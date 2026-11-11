@@ -59,7 +59,7 @@ export function createOpenAICompatibleProvider(spec, { fetchImpl = globalThis.fe
         signal: AbortSignal.timeout(timeoutMs),
       });
       const text = await res.text();
-      if (!res.ok) throw new Error(`provider ${spec.name} HTTP ${res.status}：${text.slice(0, 500)}`);
+      if (!res.ok) throw httpError(spec.name, res.status, text);
       let data;
       try {
         data = JSON.parse(text);
@@ -81,8 +81,17 @@ export function createOpenAICompatibleProvider(spec, { fetchImpl = globalThis.fe
           cacheWriteTokens: usage.prompt_tokens_details?.cache_creation_tokens ?? 0,
         },
         contextWindow,
+        truncated: data.choices?.[0]?.finish_reason === 'length', // 输出到了 max_tokens 被截断
         ...(Number.isFinite(cost) && cost >= 0 && res.headers.get('x-litellm-response-cost') !== null ? { costUsd: cost } : {}),
       };
     },
   };
+}
+
+/** HTTP 错误：5xx 标记为可重试（网关或上游临时故障），4xx 不重试。 */
+export function httpError(name, status, body) {
+  const err = new Error(`provider ${name} HTTP ${status}：${String(body ?? '').slice(0, 500)}`);
+  err.status = status;
+  if (status >= 500) err.retryable = true;
+  return err;
 }

@@ -496,13 +496,28 @@ function planned(entries) {
   }).join('\n\n');
 }
 
+/**
+ * 评审互见：上一轮其他评审提的【阻断】原文。只贴那几行，不贴整段意见；
+ * 评审只对不同意的、或能补充证据的条目表态，同意的不用重复。
+ */
+export function peersBlock(peers = []) {
+  if (!peers.length) return '';
+  return [
+    '## 上一轮其他评审提的阻断（原文，匿名）',
+    ...peers.map((x) => `### ${x.tag}\n${x.lines.join('\n')}`),
+    '',
+    '对这些阻断，你只需对不同意的、或能补充证据的条目表态，每条一行：「对评审 N 的『……』：不同意 / 补充：理由或证据」。同意的不用重复，也不用逐条回应。主笔对这些阻断的回应在方案的修订说明里。',
+  ].join('\n');
+}
+
 /** 评审：不出自己的方案，只给主笔的方案挑问题，并分级。 */
-export function critiquePrompt({ topic, round, proposals, interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope }) {
+export function critiquePrompt({ topic, round, proposals, peers = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope }) {
   const refine = mode === 'refine';
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.critique}】`,
     scopeBlock(scope, { once: convo }),
     `## 待评审的${refine ? '修改' : ''}方案（匿名）\n${planned(proposals)}`,
+    peersBlock(peers),
     interjectionBlock(interjections),
     [
       ...followUpLines(convo, round),
@@ -548,6 +563,11 @@ export function reviewPrompt({ topic, round, own, others, critiques = [], interj
 function finalsBlock(finals, title = '各主笔的最终方案') {
   if (!finals?.some((e) => e.plan)) return '';
   return `## ${title}（匿名，讨论记录里的修订轮只写了变化，完整方案以这里为准）\n${finals.map((e) => `### ${e.tag ?? `方案 ${e.label}`}\n${e.plan ?? e.text}`).join('\n\n')}`;
+}
+
+/** 本场没有读代码：涉及代码现状的说法都是参与者的推测。 */
+function noCodeBlock(noCode) {
+  return noCode ? '## 代码上下文\n本场无代码：讨论前没有读代码，讨论中也没有核实代码事实。参与者关于代码现状的说法都是推测，主文档里涉及代码现状的结论要标为「未核实」，并在开头注明「本场无代码」。' : '';
 }
 
 /** 告诉主席讨论是怎么结束的。 */
@@ -861,7 +881,7 @@ function attachmentsBlock(attachments) {
 /**
  * 初稿：讨论结束时写。补写旧讨论时 earlier 带上原来的汇总和追问记录。
  */
-export function docPrompt({ mode, rounds, finals, interjections, ending, earlier }) {
+export function docPrompt({ mode, rounds, finals, interjections, ending, earlier, noCode = false }) {
   const hasCritique = rounds?.some((r) => r.stage === 'critique');
   return join(
     `【阶段：${STAGE_LABELS.doc}】`,
@@ -871,6 +891,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
       : finalsBlock(finals, mode === 'refine' ? '各主笔最终的修改方案' : '各主笔的最终方案'),
     earlier ? `## 之前的汇总和追问（按时间先后，后面的结论推翻前面时以后面为准）\n${earlier}` : '',
     endingBlock(ending),
+    noCodeBlock(noCode),
     interjectionBlock(interjections),
     hasCritique ? '「方案」是主笔给出的方案，「评审」是评审给出的意见；以主笔的最终方案为准，评审意见用来判断哪些问题已经解决、哪些还没有。' : '',
     '请把这场讨论的结果写成主文档。',
@@ -882,7 +903,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
 /**
  * 追问之后更新主文档：直接回答的给回答，重新讨论的给追问之后的讨论记录。
  */
-export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending }) {
+export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false }) {
   return join(
     `【阶段：更新${STAGE_LABELS.doc}】`,
     `## 现在的主文档（第 ${version} 版）\n${doc}`,
@@ -895,6 +916,7 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
         historyBlock(rounds).replace('## 讨论记录（匿名）', '## 追问之后的讨论（匿名）'),
         mode === 'brainstorm' ? (finals?.length ? `## 各方最新的脑洞（匿名）\n${labeled(finals)}` : '') : finalsBlock(finals, '各主笔目前的方案'),
         endingBlock(ending),
+        noCodeBlock(noCode),
       ),
     interjectionBlock(interjections),
     [

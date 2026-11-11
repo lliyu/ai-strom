@@ -239,6 +239,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       followUps: (state?.followUps ?? []).map((f) => ({ question: f.question, handling: f.handling, answer: f.answer, doc: f.doc ?? null, at: f.at })),
       applied: state?.applied ?? null,
       expired: Boolean(state?.expired),
+      docFailed: Boolean(state?.docFailed),
       mock: Boolean(state?.mock ?? start?.mock),
       dryRun: Boolean(state?.dryRun ?? start?.dryRun),
       code: state?.context ? { auto: Boolean(state.context.auto), repos: state.context.repos ?? [] } : null,

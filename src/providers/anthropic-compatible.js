@@ -1,3 +1,4 @@
+import { httpError } from './openai-compatible.js';
 /**
  * Anthropic Messages 兼容接口（POST {baseUrl}/v1/messages）：
  * 阿里百炼的 /apps/anthropic、其他提供 Anthropic 兼容层的网关，以及 Anthropic 官方 API。
@@ -44,7 +45,7 @@ export function createAnthropicCompatibleProvider(spec, { fetchImpl = globalThis
         signal: AbortSignal.timeout(timeoutMs),
       });
       const text = await res.text();
-      if (!res.ok) throw new Error(`provider ${spec.name} HTTP ${res.status}：${text.slice(0, 500)}`);
+      if (!res.ok) throw httpError(spec.name, res.status, text);
       let data;
       try {
         data = JSON.parse(text);

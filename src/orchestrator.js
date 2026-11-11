@@ -142,8 +142,27 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     }
   };
 
-  /** 调一次模型并记账；失败时抛错。 */
-  const call = async (speaker, { stage, round, system, prompt, callOptions = {}, session, retry }) => {
+  const retryDelayMs = cfg.retryDelayMs ?? 5000;
+  run.occupancy = new Map(); // 参与者 id -> 最近一次的上下文占用 { tokens, kind, pct }
+
+  /**
+   * 调一次模型并记账；失败时抛错。超时、5xx 这类临时故障（isTransient）隔 retryDelayMs 重试一次。
+   * 会话还没开始（第一条消息）时重试换一个新的会话 id：上一次可能已经用这个 id 建了会话文件。
+   */
+  const call = async (speaker, opts) => {
+    try {
+      return await callOnce(speaker, opts);
+    } catch (err) {
+      if (!isTransient(err)) throw err;
+      log(`⚠️ ${speaker.name} 调用失败（${err.message.slice(0, 120)}），${Math.round(retryDelayMs / 1000)} 秒后重试一次`);
+      emit({ type: 'call_failed', speaker: speaker.id, stage: opts.stage, round: opts.round, error: err.message.slice(0, 500), durationMs: err.durationMs ?? 0, willRetry: true });
+      if (retryDelayMs) await new Promise((res) => setTimeout(res, retryDelayMs));
+      if (opts.session && !opts.session.turns.length) opts.session.id = randomUUID();
+      return callOnce(speaker, { ...opts, retry: opts.retry ?? 'error' });
+    }
+  };
+
+  const callOnce = async (speaker, { stage, round, system, prompt, callOptions = {}, session, retry }) => {
     const provider = providers.get(speaker.provider);
     stats.calls += 1;
     const started = Date.now();
@@ -151,6 +170,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     try {
       const res = await provider.complete({ model: speaker.model, system, prompt, effort: speaker.effort, temperature: speaker.temperature, ...callOptions, ...(session ? { session } : {}) });
       if (session) session.turns.push({ prompt, reply: res.text });
+      const window = speaker.contextWindow ?? res.contextWindow ?? null;
+      res.occupancy = occupancyOf(res, { window, last: session?.contextTokens });
+      if (session) session.contextTokens = res.occupancy.tokens;
+      if (tags.has(speaker.id)) run.occupancy.set(speaker.id, res.occupancy);
+      if (res.truncated) log(`⚠️ ${speaker.name} 的输出到了长度上限，被截断了`);
       // 接口不返回费用时（例如百炼），按配置的价格估算
       const estimate = res.costUsd == null ? estimateCost(priceFor(cfg, speaker, res.model), res.usage, new Date(started)) : null;
       if (estimate?.costUsd != null) res.costUsd = estimate.costUsd;
@@ -167,7 +191,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         outputTokens: res.usage?.outputTokens ?? 0,
         cacheReadTokens: res.usage?.cacheReadTokens ?? 0,
         cacheWriteTokens: res.usage?.cacheWriteTokens ?? 0,
-        contextWindow: speaker.contextWindow ?? res.contextWindow ?? null,
+        contextWindow: window,
+        // 上下文占用：inputTokens 在多回合调用（带工具）时是各回合的累计值，不能直接除以窗口
+        contextTokens: res.occupancy.tokens,
+        contextKind: res.occupancy.kind,
+        contextPct: res.occupancy.pct,
         costUsd: res.costUsd ?? null,
         ...(estimate ? { costEstimated: true, costOriginal: { amount: estimate.amount, currency: estimate.currency, offPeak: estimate.offPeak } } : {}),
         durationMs: res.durationMs ?? Date.now() - started,
@@ -287,6 +315,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   const normQ = (q) => q.replace(/\s+/g, '').replace(/[？?。.]+$/, '');
   const asked = new Set(run.facts.flatMap((f) => f.questions.map(normQ)));
   let pendingQuestions = [];
+  run.pendingQuestions = () => [...pendingQuestions];
   /**
    * 收集上次核实之后参与者列出的「待核实的事实」，交给调研员查代码回答。
    * 有新结果时返回 true：这一轮不提前结束，主笔要先按核实结果修订。
@@ -392,8 +421,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       } else {
         // 评审先提意见，主笔再看着意见互评修订
         const proposals = [...latest.values()].sort(byTag);
+        // 评审互见：上一轮其他评审提的【阻断】原文（只取那几行），评审只对不同意或能补充证据的表态
+        const lastCritiques = rounds.find((x) => x.round === round - 1 && x.stage === 'critique')?.entries ?? [];
+        const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: blockerLines(e.text) })).filter((x) => x.lines.length);
         const critiques = reviewers.length
-          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p) }))
+          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p) }))
           : [];
         markScoped(critiques);
         if (adaptive && reviewers.length && !newInterjections && reviewersDone(critiques)) {
@@ -425,7 +457,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /** 讨论结束卡片：代号对照、用量、追问提示。 */
-  run.postEnd = async ({ title, subtitle, number }) => {
+  run.postEnd = async ({ title, subtitle, number, noCode = false }) => {
     const mapping = participants
       .map((p) => ({ tag: tagOf(p), line: `- ${tagOf(p)}：${p.name}${p.role ? ` · ${p.role}` : ''}（${p.provider}${p.model ? ` / ${p.model}` : ''}）` }))
       .sort(byTag)
@@ -438,7 +470,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         '**代号对照**',
         ...mapping,
         '',
-        `**用量**：输入 ${stats.inputTokens} tokens，输出 ${stats.outputTokens} tokens${stats.costUsd ? `，约 $${stats.costUsd.toFixed(2)}` : ''}`,
+        `**用量**：输入 ${stats.inputTokens} tokens（多回合调用按各回合累计），输出 ${stats.outputTokens} tokens${stats.costUsd ? `，约 $${stats.costUsd.toFixed(2)}` : ''}`,
+        occupancyLine(participants, run.occupancy),
+        noCode ? '**代码上下文**：本场无代码，涉及代码现状的结论都没有核实。' : null,
         heard.length ? `**收到的插话**：${heard.length} 条` : null,
         number && cfg.mode === 'refine' ? '**追问**：在页面上接着追问，主编会判断是直接回答还是重新讨论；重新讨论后会重写修订版。' : null,
         number && cfg.mode !== 'refine' ? `**追问**：发 \`/追问 <问题>\` 接着问这场讨论（更早的讨论写 \`/追问 #${number} <问题>\`），主席会判断是直接回答还是重新讨论。` : null,
@@ -453,17 +487,23 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    */
   run.writeDoc = async ({ prompt, previous = null, round, reason, check = true }) => {
     // 主席这次写文档用一条临时会话：按核对意见修改时讨论记录已经在会话里，不用再发一遍。非会话模式把初稿贴回去
-    const session = convo ? { id: randomUUID(), turns: [], seen: 0 } : null;
+    let session = null;
     const write = async (text) => run.speak(cfg.chair, { stage: 'doc', round, system: run.shared, prompt: text, session, quiet: true });
-    const raw = await write(`${docSystem(cfg.mode)}\n\n${prompt}`);
-    if (raw == null) return null;
-    let parsed;
-    try {
-      parsed = parseDoc(raw);
-    } catch (err) {
-      log(`⚠️ 主文档格式不对：${err.message}`);
-      return null;
+    // 主席没写出来（失败或格式不对）时换一条新会话重写一次；仍不行返回 null，由调用方发兜底卡片
+    let raw = null;
+    let parsed = null;
+    for (let attempt = 0; attempt < 2 && !parsed; attempt += 1) {
+      if (attempt) log('主席重写一次主文档');
+      session = convo ? { id: randomUUID(), turns: [], seen: 0 } : null;
+      raw = await write(`${docSystem(cfg.mode)}\n\n${prompt}`);
+      if (raw == null) continue;
+      try {
+        parsed = parseDoc(raw);
+      } catch (err) {
+        log(`⚠️ 主文档格式不对：${err.message}`);
+      }
     }
+    if (!parsed) return null;
     if (parsed.unchanged) {
       log('主席判断：这次追问不需要改主文档');
       return { unchanged: true };
@@ -526,6 +566,36 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /**
+   * 主席没写成主文档时，由程序直接发一张卡片：各主笔的最终方案、评审最后提的阻断、还没核实的问题。
+   * 不经过任何模型，讨论的结果不至于整场丢掉。
+   */
+  run.postDocFallback = async ({ round, ending, number }) => {
+    const finals = [...latest.values()].sort(byTag);
+    const blockers = reviewers.map((p) => {
+      const last = [...rounds].reverse().find((x) => (x.stage === 'critique' || x.stage === 'feedback') && x.entries.some((e) => e.id === p.id));
+      const lines = last ? blockerLines(last.entries.find((e) => e.id === p.id).text) : [];
+      return lines.length ? `**${tagOf(p)}**（第 ${last.round} 轮）\n${lines.map((l) => `- ${l.replace(/^[-*]\s*/, '')}`).join('\n')}` : null;
+    }).filter(Boolean);
+    const pending = run.pendingQuestions();
+    const checked = run.facts.reduce((n, f) => n + f.questions.length, 0);
+    const chair = cfg.chair.name;
+    const body = [
+      `${chair}没能写出主文档（重写一次后仍失败）。下面是程序直接整理的材料，没有经过${chair}判断。`,
+      endingText(ending),
+      '',
+      '## 各主笔的最终方案',
+      ...finals.map((e) => `### ${e.tag}\n${e.plan ?? e.text}`),
+      blockers.length ? '\n## 评审最后提的阻断' : null,
+      ...blockers,
+      checked || pending.length ? `\n## 代码核实\n已核实 ${checked} 个问题，结果在讨论里的「代码核实」卡片${pending.length ? `；还有 ${pending.length} 个没核实：\n${pending.map((q) => `- ${q}`).join('\n')}` : '。'}` : null,
+      '',
+      `补救：运行 \`node src/cli.js doc${number ? ` ${number}` : ''}\`，让${chair}按全部记录补写主文档。`,
+    ].filter((l) => l !== null).join('\n');
+    await publisher.post({ speaker: cfg.chair, title: `${chair}汇总失败 · 程序整理的结果`, subtitle: endingText(ending) || '讨论结束', body, meta: { stage: 'fallback', round } });
+    emit({ type: 'doc_failed', round });
+  };
+
+  /**
    * 打磨：主编按主文档写出完整修订版。格式不对时把错误告诉它再写一次。
    * 返回 { fields, changed } 或 null（两次都失败）。
    */
@@ -579,7 +649,7 @@ function codeSpecOf(code) {
   return { auto: Boolean(code.auto), repos: code.auto ? [] : code.repos.map((r) => ({ name: r.alias, ...(r.ref ? { ref: r.ref } : {}) })) };
 }
 
-function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision }) {
+function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false }) {
   return {
     version: STATE_VERSION,
     number: number ?? null,
@@ -596,6 +666,8 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     latest: [...latest.values()],
     rounds,
     lastRound,
+    ending: ending ? { reason: ending.reason, round: ending.round } : null,
+    ...(docFailed ? { docFailed: true } : {}),
     summary,
     docs,
     followUps,
@@ -672,6 +744,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
       reviewers.length ? `**主笔**：${who(leads)}\n**评审**：${who(reviewers)}（只提意见，不出方案）` : null,
       code?.auto ? `**代码上下文**：没有指定仓库，调研员会从已登记的 ${code.repos.length} 个仓库里按议题定位相关代码（读本机当前分支），整理成背景资料发给所有人。想指定仓库可以写 \`仓库:别名\`，不想读代码写 \`仓库:无\`` : null,
       code && !code.auto ? `**代码上下文**：先由调研员只读查看下面的仓库，整理成背景资料发给所有人\n${code.repos.map((r) => `- ${describeRepo(r)}`).join('\n')}` : null,
+      !code && cfg.mode === 'decision' ? '**代码上下文**：本场无代码，参与者不能查代码，也不会核实代码事实；涉及代码现状的说法都按未核实处理。' : null,
       interjections ? (refine ? '**插话**：在页面下方输入，会在下一轮开始时交给所有模型。' : '**插话**：直接在群里发消息，会在下一轮开始时交给所有模型。') : null,
       refine ? '**写回**：修订版不会自动写回墨稿，要你在页面上确认。' : null,
     ].filter((l) => l !== null).join('\n'),
@@ -692,6 +765,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     const cap = Math.round(researcher.maxChars * 1.5);
     if (code.auto && /^\s*无相关代码/.test(text)) {
       log('调研员判断议题不涉及登记的仓库，不带代码讨论');
+      await publisher.post({ speaker: cfg.chair, title: '本场无代码', subtitle: '代码上下文', body: '调研员判断议题不涉及登记的仓库。参与者不能查代码，也不会核实代码事实；涉及代码现状的说法都按未核实处理。', meta: { stage: 'nocode' } });
     } else {
       context = {
         auto: Boolean(code.auto),
@@ -727,8 +801,9 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const doc = await run.writeDoc({
     round: lastRound + 1,
     reason: '讨论结束',
-    prompt: `${docPrompt({ mode: cfg.mode, rounds, finals: [...latest.values()].sort(byTag), interjections: heard, ending })}${chairFacts(run.facts)}`,
+    prompt: `${docPrompt({ mode: cfg.mode, rounds, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context) })}${chairFacts(run.facts)}`,
   });
+  if (!doc) await run.postDocFallback({ round: lastRound + 1, ending, number });
   const docs = doc?.text ? [doc] : [];
   const summary = doc?.text ?? null;
 
@@ -739,6 +814,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     number,
     title: `讨论${no} 结束`,
     subtitle: `共 ${lastRound} 轮${ending.reason === 'converged' ? `，${run.stopRule}` : ending.reason === 'max' ? '，达到上限仍有意见' : ''} · ${stats.calls} 次模型调用${stats.failures ? `，${stats.failures} 次失败` : ''}`,
+    noCode: noCodeOf(cfg.mode, context),
   });
 
   const labels = Object.fromEntries([...tags].map(([id, t]) => [id, t.tag]));
@@ -754,7 +830,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     context: context ? { repos: context.repos.map(describeRepo), text: context.text } : null,
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc: doc?.text ? doc : null,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc }),
   };
 }
 
@@ -808,11 +884,14 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     system: run.shared,
     prompt: `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: state.rounds, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length) })}${chairFacts(run.facts)}`,
   });
-  if (!triage) throw new Error('主席没能处理这次追问');
-  const handling = parseTriage(triage);
+  // 主席判断失败时不放弃这次追问：按重新讨论处理，让参与者直接回应追问
+  if (!triage) log('⚠️ 主席没能判断这次追问，按重新讨论处理');
+  const handling = triage ? parseTriage(triage) : 'discuss';
   const followUps = [...(state.followUps ?? [])];
-  let answer = stripTriageLine(triage);
+  let answer = triage ? stripTriageLine(triage) : '';
   let lastRound = state.lastRound;
+  let ending = { reason: 'answered', round: state.lastRound };
+  let docFailed = false;
   let revision = null;
   const docs = [...(state.docs ?? [])];
   const current = docs.at(-1) ?? null;
@@ -847,6 +926,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     // ---------- 评审与修订，直到没有新意见 ----------
     const it = maxRounds >= 2 ? await run.iterate({ from: r0 + 1, to: r0 + maxRounds - 1, adaptive: true, scope: question }) : { lastRound: r0, ending: { reason: 'fixed', round: r0 } };
     lastRound = it.lastRound;
+    ending = it.ending;
     await run.pullInterjections();
     await run.factCheck(lastRound + 1);
     const finals = [...latest.values()].sort(byTag);
@@ -858,31 +938,36 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         reason,
         prompt: `${docUpdatePrompt({
           mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, brief: briefText,
-          rounds: rounds.filter((r) => r.round >= r0), finals, interjections: heard, ending: it.ending,
+          rounds: rounds.filter((r) => r.round >= r0), finals, interjections: heard, ending: it.ending, noCode: noCodeOf(state.mode, run.code ? state.context : null),
         })}${chairFacts(run.facts)}`,
       }
       : {
         round: lastRound + 1,
         reason: `补写（${reason}）`,
         prompt: `${docPrompt({
-          mode: state.mode, rounds, finals, interjections: heard, ending: it.ending,
+          mode: state.mode, rounds, finals, interjections: heard, ending: it.ending, noCode: noCodeOf(state.mode, run.code ? state.context : null),
           earlier: earlierOf(state.summary, [...followUps, { question, answer: `（这次追问，第 ${r0} 轮之后的讨论记录就是它的讨论）` }]),
         })}${chairFacts(run.facts)}`,
       });
     if (doc?.text) docs.push(doc);
-    else log('⚠️ 主文档没有更新');
+    else if (!doc) {
+      log('⚠️ 主文档没有更新');
+      docFailed = true;
+      await run.postDocFallback({ round: lastRound + 1, ending: it.ending, number: state.number });
+    }
     answer = doc?.text ? doc.note : null;
-    followUps.push({ question, handling, brief: briefText, answer, ...(doc?.text ? { doc: doc.version } : {}), rounds: [r0, lastRound], at: new Date().toISOString() });
+    followUps.push({ question, handling, brief: briefText, answer, ...(doc?.text ? { doc: doc.version } : {}), rounds: [r0, lastRound], ending: it.ending.reason, ...(triage ? {} : { triageFailed: true }), at: new Date().toISOString() });
     if (state.mode === 'refine' && state.subject && doc?.text) {
       revision = await run.rewrite({ subject: state.subject, summary: doc.text, round: lastRound + 1 });
     }
     await run.postEnd({
       title: `追问讨论结束 · 讨论${no}`,
       subtitle: `追问后讨论了 ${lastRound - r0 + 1} 轮${it.ending.reason === 'converged' ? `，${run.stopRule}` : it.ending.reason === 'max' ? '，达到上限仍有意见' : ''} · ${stats.calls} 次模型调用`,
+      noCode: noCodeOf(state.mode, run.code ? state.context : null),
     });
   }
 
-  emit({ type: 'run_finished', stats, handling, roundsUsed: lastRound - state.lastRound, ending: handling === 'answer' ? 'answered' : 'followup' });
+  emit({ type: 'run_finished', stats, handling, roundsUsed: lastRound - state.lastRound, ending: ending.reason });
   const next = {
     ...state,
     updatedAt: new Date().toISOString(),
@@ -893,6 +978,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     followUps,
     facts: run.facts,
     docs,
+    ...(docFailed && !docs.length ? { docFailed: true } : { docFailed: undefined }),
     summary: docs.at(-1)?.text ?? state.summary,
     ...(docs.length && !state.docs?.length && state.summary ? { legacySummary: state.summary } : {}),
     ...(revision ? { revision, revisions: [...(state.revisions ?? []), revision] } : {}),
@@ -935,10 +1021,77 @@ export async function backfillDoc({ cfg, state, providers, publisher, log = () =
   };
 }
 
+/**
+ * 上下文占用。HTTP 调用和单回合的 claude-cli 调用，输入 tokens 就是这次实际送进去的量（exact）。
+ * 多回合（带工具）的 claude-cli 调用，CLI 返回的是各回合的累计值，只能估一个下界（lower）：
+ * max(累计 ÷ 回合数, 缓存写入, 这条会话上次已知的占用)。
+ */
+export function occupancyOf(res, { window = null, last } = {}) {
+  const input = res.usage?.inputTokens ?? 0;
+  const turns = res.turns ?? 0;
+  let tokens = input;
+  let kind = 'exact';
+  if (turns > 1) {
+    kind = 'lower';
+    tokens = Math.max(Math.round(input / turns), res.usage?.cacheWriteTokens ?? 0, last ?? 0);
+  }
+  return { tokens, kind, pct: window ? Math.round((tokens / window) * 1000) / 1000 : null };
+}
+
+/** 占用超过这个比例时在卡片上提醒。 */
+export const OCCUPANCY_WARN = 0.5;
+
+function pctText(o) {
+  if (o?.pct == null) return null;
+  return `${o.kind === 'lower' ? '≥' : ''}${Math.round(o.pct * 100)}%`;
+}
+
+/** 结束卡片：每位有会话的参与者最近一次的上下文占用。 */
+function occupancyLine(participants, occupancy) {
+  const items = participants.filter((p) => occupancy.get(p.id)?.pct != null).map((p) => {
+    const o = occupancy.get(p.id);
+    return `${p.name} ${pctText(o)}${o.pct > OCCUPANCY_WARN ? ' ⚠️' : ''}`;
+  });
+  if (!items.length) return null;
+  const warn = participants.some((p) => occupancy.get(p.id)?.pct > OCCUPANCY_WARN);
+  return `**上下文占用**（最近一次发言）：${items.join('，')}${warn ? `。超过 ${OCCUPANCY_WARN * 100}% 的会话再追问几次就可能放不下` : ''}`;
+}
+
+/** 讨论怎么结束的，一句话。 */
+function endingText(ending) {
+  if (!ending) return '';
+  if (ending.reason === 'converged') return `第 ${ending.round} 轮提前结束（收敛）`;
+  if (ending.reason === 'max') return `到上限 ${ending.round} 轮结束，评审仍有意见`;
+  if (ending.reason === 'fixed') return `按固定轮数在第 ${ending.round} 轮结束`;
+  return '';
+}
+
+/** 方案讨论没有带代码背景：主席写文档时要把代码相关的说法标为未核实。 */
+function noCodeOf(mode, context) {
+  return mode === 'decision' && !context;
+}
+
+/** 发言里带【阻断】的那几行，原文照抄（最多 10 行，每行最多 300 字）。 */
+export function blockerLines(text) {
+  return String(text ?? '').split('\n').map((l) => l.trim()).filter((l) => hasBlocker(l)).slice(0, 10).map((l) => (l.length > 300 ? `${l.slice(0, 300)}…` : l));
+}
+
+/** 超时、HTTP 5xx、连接中断这类临时故障：重试一次。 */
+export function isTransient(err) {
+  if (!err) return false;
+  if (err.retryable === true) return true;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  return /fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|network/i.test(`${err.message ?? ''} ${err.cause?.code ?? ''}`);
+}
+
 function footerOf(res) {
   const parts = [res.model];
   if (res.durationMs) parts.push(`${(res.durationMs / 1000).toFixed(1)}s`);
-  if (res.usage) parts.push(`输入 ${res.usage.inputTokens} / 输出 ${res.usage.outputTokens} tokens`);
+  const o = res.occupancy;
+  if (res.usage) parts.push(`${o?.kind === 'lower' ? `累计输入 ${res.usage.inputTokens}（${res.turns} 回合）` : `输入 ${res.usage.inputTokens}`} / 输出 ${res.usage.outputTokens} tokens`);
   if (res.usage?.cacheReadTokens && res.usage.inputTokens) parts.push(`缓存命中 ${Math.round((res.usage.cacheReadTokens / res.usage.inputTokens) * 100)}%`);
+  const pct = pctText(o);
+  if (pct) parts.push(`${o.pct > OCCUPANCY_WARN ? '⚠️ ' : ''}上下文 ${pct}`);
+  if (res.truncated) parts.push('⚠️ 输出被截断');
   return parts.filter(Boolean).join(' · ');
 }

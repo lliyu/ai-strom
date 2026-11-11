@@ -631,7 +631,7 @@ function renderRun() {
       ? `<div class="card">${md(r.conclusion)}</div>${asked.length ? `<div class="card"><h3>追问</h3>${asked.map((f) => `<details style="margin-top:8px"><summary>${esc(f.question)}（${f.handling === 'discuss' ? '重新讨论' : '直接回答'}）</summary>${md(f.answer)}</details>`).join('')}</div>` : ''}`
       : `<div class="card hint">${status === 'running' || status === 'queued' ? '讨论结束后这里显示主席的汇总。' : '这场讨论没有汇总。'}</div>`;
   } else if (S.sub === 'doc') {
-    if (!docs.length) { pane.innerHTML = `<div class="card hint">${status === 'running' || status === 'queued' ? '讨论结束后主席会写主文档，主笔核对后发在这里。' : r.summary ? '这场讨论还没有主文档（旧讨论只有汇总）。可以在终端运行 node src/cli.js doc ' + r.number + ' 补写。' : '这场讨论没有主文档。'}</div>`; return; }
+    if (!docs.length) { pane.innerHTML = `<div class="card hint">${status === 'running' || status === 'queued' ? '讨论结束后主席会写主文档，主笔核对后发在这里。' : r.docFailed ? '主席没能写出主文档。「讨论」页最后有一张程序整理的结果（各主笔的最终方案、评审最后提的阻断、没核实的问题）。可以在终端运行 node src/cli.js doc ' + r.number + ' 补写。' : r.summary ? '这场讨论还没有主文档（旧讨论只有汇总）。可以在终端运行 node src/cli.js doc ' + r.number + ' 补写。' : '这场讨论没有主文档。'}</div>`; return; }
     const idx = Math.min(S.docIdx ?? docs.length - 1, docs.length - 1);
     const d = docs[idx], prev = docs[idx - 1];
     const diff = S.docDiff && prev;

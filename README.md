@@ -295,11 +295,23 @@ lark-cli im +chat-search --query "<群名>" --as user
 |---|---|
 | `run_started` | 议题、模式、轮数、参与者与主席（provider、配置的模型、`contextWindow`）、进程号、是否 dry-run / mock |
 | `call_started` | 谁开始调用、哪个阶段、第几轮 |
-| `call_finished` | 实际模型、输入/输出 tokens、上下文窗口、费用、耗时、是否被截断；调研员还有工具调用轮数 `turns` |
-| `call_failed` | 失败原因 |
+| `call_finished` | 实际模型、输入/输出 tokens、上下文窗口、上下文占用（`contextTokens`、`contextKind`、`contextPct`，见下文）、费用、耗时、是否被截断；带工具的调用还有回合数 `turns`。`retry` 为 `compress` 是压缩重写，为 `error` 是临时故障后的重试 |
+| `call_failed` | 失败原因；`willRetry: true` 表示是临时故障，马上重试一次 |
 | `fact_checked` | 第几轮做了代码核实、查了几个问题 |
 | `doc_written` | 主文档写到第几版、原因、字数、附录数、主笔核对结果 |
-| `run_finished` / `run_failed` | 本次用量合计，或错误 |
+| `doc_failed` | 主席重写一次后仍没写出主文档，程序发了兜底卡片 |
+| `run_finished` / `run_failed` | 本次用量合计和结束原因 `ending`，或错误 |
+
+结束原因（`ending`，也存在 `state.json` 里）：`converged`（提前收敛）、`max`（到轮数上限仍有意见）、`fixed`（按固定轮数结束）、`answered`（追问由主席直接回答）。追问重新讨论时写这次追问讨论的真实结束原因。
+
+**上下文占用**：claude CLI 带工具（读代码）时一次调用会跑很多回合，返回的输入 tokens 是各回合的累计值，可能远超窗口，不能直接除以窗口。所以另记一个占用：
+
+| `contextKind` | 适用 | `contextTokens` |
+|---|---|---|
+| `exact`（准确值） | HTTP 接口，以及只跑了 1 个回合的 claude CLI 调用 | 这次实际送进模型的输入 tokens |
+| `lower`（下界） | 多回合的 claude CLI 调用 | max(累计 ÷ 回合数, 缓存写入, 这条会话上次已知的占用) |
+
+卡片页脚显示「上下文 39%」，下界显示「≥12%」，超过 50% 带 ⚠️；多回合调用的输入写成「累计输入 X（N 回合）」。结束卡片列出每位参与者最近一次发言的占用。klook-console 的「上下文峰值」也按这个口径算，旧记录按同样的规则估。
 
 上下文窗口的来源：claude CLI 会返回实际模型和窗口大小；OpenAI 兼容接口在没写 `contextWindow` 时会查一次 `{baseUrl}/models`（LiteLLM 网关返回 `max_input_tokens`）；Anthropic 兼容接口（百炼）查不到，需要在发言者上写 `contextWindow`。
 
@@ -321,6 +333,18 @@ lark-cli im +chat-search --query "<群名>" --as user
 ```
 
 单价是每百万 tokens；`cacheReadRatio` 是缓存命中按输入单价的比例；`offPeak` 是闲时价格；`usdRate` 是 1 美元折多少原币，用来和其他模型一起按美元汇总。上面的数字来自百炼官方价格页和上下文缓存说明（2026-11）。
+
+## 出错时怎么处理
+
+- **临时故障重试一次**：超时、HTTP 5xx、连接中断，以及 claude CLI 报的 API 5xx / 529 过载，隔 5 秒（`retryDelayMs`）重试一次，主笔、评审、调研员、主席都适用。4xx、配置错误等不重试。
+- **输出被截断**：OpenAI 兼容接口的 `finish_reason` 为 `length`、Anthropic 兼容接口的 `stop_reason` 为 `max_tokens` 时，记 `truncated: true`，卡片页脚标「输出被截断」。
+- **主席写不出主文档**：换一条新会话重写一次；仍失败就由程序发一张「主席汇总失败 · 程序整理的结果」卡片，内容是各主笔的最终方案、每位评审最后提的阻断、还没核实的问题，不经过模型。`state.json` 记 `docFailed: true`，之后可以用 `node src/cli.js doc <编号>` 补写。
+- **主席判断不了追问**：按「重新讨论」处理，参与者直接回应追问，这次追问记 `triageFailed: true`。
+
+## 讨论规则补充
+
+- **评审互见**：方案讨论和打磨里，评审从第 3 轮起能看到上一轮其他评审提的【阻断】原文（只贴那几行，匿名），只对不同意或能补充证据的条目表态。脑洞风暴的盲审不互见。
+- **本场无代码**：方案讨论没带代码背景时（写了「仓库:无」、没登记仓库，或调研员判断「无相关代码」），开场卡片和结束卡片都写明「本场无代码」，主席在主文档里把涉及代码现状的结论标为未核实。
 
 ## 限制
 

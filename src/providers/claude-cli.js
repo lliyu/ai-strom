@@ -17,6 +17,10 @@ import path from 'node:path';
  *
  * 费用：续接会话时 total_cost_usd 是会话累计值，见 callCost。
  */
+/** CLI 报出的服务端临时故障：API 5xx、529 过载、连接中断。这类错误重试一次通常就好。 */
+const TRANSIENT = /API Error:?\s*5\d\d|\b(?:500|502|503|504|529)\b|overloaded|Internal server error|ECONNRESET|ETIMEDOUT|socket hang up/i;
+const retryable = (err) => Object.assign(err, { retryable: true });
+
 export const DEFAULT_CLAUDE_CWD = path.join(os.homedir(), '.cache', 'ai-storm', 'claude');
 
 /** Claude Code 存会话的位置：~/.claude/projects/<工作目录真实路径，非字母数字换成「-」>/<id>.jsonl */
@@ -60,16 +64,18 @@ export function createClaudeCliProvider(spec, { spawnImpl = spawn } = {}) {
       const started = Date.now();
       const limit = callTimeoutMs ?? timeoutMs;
       const { stdout, stderr, code, timedOut } = await run(spawnImpl, bin, args, prompt, { cwd, timeoutMs: limit });
-      if (timedOut) throw new Error(`claude CLI 超时（${Math.round(limit / 1000)}s）`);
+      if (timedOut) throw retryable(new Error(`claude CLI 超时（${Math.round(limit / 1000)}s）`));
       const parsed = parseResult(stdout);
       if (!parsed) {
-        throw new Error(`claude CLI 退出码 ${code}，输出无法解析：${(stderr || stdout).slice(0, 500)}`);
+        const err = new Error(`claude CLI 退出码 ${code}，输出无法解析：${(stderr || stdout).slice(0, 500)}`);
+        throw TRANSIENT.test(stderr || stdout) ? retryable(err) : err;
       }
       if (parsed.subtype === 'error_max_budget_usd') {
         throw new Error(`claude CLI 超出单次预算 $${maxBudgetUsd}（已用 $${(parsed.total_cost_usd ?? 0).toFixed(2)}），可以调大 research.maxBudgetUsd`);
       }
       if (parsed.is_error || parsed.subtype !== 'success') {
-        throw new Error(`claude CLI 返回错误：${String(parsed.result ?? parsed.subtype).slice(0, 500)}`);
+        const err = new Error(`claude CLI 返回错误：${String(parsed.result ?? parsed.subtype).slice(0, 500)}`);
+        throw TRANSIENT.test(String(parsed.result ?? '')) ? retryable(err) : err;
       }
       const usage = parsed.usage ?? {};
       // modelUsage 里有别名解析后的真实模型、上下文窗口与费用；取用量最大的那一项
