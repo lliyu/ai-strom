@@ -5,16 +5,17 @@ import { ConfigError } from './config.js';
 import { createProviderRegistry } from './providers/index.js';
 import { createLarkPublisher, createConsolePublisher, createTranscriptPublisher, combinePublishers } from './publishers.js';
 import { createInterjectionReader } from './lark/interjections.js';
-import { runDiscussion, runFollowUp } from './orchestrator.js';
+import { runDiscussion, runFollowUp, backfillDoc } from './orchestrator.js';
 import { nextNumber, saveState, findState, expireOldSessions } from './state.js';
 import { DEFAULT_CLAUDE_CWD } from './providers/claude-cli.js';
 import { isTrigger, DEFAULT_TRIGGERS } from './watch.js';
-import { describeRepo, resolveRepos, prepareRepos, allRepoSpecs } from './repos.js';
+import { describeRepo, resolveRepos, prepareRepos, allRepoSpecs, parseRepoSpecs } from './repos.js';
+import { createFileInbox, combineInterjections } from './inbox.js';
 
 /**
  * 跑一场讨论或一次追问：命令行（discuss / followup）、Lark 监听（watch）和本地网页（web）共用。
- * 发到哪里由调用方决定：默认发 Lark（dryRun 时打印到终端）；网页传 lark: false，
- * 再通过 extraPublishers / interjections 接上自己的发布者和插话来源。
+ * 发到哪里由调用方决定：默认发 Lark（dryRun 时打印到终端）；网页上发起的传 lark: false，只写本地记录。
+ * 插话除了群消息，还读讨论目录里的 inbox.jsonl（网页写入），见 inbox.js。
  */
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -54,7 +55,7 @@ function setupRun(cfg, { runDir, dryRun, mock, interject, triggers, echo = true,
 
   let interjections = ownInterjections;
   const ij = cfg.lark.interjection;
-  if (!ownInterjections && toLark && ij.enabled && interject && !mock) {
+  if (!ownInterjections && toLark && !dryRun && ij.enabled && interject && !mock) {
     // 指令消息（/讨论、/脑洞）不算插话，留给 watch 排队
     interjections = createInterjectionReader({
       chatId: ij.chatId,
@@ -63,17 +64,45 @@ function setupRun(cfg, { runDir, dryRun, mock, interject, triggers, echo = true,
       ignore: (text) => isTrigger(text, triggers ?? cfg.lark.watch?.triggers ?? DEFAULT_TRIGGERS),
     });
   }
+  // 网页上的插话：不管这场讨论在哪个进程里跑，都从讨论目录的 inbox.jsonl 读
+  if (interject) interjections = combineInterjections([interjections, createFileInbox(runDir)]);
+  const channel = toLark ? (dryRun ? 'dry-run' : 'lark') : 'web';
 
   const providers = createProviderRegistry(cfg, { forceMock: mock });
   // usage.jsonl：每次模型调用的用量与上下文，供 klook-console 等外部看板读取
   const usageFile = path.join(runDir, 'usage.jsonl');
   const onEvent = (e) => {
     const row = { at: new Date().toISOString(), ...e };
-    if (e.type === 'run_started') Object.assign(row, { pid: process.pid, dryRun, mock });
+    if (e.type === 'run_started') Object.assign(row, { pid: process.pid, dryRun, mock, channel });
     fs.appendFileSync(usageFile, `${JSON.stringify(row)}\n`);
     watcher?.(row);
   };
-  return { publisher, interjections, providers, onEvent };
+  return { publisher, interjections, providers, onEvent, channel };
+}
+
+/** 跑一场讨论：discuss、watch 和网页共用。先解析并准备仓库：别名写错、分支不存在时在发任何消息之前就报错。 */
+export async function runOne(cfg, { repos, ...opts }) {
+  const code = prepareCode(cfg, repos);
+  try {
+    return await runPrepared(cfg, { ...opts, code });
+  } finally {
+    code?.cleanup();
+  }
+}
+
+/**
+ * 指定了仓库就读这些；写「无」不读；没写时（方案讨论）把全部登记的仓库交给调研员按议题定位。
+ */
+export function prepareCode(cfg, repos) {
+  if (repos === undefined || repos === null) {
+    const auto = cfg.mode === 'decision' && cfg.research?.auto !== false && Object.keys(cfg.repos).length > 0;
+    if (!auto) return null;
+    const code = prepareRepos(resolveRepos(cfg, allRepoSpecs(cfg)), { skipMissing: true });
+    for (const p of code.skipped) log(`⚠️ 登记的目录不存在，跳过：${p}`);
+    return { ...code, auto: true };
+  }
+  const specs = parseRepoSpecs(repos);
+  return specs.length ? prepareRepos(resolveRepos(cfg, specs)) : null;
 }
 
 /**
@@ -87,7 +116,7 @@ export async function runPrepared(cfg, { topic, dryRun, mock, interject, trigger
   const number = given ?? (mock ? undefined : nextNumber(runsDir));
   const runDir = path.join(runsDir, `${stamp()}-${number ? `#${number}-` : ''}${slug(subject ? `打磨-${subject.title}` : topic)}`);
   onRunDir?.(runDir, number);
-  const { publisher, interjections, providers, onEvent } = setupRun(cfg, { runDir, dryRun, mock, interject, triggers, lark, extraPublishers, interjections: ownInterjections, onEvent: watcher, echo });
+  const { publisher, interjections, providers, onEvent, channel } = setupRun(cfg, { runDir, dryRun, mock, interject, triggers, lark, extraPublishers, interjections: ownInterjections, onEvent: watcher, echo });
   log(`开始${number ? ` #${number}` : ''} ${{ brainstorm: '脑洞风暴', refine: '打磨', decision: '方案讨论' }[cfg.mode]}：${cfg.participants.length} 位参与者，${cfg.adaptive ? `自动轮数（最多 ${cfg.rounds} 轮）` : `${cfg.rounds} 轮`}${dryRun ? '（dry-run，不发到 Lark）' : ''}${mock ? '（mock，不调用模型）' : ''}`);
   if (code?.auto) log(`代码上下文：未指定仓库，调研员从 ${code.repos.length} 个登记的仓库里按议题定位`);
   else if (code) for (const r of code.repos) log(`代码上下文 ${describeRepo(r)}`);
@@ -101,7 +130,7 @@ export async function runPrepared(cfg, { topic, dryRun, mock, interject, trigger
   }
   const { state, ...rest } = result;
   // state.json：会话与讨论状态，追问时接着用；超过保留期后会话会被清理
-  if (number) saveState(runDir, { ...state, dryRun, ...(mock ? { mock: true } : {}) });
+  if (number) saveState(runDir, { ...state, dryRun, channel, ...(mock ? { mock: true } : {}) });
   fs.writeFileSync(path.join(runDir, 'result.json'), JSON.stringify({ number, topic, mode: cfg.mode, ...rest }, null, 2));
   log(`完成${number ? ` #${number}` : ''}。本地记录：${path.relative(process.cwd(), runDir) || runDir}`);
   return result;
@@ -137,6 +166,33 @@ export async function followUpOne(cfg, { question, number, dryRun = false, mock 
   saveState(dir, result.state);
   fs.writeFileSync(path.join(runDir, 'result.json'), JSON.stringify({ followUpOf: state.number, question, handling: result.handling, answer: result.answer, stats: result.stats }, null, 2));
   log(`追问完成（${result.handling === 'answer' ? '主席直接回答' : '重新讨论'}）。本地记录：${path.relative(process.cwd(), runDir) || runDir}`);
+  return result;
+}
+
+/**
+ * 给还没有主文档的旧讨论补写一份。只打印到终端，不发群、不写讨论记录；结果写回原讨论的 state.json 和 主文档.md。
+ */
+export async function docOne(cfg, { number, mock = false, runsDir = RUNS }) {
+  let found;
+  try {
+    found = findState(runsDir, number);
+  } catch (err) {
+    throw new ConfigError(err.message);
+  }
+  const { dir, state } = found;
+  const providers = createProviderRegistry(cfg, { forceMock: mock });
+  const publisher = combinePublishers([createConsolePublisher({ full: false })]);
+  log(`补写主文档 #${state.number}「${state.topic.split('\n')[0].slice(0, 30)}」：主席读全部记录写初稿，主笔核对`);
+  let result;
+  try {
+    result = await backfillDoc({ cfg: { ...cfg, mode: state.mode }, state, providers, publisher, log });
+  } catch (err) {
+    throw new ConfigError(err.message);
+  }
+  saveState(dir, result.state);
+  const { stats, doc } = result;
+  const extra = Object.keys(doc.attachments).length;
+  log(`完成：第 ${doc.version} 版，${doc.text.length} 字${extra ? `，附录 ${extra} 份` : ''}。${stats.calls} 次模型调用${stats.costUsd ? `，约 $${stats.costUsd.toFixed(2)}` : ''}。文件：${path.join(dir, '主文档.md')}`);
   return result;
 }
 

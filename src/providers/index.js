@@ -42,6 +42,8 @@ export function createMockProvider(spec = {}) {
       const who = /你是「([^」]+)」/.exec(`${system ?? ''}\n${prompt ?? ''}`)?.[1] ?? 'mock';
       const stage = /【阶段：([^】]+)】/.exec(prompt ?? '')?.[1] ?? '回答';
       if (stage === '修订版') return { text: mockRevision(prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 20 } };
+      if (stage === '核对主文档') return { text: '没有问题', model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 4 } };
+      if (stage.includes('主文档')) return { text: mockDoc(stage, prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
       return {
         text: `**${who}** 的${stage}（mock）\n\n- 要点一\n- 要点二\n\n提示词长度 ${prompt?.length ?? 0} 字。`,
         model: model ?? 'mock',
@@ -50,6 +52,27 @@ export function createMockProvider(spec = {}) {
       };
     },
   };
+}
+
+/** mock 的主文档：初稿或更新后的完整版本，版本号从提示词里取。 */
+function mockDoc(stage, prompt) {
+  const version = Number(/现在的主文档（第 (\d+) 版）/.exec(prompt ?? '')?.[1] ?? 0) + 1;
+  return [
+    '【说明】',
+    stage.startsWith('更新') ? `追问的结论（mock）：主文档改到第 ${version} 版。` : '**一句话结论**：mock 讨论的结论。',
+    '【主文档】',
+    '# mock 主文档',
+    '**一句话结论**：mock 讨论的结论。',
+    '## 要点',
+    '- 要点一',
+    '- 要点二',
+    '## 问题',
+    '议题背景（mock）。',
+    '## 方案',
+    `- 第 ${version} 版的方案（mock）`,
+    '## 变更记录',
+    ...Array.from({ length: version }, (_, i) => `- 第 ${i + 1} 版（mock）`),
+  ].join('\n');
 }
 
 /** mock 的修订版：按提示词里的 JSON Schema，把第一个文字字段改一下，其余字段由解析时用原值补齐。 */

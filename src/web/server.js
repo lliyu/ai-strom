@@ -3,43 +3,50 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeConfig } from '../config.js';
-import { listStates, nextNumber, saveState } from '../state.js';
+import { listStates, nextNumber, saveState, STATE_FILE, DOC_FILE } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS } from '../modes.js';
-import { RUNS, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
+import { RUNS, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
+import { parseRepoSpecs, resolveRepos, availableRepos } from '../repos.js';
+import { appendInbox } from '../inbox.js';
 import { createNovelClient } from '../novel.js';
 
 /**
- * 本地网页：从墨稿列出脑洞 / 梗概 / 总纲，挑一项发起多模型打磨，实时看讨论、插话、追问，
- * 对比修订版，确认后写回墨稿。只监听本机地址，没有登录。
+ * 本地网页：所有讨论（群里发起的和网页上发起的）都能在这里看、插话、追问；
+ * 网页上可以发起方案讨论、脑洞风暴（只在网页上，不发群），以及从墨稿挑一项做作品打磨。只监听本机地址，没有登录。
  *
- * 讨论一场一场排队执行。每场讨论的全部发言（包括之后的追问）写在 runs/<讨论>/thread.jsonl，
- * 页面打开时先读这个文件，再用 SSE 接着收新的发言。
+ * 讨论记录都在 runs/ 下：每场讨论一个目录，追问各自一个「…-追问#编号-…」目录。
+ * 网页直接读这些目录里的 events.jsonl（发言）、usage.jsonl（进度）和 state.json（结论、会话），
+ * 所以不管讨论是 Lark 监听进程还是网页自己跑的，看到的都一样；进行中的讨论每秒检查一次文件，有新发言就推给页面。
+ * 插话写进正在进行的那个目录的 inbox.jsonl，跑讨论的进程每轮开始时读。
+ *
+ * 网页上发起的讨论和追问一场一场排队，由网页进程自己跑；群里发起的讨论在网页上追问时，追问照样发到群里。
  */
 
 const PAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'page.html');
-const THREAD = 'thread.jsonl';
 const LOCAL = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
+const FOLLOW_UP_DIR = /-追问#(\d+)-/;
+const MODE_LABELS = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨' };
 
-export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock = false, runsDir = RUNS, log = defaultLog, echo = true, runner = { runPrepared, followUpOne } } = {}) {
-  const refineCfg = () => normalizeConfig(cfg, { mode: 'refine' });
-  const live = new Map(); // 编号 -> { status, posts, clients, inbox, subject, topic, threadFile, error, speaking }
+export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock = false, runsDir = RUNS, log = defaultLog, echo = true, pollMs = 1000, runner = { runOne, runPrepared, followUpOne } } = {}) {
   const queue = [];
   let current = null;
+  const pending = new Map(); // 网页上刚排队、还没建目录的讨论：编号 -> { mode, topic, subject }
+  const failures = new Map(); // 网页跑的讨论在建目录之前就失败了：编号 -> 错误
 
-  const stateOf = (number) => listStates(runsDir).find((s) => s.state.number === number) ?? null;
+  const cfgFor = (mode, rounds) => normalizeConfig(cfg, { mode, ...(rounds !== undefined ? { rounds } : {}) });
+  const speakers = () => {
+    const all = new Map();
+    for (const mode of ['decision', 'refine']) {
+      const c = cfgFor(mode);
+      for (const s of [...c.participants, c.chair, ...(c.research ? [c.research] : [])]) all.set(`${mode}:${s.id}`, s);
+    }
+    return all;
+  };
 
-  function entryFor(number) {
-    if (!live.has(number)) live.set(number, { number, status: 'idle', clients: new Set(), inbox: [], speaking: [] });
-    return live.get(number);
-  }
+  // ---------- 读 runs/ ----------
 
-  function broadcast(entry, event, data) {
-    const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const res of entry.clients) res.write(line);
-  }
-
-  function readThread(file) {
-    if (!file || !fs.existsSync(file)) return [];
+  function readJsonl(file) {
+    if (!fs.existsSync(file)) return [];
     return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).flatMap((l) => {
       try {
         return [JSON.parse(l)];
@@ -49,125 +56,219 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     });
   }
 
-  /** 网页发布者：发言写进 thread.jsonl，并推给正在看这场讨论的页面。 */
-  function webPublisher(number) {
-    const entry = entryFor(number);
-    return {
-      name: 'web',
-      async post(msg) {
-        if (!entry.threadFile) return;
-        const post = {
-          seq: readThread(entry.threadFile).length + 1,
-          at: new Date().toISOString(),
-          speaker: { id: msg.speaker.id, name: msg.speaker.name, color: msg.speaker.color },
-          title: msg.title,
-          subtitle: msg.subtitle ?? '',
-          brief: msg.brief ?? null,
-          body: msg.body,
-          plan: msg.plan ?? null,
-          footer: msg.footer ?? '',
-          stage: msg.meta?.stage ?? null,
-          error: msg.meta?.error ?? null,
-        };
-        fs.appendFileSync(entry.threadFile, `${JSON.stringify(post)}\n`);
-        broadcast(entry, 'post', post);
-      },
-    };
+  function readJson(file) {
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      return null;
+    }
   }
 
-  /** 页面上的插话：下一轮开始时交给所有模型。 */
-  function webInterjections(number) {
-    const entry = entryFor(number);
-    return {
-      async poll() {
-        return entry.inbox.splice(0);
-      },
-    };
-  }
-
-  function onEventFor(number) {
-    const entry = entryFor(number);
-    return (e) => {
-      if (e.type === 'call_started') entry.speaking.push({ speaker: e.speaker, stage: e.stage, round: e.round, at: e.at });
-      if (e.type === 'call_finished' || e.type === 'call_failed') {
-        const i = entry.speaking.findIndex((s) => s.speaker === e.speaker && s.stage === e.stage);
-        if (i >= 0) entry.speaking.splice(i, 1);
+  /** 编号 -> { number, dir, start（usage.jsonl 第一行）, state, followDirs } */
+  function scan() {
+    const runs = new Map();
+    const follows = [];
+    if (!fs.existsSync(runsDir)) return runs;
+    for (const name of fs.readdirSync(runsDir).sort()) {
+      const dir = path.join(runsDir, name);
+      if (name.startsWith('.') || !fs.statSync(dir).isDirectory()) continue;
+      const f = FOLLOW_UP_DIR.exec(name);
+      if (f) {
+        follows.push({ number: Number(f[1]), dir });
+        continue;
       }
-      if (e.type.startsWith('call_')) broadcast(entry, 'progress', progressOf(entry));
+      const start = readJsonl(path.join(dir, 'usage.jsonl')).find((r) => r.type === 'run_started');
+      const state = readJson(path.join(dir, STATE_FILE));
+      const number = state?.number ?? start?.number;
+      if (!number) continue; // 命令行 --mock 演练不编号
+      runs.set(number, { number, dir, start: start ?? null, state, followDirs: [] });
+    }
+    for (const f of follows) runs.get(f.number)?.followDirs.push(f.dir);
+    return runs;
+  }
+
+  const findRun = (number) => scan().get(number) ?? null;
+  const dirsOf = (run) => [run.dir, ...run.followDirs];
+  const latestDir = (run) => dirsOf(run).at(-1);
+  const modeOf = (run) => run.state?.mode ?? run.start?.mode ?? 'decision';
+  const channelOf = (run) => run.state?.channel ?? run.start?.channel
+    ?? (modeOf(run) === 'refine' ? 'web' : (run.state?.dryRun ?? run.start?.dryRun) ? 'dry-run' : 'lark');
+
+  function postsOf(run) {
+    const table = speakers();
+    const mode = modeOf(run);
+    const posts = [];
+    for (const [part, dir] of dirsOf(run).entries()) {
+      const followUp = part > 0;
+      for (const e of readJsonl(path.join(dir, 'events.jsonl'))) {
+        const sp = table.get(`${mode}:${e.speaker}`) ?? table.get(`decision:${e.speaker}`);
+        posts.push({
+          seq: posts.length + 1,
+          at: e.at,
+          speaker: { id: e.speaker, name: sp?.name ?? e.speaker, color: sp?.color ?? 'grey' },
+          title: e.title,
+          subtitle: e.subtitle ?? '',
+          brief: e.brief ?? null,
+          body: e.body ?? '',
+          plan: e.plan ?? null,
+          footer: e.footer ?? '',
+          stage: e.meta?.stage ?? null,
+          error: e.meta?.error ?? null,
+          followUp,
+          part,
+        });
+      }
+    }
+    return posts;
+  }
+
+  const alive = (pid) => {
+    if (!pid) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return err.code === 'EPERM';
+    }
+  };
+
+  /** 进度：看最新一个目录（原讨论或最后一次追问）的 usage.jsonl。 */
+  function progressOf(number, run) {
+    const qi = queue.findIndex((j) => j.number === number);
+    if (qi >= 0) return { status: 'queued', queuedAhead: qi + (current ? 1 : 0), speaking: [] };
+    if (!run) {
+      if (failures.has(number)) return { status: 'failed', error: failures.get(number), speaking: [] };
+      return { status: current?.number === number ? 'running' : 'queued', speaking: [] };
+    }
+    const rows = readJsonl(path.join(latestDir(run), 'usage.jsonl'));
+    const startIdx = rows.findLastIndex((r) => r.type === 'run_started');
+    const tail = startIdx >= 0 ? rows.slice(startIdx) : rows;
+    const end = tail.find((r) => r.type === 'run_finished' || r.type === 'run_failed');
+    if (end?.type === 'run_failed') return { status: 'failed', error: end.error, speaking: [] };
+    if (end || startIdx < 0) return { status: current?.number === number ? 'running' : 'done', speaking: [] };
+    const started = tail[0];
+    if (current?.number !== number && !alive(started.pid)) return { status: 'failed', error: '跑这场讨论的进程已经退出，讨论没有正常结束', speaking: [] };
+    const open = [];
+    for (const r of tail) {
+      if (r.type === 'call_started') open.push(r);
+      if (r.type === 'call_finished' || r.type === 'call_failed') {
+        const i = open.findIndex((s) => s.speaker === r.speaker && s.stage === r.stage && s.round === r.round);
+        if (i >= 0) open.splice(i, 1);
+      }
+    }
+    const table = speakers();
+    const mode = modeOf(run);
+    return {
+      status: 'running',
+      speaking: open.map((s) => ({ name: (table.get(`${mode}:${s.speaker}`) ?? table.get(`decision:${s.speaker}`))?.name ?? s.speaker, stage: STAGE_LABELS[s.stage] ?? s.stage, round: s.round, at: s.at })),
     };
   }
 
-  const speakerName = (id) => [...cfg.participants, cfg.chair].find((s) => s.id === id)?.name ?? id;
-  const progressOf = (entry) => ({
-    status: entry.status,
-    error: entry.error ?? null,
-    speaking: entry.speaking.map((s) => ({ name: speakerName(s.speaker), stage: STAGE_LABELS[s.stage] ?? s.stage, round: s.round, at: s.at })),
-    // 前面还有几场（包括正在进行的那场）
-    queuedAhead: entry.status === 'queued' ? queue.findIndex((j) => j.number === entry.number) + (current ? 1 : 0) : 0,
-  });
-
-  function setStatus(number, status, error) {
-    const entry = entryFor(number);
-    entry.status = status;
-    entry.error = error ?? null;
-    if (status !== 'running') entry.speaking = [];
-    broadcast(entry, 'progress', progressOf(entry));
+  function summaryOf(run) {
+    const { state, start } = run;
+    const mode = modeOf(run);
+    const subject = state?.subject ?? start?.subject;
+    return {
+      number: run.number,
+      mode,
+      channel: channelOf(run),
+      topic: mode === 'refine' ? subject?.title ?? '' : (state?.topic ?? start?.topic ?? '').split('\n')[0].slice(0, 120),
+      requirement: mode === 'refine' ? (state?.topic ?? start?.topic ?? '') : undefined,
+      type: subject?.type,
+      createdAt: state?.createdAt ?? start?.at ?? null,
+      updatedAt: state?.updatedAt ?? null,
+      status: progressOf(run.number, run).status,
+      followUps: state?.followUps?.length ?? run.followDirs.length,
+      hasRevision: Boolean(state?.revision),
+      docVersion: state?.docs?.at(-1)?.version ?? null,
+      applied: state?.applied ?? null,
+      mock: Boolean(state?.mock ?? start?.mock),
+    };
   }
+
+  function listRuns() {
+    const runs = scan();
+    const rows = [...runs.values()].map(summaryOf);
+    for (const [number, p] of pending) {
+      if (runs.has(number)) {
+        pending.delete(number);
+        continue;
+      }
+      rows.push({ number, mode: p.mode, channel: 'web', topic: p.mode === 'refine' ? p.subject.title : p.topic.split('\n')[0].slice(0, 120), requirement: p.mode === 'refine' ? p.topic : undefined, type: p.subject?.type, status: progressOf(number, null).status, followUps: 0, hasRevision: false, applied: null, mock });
+    }
+    return rows.sort((a, b) => b.number - a.number);
+  }
+
+  function runDetail(number) {
+    const run = findRun(number);
+    const p = pending.get(number);
+    if (!run && !p) throw httpError(404, `没有 #${number} 这场讨论`);
+    if (!run) {
+      return { number, mode: p.mode, channel: 'web', topic: p.topic, subject: p.subject ?? null, summary: null, docs: [], docFile: null, revision: null, revisions: [], followUps: [], applied: null, expired: false, mock, canFollowUp: false, progress: progressOf(number, null), posts: [] };
+    }
+    const { state, start } = run;
+    const mode = modeOf(run);
+    const subject = state?.subject ?? start?.subject ?? null;
+    const progress = progressOf(number, run);
+    const lastDiscuss = [...(state?.followUps ?? [])].reverse().find((f) => f.handling === 'discuss');
+    return {
+      number,
+      mode,
+      channel: channelOf(run),
+      topic: state?.topic ?? start?.topic ?? '',
+      subject: subject && subject.fields ? { type: subject.type, id: subject.id, title: subject.title, current: subject.current, background: subject.background, fields: subject.fields, version: subject.version } : subject,
+      summary: state?.summary ?? null,
+      conclusion: lastDiscuss?.answer ?? state?.summary ?? null,
+      // 主文档的所有版本（最新的在最后）；旧讨论没有主文档时为空，页面退回显示汇总
+      docs: state?.docs ?? [],
+      docFile: state?.docs?.length ? path.join(run.dir, DOC_FILE) : null,
+      revision: state?.revision ?? null,
+      revisions: state?.revisions ?? [],
+      followUps: (state?.followUps ?? []).map((f) => ({ question: f.question, handling: f.handling, answer: f.answer, doc: f.doc ?? null, at: f.at })),
+      applied: state?.applied ?? null,
+      expired: Boolean(state?.expired),
+      mock: Boolean(state?.mock ?? start?.mock),
+      dryRun: Boolean(state?.dryRun ?? start?.dryRun),
+      code: state?.context ? { auto: Boolean(state.context.auto), repos: state.context.repos ?? [] } : null,
+      canFollowUp: Boolean(state) && !state.expired && progress.status !== 'running' && progress.status !== 'queued',
+      progress,
+      posts: postsOf(run),
+    };
+  }
+
+  // ---------- 网页自己跑的讨论 ----------
 
   async function pump() {
     if (current || !queue.length) return;
     current = queue.shift();
     const job = current;
-    const entry = entryFor(job.number);
-    setStatus(job.number, 'running');
-    const common = {
-      runsDir,
-      echo,
-      mock,
-      lark: false,
-      interject: true,
-      extraPublishers: [webPublisher(job.number)],
-      interjections: webInterjections(job.number),
-      onEvent: onEventFor(job.number),
-    };
+    const common = { runsDir, echo, mock, interject: true };
     try {
       if (job.kind === 'refine') {
-        await runner.runPrepared(refineCfg(), {
-          ...common,
-          topic: job.topic,
-          number: job.number,
-          subject: job.subject,
-          onRunDir: (dir) => { entry.threadFile = path.join(dir, THREAD); },
-        });
+        await runner.runPrepared(cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
+      } else if (job.kind === 'discuss') {
+        await runner.runOne(cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, number: job.number, repos: job.repos });
       } else {
-        await runner.followUpOne(refineCfg(), {
-          ...common,
-          question: job.question,
-          number: job.number,
-          onRunDir: (_dir, _n, origDir) => { entry.threadFile = path.join(origDir, THREAD); },
-        });
+        // 群里的讨论在网页上追问：照样发到群里（dry-run 的讨论打印到终端）
+        await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number });
       }
-      setStatus(job.number, 'done');
     } catch (err) {
       log(`⚠️ #${job.number} 失败：${err.message}`);
-      await webPublisher(job.number).post({ speaker: cfg.chair, title: '讨论中断', subtitle: '出错了', body: err.message, meta: { error: err.message } }).catch(() => {});
-      setStatus(job.number, 'failed', err.message);
+      failures.set(job.number, err.message);
     } finally {
       current = null;
-      for (const e of live.values()) if (e.status === 'queued') broadcast(e, 'progress', progressOf(e));
       setImmediate(pump);
     }
   }
 
   function enqueue(job) {
     queue.push(job);
-    setStatus(job.number, 'queued');
     setImmediate(pump);
   }
 
   const busyWith = (number) => current?.number === number || queue.some((j) => j.number === number);
 
-  // ---------- 路由 ----------
+  // ---------- 操作 ----------
 
   async function startRefine({ type, id, requirement = '' }) {
     if (!SUBJECT_LABELS[type] || !id) throw httpError(400, '需要 type（idea / premise / outline）和 id');
@@ -184,91 +285,68 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       fieldsSchema: item.fieldsSchema,
       rules: item.rules,
     };
-    const entry = entryFor(number);
-    Object.assign(entry, { subject, topic: String(requirement).slice(0, 4000) });
-    enqueue({ kind: 'refine', number, subject, topic: entry.topic });
+    const topic = String(requirement).slice(0, 4000);
+    pending.set(number, { mode: 'refine', topic, subject });
+    enqueue({ kind: 'refine', number, subject, topic });
     log(`网页：#${number} 打磨${SUBJECT_LABELS[type]}「${item.title}」排队`);
     return { number };
   }
 
-  function runSummary({ state }) {
-    const entry = live.get(state.number);
-    return {
-      number: state.number,
-      type: state.subject?.type,
-      title: state.subject?.title,
-      requirement: state.topic,
-      createdAt: state.createdAt,
-      updatedAt: state.updatedAt,
-      status: entry && entry.status !== 'idle' ? entry.status : 'done',
-      hasRevision: Boolean(state.revision),
-      applied: state.applied ?? null,
-      followUps: state.followUps?.length ?? 0,
-      mock: Boolean(state.mock),
-    };
-  }
-
-  function listRuns() {
-    const saved = listStates(runsDir).filter((s) => s.state.mode === 'refine').map(runSummary);
-    const savedNumbers = new Set(saved.map((r) => r.number));
-    const pending = [...live].filter(([n, e]) => !savedNumbers.has(n) && e.subject).map(([n, e]) => ({
-      number: n, type: e.subject.type, title: e.subject.title, requirement: e.topic, status: e.status, hasRevision: false, applied: null, followUps: 0, mock,
-    }));
-    return [...pending, ...saved].sort((a, b) => b.number - a.number);
-  }
-
-  function runDetail(number) {
-    const found = stateOf(number);
-    const entry = live.get(number);
-    if (!found && !entry?.subject) throw httpError(404, `没有 #${number} 这场打磨`);
-    const state = found?.state;
-    if (state && state.mode !== 'refine') throw httpError(404, `#${number} 不是打磨讨论`);
-    const threadFile = found ? path.join(found.dir, THREAD) : entry.threadFile;
-    if (entry && found) entry.threadFile ??= threadFile;
-    const subject = state?.subject ?? entry.subject;
-    return {
-      number,
-      subject: { type: subject.type, id: subject.id, title: subject.title, current: subject.current, background: subject.background, fields: subject.fields, version: subject.version },
-      requirement: state?.topic ?? entry.topic,
-      summary: state?.summary ?? null,
-      revision: state?.revision ?? null,
-      revisions: state?.revisions ?? [],
-      followUps: (state?.followUps ?? []).map((f) => ({ question: f.question, handling: f.handling, at: f.at })),
-      applied: state?.applied ?? null,
-      expired: Boolean(state?.expired),
-      mock: Boolean(state?.mock ?? mock),
-      progress: entry ? progressOf(entry) : { status: 'done', speaking: [] },
-      posts: readThread(threadFile),
-    };
+  /** 网页上发起方案讨论或脑洞风暴：只在网页上，不发到群里。 */
+  function startDiscussion({ mode, topic, repos, rounds }) {
+    if (mode !== 'decision' && mode !== 'brainstorm') throw httpError(400, 'mode 只能是 decision 或 brainstorm');
+    const text = String(topic ?? '').trim();
+    if (!text) throw httpError(400, `${mode === 'brainstorm' ? '题目' : '议题'}不能为空`);
+    let r;
+    if (rounds !== undefined && rounds !== null && rounds !== '' && rounds !== 'auto') {
+      r = Number(rounds);
+      if (!Number.isInteger(r) || r < 2 || r > 12) throw httpError(400, '轮数要是 2 到 12 的整数，或者自动');
+    } else if (rounds === 'auto') r = 'auto';
+    // 仓库：不写 = 方案讨论自动定位；「无」= 不读代码；否则是别名列表。先校验，写错了不排队
+    let repoSpecs;
+    const repoText = String(repos ?? '').trim();
+    if (repoText) {
+      try {
+        const specs = parseRepoSpecs(repoText);
+        if (specs.length) resolveRepos(cfgFor(mode), specs);
+        repoSpecs = repoText;
+      } catch (err) {
+        throw httpError(400, err.message);
+      }
+    }
+    const number = nextNumber(runsDir);
+    pending.set(number, { mode, topic: text.slice(0, 8000) });
+    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), repos: repoSpecs, rounds: r });
+    log(`网页：#${number} ${MODE_LABELS[mode]}排队`);
+    return { number };
   }
 
   function interject(number, text) {
-    const entry = live.get(number);
-    if (!entry || entry.status !== 'running') throw httpError(409, '这场讨论没有在进行，插话不会被看到；讨论结束后可以追问');
     const t = String(text ?? '').trim();
     if (!t) throw httpError(400, '插话不能为空');
-    entry.inbox.push({ sender: '作者', text: t.slice(0, 4000), time: new Date().toTimeString().slice(0, 5) });
-    return { ok: true, pending: entry.inbox.length };
+    const run = findRun(number);
+    if (!run || progressOf(number, run).status !== 'running') throw httpError(409, '这场讨论没有在进行，插话不会被看到；讨论结束后可以追问');
+    appendInbox(latestDir(run), { sender: modeOf(run) === 'refine' ? '作者' : '主持人', text: t.slice(0, 4000) });
+    return { ok: true, lark: channelOf(run) === 'lark' };
   }
 
   function followUp(number, question) {
     const q = String(question ?? '').trim();
     if (!q) throw httpError(400, '追问不能为空');
-    const found = stateOf(number);
-    if (!found || found.state.mode !== 'refine') throw httpError(404, `没有 #${number} 这场打磨，或者它还没结束`);
-    if (found.state.expired) throw httpError(409, `#${number} 已超过保留期，会话已清理，请重新发起打磨`);
-    if (busyWith(number)) throw httpError(409, `#${number} 还在进行或排队中`);
-    const entry = entryFor(number);
-    entry.threadFile = path.join(found.dir, THREAD);
-    enqueue({ kind: 'followup', number, question: q.slice(0, 4000) });
-    return { ok: true };
+    const run = findRun(number);
+    if (!run?.state) throw httpError(404, `#${number} 还没结束或没有保存状态，不能追问`);
+    if (run.state.expired) throw httpError(409, `#${number} 已超过保留期，会话已清理，请重新发起讨论`);
+    if (busyWith(number) || progressOf(number, run).status === 'running') throw httpError(409, `#${number} 还在进行或排队中`);
+    const channel = channelOf(run);
+    enqueue({ kind: 'followup', number, mode: modeOf(run), question: q.slice(0, 4000), lark: channel !== 'web', dryRun: channel === 'dry-run' });
+    return { ok: true, lark: channel === 'lark' };
   }
 
   async function apply(number, revisionAt) {
-    const found = stateOf(number);
-    if (!found?.state.revision) throw httpError(404, `#${number} 还没有修订版`);
+    const run = findRun(number);
+    const state = run?.state;
+    if (!state?.revision) throw httpError(404, `#${number} 还没有修订版`);
     if (busyWith(number)) throw httpError(409, `#${number} 还在进行，等它结束再写回`);
-    const { state, dir } = found;
     if (revisionAt && revisionAt !== state.revision.at) throw httpError(409, '页面上的修订版已经过时，刷新后再确认');
     if (state.applied?.revisionAt === state.revision.at) throw httpError(409, '这一版已经写回过了');
     if (state.mock) throw httpError(409, '这是 mock 演练出来的修订版，不写回墨稿');
@@ -280,10 +358,32 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       note: `ai-storm #${number} 打磨写回前`,
     });
     const applied = { at: new Date().toISOString(), revisionAt: state.revision.at, version: res.version };
-    saveState(dir, { ...state, applied, appliedHistory: [...(state.appliedHistory ?? []), applied] });
+    saveState(run.dir, { ...state, applied, appliedHistory: [...(state.appliedHistory ?? []), applied] });
     log(`网页：#${number} 修订版已写回墨稿`);
     return { ok: true, applied };
   }
+
+  function status() {
+    const watch = readJson(path.join(runsDir, '.watch.state.json'));
+    const { repos, groups } = availableRepos(cfg);
+    const people = (mode) => {
+      const c = cfgFor(mode);
+      return c.participants.map((p) => ({ id: p.id, name: p.name, role: p.role, part: p.part ?? 'lead', color: p.color }));
+    };
+    return {
+      mock,
+      novel: novel.baseUrl,
+      current: current ? { number: current.number, kind: current.kind } : null,
+      queued: queue.map((j) => ({ number: j.number, kind: j.kind })),
+      watch: watch && alive(watch.pid) ? { phase: watch.phase, current: watch.current, dryRun: watch.dryRun } : null,
+      repos,
+      groups,
+      maxRounds: cfg.maxRounds,
+      participants: { decision: people('decision'), brainstorm: people('brainstorm'), refine: people('refine') },
+    };
+  }
+
+  // ---------- 路由 ----------
 
   async function route(req, res, url) {
     const m = /^\/api\/runs\/(\d+)(?:\/(events|interject|followup|apply))?$/.exec(url.pathname);
@@ -291,19 +391,14 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(fs.readFileSync(PAGE));
     }
-    if (req.method === 'GET' && url.pathname === '/api/status') {
-      return json(res, {
-        mock,
-        novel: novel.baseUrl,
-        current: current ? { number: current.number, kind: current.kind } : null,
-        queued: queue.map((j) => ({ number: j.number, kind: j.kind })),
-        participants: refineCfg().participants.map((p) => ({ id: p.id, name: p.name, role: p.role, part: p.part ?? 'lead', color: p.color })),
-      });
-    }
+    if (req.method === 'GET' && url.pathname === '/api/status') return json(res, status());
     if (req.method === 'GET' && url.pathname === '/api/novel/items') return json(res, { items: await novel.list() });
     if (req.method === 'GET' && url.pathname === '/api/novel/item') return json(res, await novel.get(url.searchParams.get('type'), url.searchParams.get('id')));
     if (req.method === 'GET' && url.pathname === '/api/runs') return json(res, { runs: listRuns() });
-    if (req.method === 'POST' && url.pathname === '/api/runs') return json(res, await startRefine(await body(req)), 201);
+    if (req.method === 'POST' && url.pathname === '/api/runs') {
+      const b = await body(req);
+      return json(res, b.type ? await startRefine(b) : startDiscussion(b), 201);
+    }
     if (!m) throw httpError(404, '没有这个地址');
     const number = Number(m[1]);
     if (req.method === 'GET' && !m[2]) return json(res, runDetail(number));
@@ -314,22 +409,37 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     throw httpError(405, '不支持的请求');
   }
 
+  /** 每秒看一次文件：有新发言就推 post，进度变了就推 progress。 */
   function sse(req, res, number) {
-    const entry = entryFor(number);
-    if (!entry.threadFile) {
-      const found = stateOf(number);
-      if (found) entry.threadFile = path.join(found.dir, THREAD);
-    }
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive' });
-    entry.clients.add(res);
-    // 打开页面到连上 SSE 之间的发言：按 seq 补发
-    const after = Number(new URL(req.url, 'http://x').searchParams.get('after') ?? 0);
-    for (const p of readThread(entry.threadFile)) if (p.seq > after) res.write(`event: post\ndata: ${JSON.stringify(p)}\n\n`);
-    res.write(`event: progress\ndata: ${JSON.stringify(progressOf(entry))}\n\n`);
+    let sent = Number(new URL(req.url, 'http://x').searchParams.get('after') ?? 0);
+    let lastProgress = '';
+    const tick = () => {
+      try {
+        const run = findRun(number);
+        if (run) {
+          for (const p of postsOf(run)) {
+            if (p.seq > sent) {
+              res.write(`event: post\ndata: ${JSON.stringify(p)}\n\n`);
+              sent = p.seq;
+            }
+          }
+        }
+        const prog = JSON.stringify(progressOf(number, run));
+        if (prog !== lastProgress) {
+          res.write(`event: progress\ndata: ${prog}\n\n`);
+          lastProgress = prog;
+        }
+      } catch (err) {
+        log(`⚠️ 推送 #${number} 失败：${err.message}`);
+      }
+    };
+    tick();
+    const timer = setInterval(tick, pollMs);
     const beat = setInterval(() => res.write(': ping\n\n'), 25000);
     req.on('close', () => {
+      clearInterval(timer);
       clearInterval(beat);
-      entry.clients.delete(res);
     });
   }
 
@@ -345,14 +455,14 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       }
       await route(req, res, new URL(req.url, `http://${host}`));
     } catch (err) {
-      const status = err.status ?? 500;
-      if (status >= 500 && !(err.status)) log(`⚠️ 网页出错：${err.stack ?? err.message}`);
-      if (!res.headersSent) json(res, { error: err.message }, status);
+      const code = err.status ?? 500;
+      if (!err.status) log(`⚠️ 网页出错：${err.stack ?? err.message}`);
+      if (!res.headersSent) json(res, { error: err.message }, code);
       else res.end();
     }
   }
 
-  return { handle, live, queue, idle: () => !current && !queue.length };
+  return { handle, queue, idle: () => !current && !queue.length };
 }
 
 function httpError(status, message) {
@@ -382,7 +492,7 @@ export function startWebServer(app, { host, port, log = defaultLog }) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, host, () => {
-      log(`打磨页面：http://${host === '::1' ? '[::1]' : host}:${port}/`);
+      log(`ai-storm 页面：http://${host === '::1' ? '[::1]' : host}:${port}/`);
       resolve(server);
     });
   });

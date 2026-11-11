@@ -55,6 +55,7 @@ const ANSWER = '1. 只取一条：同类型不堆叠（fission:stacking.go:520�
 function discussionScript({ failFirstCheck = false } = {}) {
   let checks = 0;
   return ({ who, stage }) => {
+    if (stage === '核对主文档') return '没有问题';
     if (who === '调研员' && stage === '代码调研') return '**一句话现状**\nfission:Price.java:42';
     if (who === '调研员' && /代码核实/.test(stage)) {
       checks += 1;
@@ -113,12 +114,13 @@ test('讨论中：能查代码的主笔带只读工具；评审提的待核实�
     'C:第 3 轮评审意见', // 评审没有意见了，但有新的核实结果：主笔要先修订，不提前结束
     'A:第 3 轮互评与修订', 'B:第 3 轮互评与修订',
     'C:第 4 轮评审意见', // 这才结束
-    '主席:汇总',
+    '主席:主文档',
+    'A:核对主文档', 'B:核对主文档', // 主笔核对，没有意见就不用改
   ]);
   assert.equal(res.ending.reason, 'converged');
 
   // 能查代码的主笔：每次都带只读工具和目录；第一次给完整目录，之后只提醒
-  const a = calls.filter((c) => c.who === 'A');
+  const a = calls.filter((c) => c.who === 'A' && c.stage !== '核对主文档'); // 核对主文档不用查代码
   for (const c of a) {
     assert.deepEqual(c.tools, TOOLS);
     assert.deepEqual(c.addDirs, ['/tmp/x', '/d/pricing']);
@@ -127,7 +129,7 @@ test('讨论中：能查代码的主笔带只读工具；评审提的待核实�
   assert.match(a[1].prompt, /你可以查代码\*\*：和前面一样/);
   assert.doesNotMatch(a[1].prompt, /`\/tmp\/x`/);
   // 其他人不带工具，但都被告知可以提待核实的问题
-  for (const c of calls.filter((x) => ['B', 'C'].includes(x.who))) {
+  for (const c of calls.filter((x) => ['B', 'C'].includes(x.who) && x.stage !== '核对主文档')) {
     assert.equal(c.tools, undefined);
     assert.match(c.prompt, /单独写一节「\*\*待核实的事实\*\*」/);
   }
@@ -144,8 +146,8 @@ test('讨论中：能查代码的主笔带只读工具；评审提的待核实�
   const r3 = calls.filter((c) => /第 3 轮/.test(c.stage) && c.who !== '调研员');
   for (const c of r3) assert.ok(c.prompt.includes('## 代码核实结果') && c.prompt.includes('同类型不堆叠'), `${c.who} 没收到核实结果`);
   assert.doesNotMatch(calls.find((c) => c.stage === '第 4 轮评审意见').prompt, /代码核实结果/);
-  // 主席汇总时拿到全部核实结果
-  assert.match(calls.at(-1).prompt, /讨论中的代码核实结果[\s\S]*同类型不堆叠/);
+  // 主席写主文档时拿到全部核实结果
+  assert.match(calls.find((c) => c.stage === '主文档').prompt, /讨论中的代码核实结果[\s\S]*同类型不堆叠/);
   // 发到群里，记进讨论状态
   assert.ok(publisher.posts.some((p) => p.speaker.id === 'research' && p.subtitle === '第 3 轮 · 代码核实 · 1 个问题'));
   assert.deepEqual(res.state.facts, [{ round: 3, questions: [QUESTION], answer: ANSWER }]);
@@ -163,17 +165,18 @@ test('核实失败不影响讨论，问题留到下一轮再查；同一个问�
   assert.equal(res.state.facts[0].round, 4);
 });
 
-test('最后一轮才提的问题：汇总前查掉，主席拿到结果', async () => {
+test('最后一轮才提的问题：写主文档前查掉，主席拿到结果', async () => {
   const cfg = config({ rounds: 2 });
   const { calls, registry } = scripted(({ who, stage }) => {
+    if (stage === '核对主文档') return '没有问题';
     if (who === '调研员' && stage === '代码调研') return '资料';
     if (who === '调研员') return ANSWER;
     if (who === 'B' && /第 2 轮/.test(stage)) return `修订\n\n**待核实的事实**\n- ${QUESTION}`;
     return null;
   });
   await runDiscussion({ cfg, topic: 't', providers: registry, publisher: createMemoryPublisher(), rng: () => 0, code });
-  assert.deepEqual(calls.slice(-2).map((c) => `${c.who}:${c.stage}`), ['调研员:第 3 轮代码核实', '主席:汇总']);
-  assert.match(calls.at(-1).prompt, /讨论中的代码核实结果/);
+  assert.deepEqual(calls.slice(-4, -2).map((c) => `${c.who}:${c.stage}`), ['调研员:第 3 轮代码核实', '主席:主文档']);
+  assert.match(calls.at(-3).prompt, /讨论中的代码核实结果/);
 });
 
 test('调研员判断不涉及代码时：不带工具，不请大家提待核实的问题', async () => {
@@ -191,7 +194,7 @@ test('关掉 research.factCheck：主笔仍能查代码，但不收集待核实�
   const { calls, registry } = scripted(discussionScript());
   await runDiscussion({ cfg, topic: 't', providers: registry, publisher: createMemoryPublisher(), rng: () => 0, code });
   assert.ok(calls.every((c) => !/代码核实/.test(c.stage)));
-  assert.ok(calls.filter((c) => c.who === 'A').every((c) => c.tools));
+  assert.ok(calls.filter((c) => c.who === 'A' && c.stage !== '核对主文档').every((c) => c.tools));
   assert.ok(calls.filter((c) => c.who !== '调研员').every((c) => !/单独写一节/.test(c.prompt)));
 });
 

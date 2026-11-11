@@ -22,7 +22,7 @@ function recordingProviders({ failWhen = () => false } = {}) {
     async complete({ model, system, prompt }) {
       const who = whoOf(arguments[0]);
       const stage = /【阶段：([^】]+)】/.exec(prompt)?.[1];
-      const text = `发言-${calls.length}`; // 回答里不带发言者名字，才能检验匿名
+      const text = stage === '核对主文档' ? '没有问题' : `发言-${calls.length}`; // 回答里不带发言者名字，才能检验匿名
       calls.push({ who, stage, model, system, prompt, text });
       if (failWhen({ who, stage })) throw new Error('模拟失败');
       return { text, model, durationMs: 10, usage: { inputTokens: 1, outputTokens: 1 } };
@@ -44,8 +44,9 @@ test('decision：发言次数、顺序与匿名', async () => {
   const pub = createMemoryPublisher();
   const result = await runDiscussion({ cfg, topic: '要不要拆分价格服务', providers: registry, publisher: pub, rng: fixedRng });
 
-  // 开场 1 + 3 人 × 3 轮 + 主席 1 + 结束 1
+  // 开场 1 + 3 人 × 3 轮 + 主文档 1 + 结束 1（主笔核对没有意见时不发）
   assert.equal(pub.posts.length, 1 + 9 + 1 + 1);
+  assert.equal(calls.filter((c) => c.stage === '核对主文档').length, 3);
   assert.equal(calls.filter((c) => c.stage === '独立方案').length, 3);
   assert.equal(calls.filter((c) => /互评与修订/.test(c.stage)).length, 6);
 
@@ -56,12 +57,15 @@ test('decision：发言次数、顺序与匿名', async () => {
   assert.doesNotMatch(review.prompt.split('其他主笔')[1], new RegExp(`${result.labels.p0}\\n`));
 
   // 主席只看到代号，结束卡片补上对照
-  const chair = calls.find((c) => c.stage === '汇总');
+  const chair = calls.find((c) => c.stage === '主文档');
   assert.doesNotMatch(chair.prompt, /模型\d/);
+  assert.match(chair.prompt, /文中不要出现代号和轮次/);
+  assert.equal(result.state.docs.length, 1);
+  assert.equal(result.state.summary, result.state.docs[0].text);
   const end = pub.posts.at(-1);
   assert.match(end.body, /代号对照/);
   assert.match(end.body, /方案 [A-C]：模型0 · 视角0/);
-  assert.equal(result.stats.calls, 10);
+  assert.equal(result.stats.calls, 9 + 1 + 3);
 });
 
 test('brainstorm：发散 → 盲审 → 修订 → 主编', async () => {
@@ -73,7 +77,8 @@ test('brainstorm：发散 → 盲审 → 修订 → 主编', async () => {
   assert.deepEqual(stages.filter((s) => s === '发散').length, 3);
   assert.deepEqual(stages.filter((s) => s === '盲审意见').length, 3);
   assert.deepEqual(stages.filter((s) => s === '修订').length, 3);
-  assert.equal(stages.at(-1), '汇总');
+  assert.ok(stages.includes('主文档'));
+  assert.match(calls.find((c) => c.stage === '主文档').prompt, /## 各方最终版脑洞/);
 
   // 修订时只拿到别人给的意见，评审者匿名，看不到别人的脑洞原文
   const revise = calls.find((c) => c.who.startsWith('模型0') && /修订/.test(c.stage));
@@ -128,15 +133,17 @@ test('decision + 评审：评审先提意见、不出方案，主笔回应后修
   assert.match(crit.prompt, /### 方案 B/);
   assert.doesNotMatch(crit.prompt, /### 方案 C/);
   // 主席知道方案与评审的区别，并输出未解决的问题
-  const chair = calls.find((c) => c.stage === '汇总');
+  const chair = calls.find((c) => c.stage === '主文档');
   assert.match(chair.prompt, /#### 评审 1/);
-  assert.match(chair.prompt, /评审提出但仍未解决的问题/);
+  assert.match(chair.prompt, /评审意见用来判断哪些问题已经解决/);
+  // 只有主笔核对主文档
+  assert.deepEqual(calls.filter((c) => c.stage === '核对主文档').map((c) => c.who.slice(0, 3)).sort(), ['模型0', '模型1']);
   // 代号对照同时列出方案与评审
   const end = pub.posts.at(-1).body;
   assert.match(end, /方案 A：/);
   assert.match(end, /评审 2：/);
   assert.match(pub.posts[0].body, /\*\*评审\*\*：模型2 · 视角2 \/ 模型3 · 视角3/);
-  assert.equal(result.stats.calls, 2 + 2 * (2 + 2) + 1);
+  assert.equal(result.stats.calls, 2 + 2 * (2 + 2) + 1 + 2);
 });
 
 test('brainstorm + 评审：评审只参与盲审，主笔收到全部意见', async () => {
@@ -178,7 +185,7 @@ test('插话进入下一轮所有人的提示词', async () => {
   const round2 = calls.filter((c) => /第 2 轮/.test(c.stage));
   assert.ok(round1.every((c) => !c.prompt.includes('不能改表结构')));
   assert.ok(round2.every((c) => c.prompt.includes('[14:20] 张三：不能改表结构')));
-  assert.ok(calls.find((c) => c.stage === '汇总').prompt.includes('不能改表结构'));
+  assert.ok(calls.find((c) => c.stage === '主文档').prompt.includes('不能改表结构'));
   assert.equal(result.interjections.length, 1);
 });
 
@@ -209,7 +216,8 @@ test('用量事件：开始、每次调用、结束都有记录', async () => {
   const p0 = finished.find((e) => e.speaker === 'p0');
   assert.equal(p0.contextWindow, 64000);
   assert.equal(p0.inputTokens, 1);
-  assert.ok(finished.some((e) => e.speaker === 'chair' && e.stage === 'summary'));
+  assert.ok(finished.some((e) => e.speaker === 'chair' && e.stage === 'doc'));
+  assert.ok(events.some((e) => e.type === 'doc_written' && e.version === 1));
 });
 
 test('第 1 轮成功不足 2 人时中止', async () => {

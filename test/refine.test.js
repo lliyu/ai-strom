@@ -76,7 +76,10 @@ test('打磨：打磨对象放在共用系统提示词里，换成打磨的角�
   assert.match(first.system, /金手指：离线收益/);
   assert.match(first.system, /作者的要求\n金手指太强/);
   assert.match(first.prompt, /结构与人物/);
-  assert.ok(calls.some((c) => c.stage === '汇总' && /你是「主编」/.test(c.prompt)));
+  const doc = calls.find((c) => c.stage === '主文档');
+  assert.match(doc.prompt, /你是「主编」[\s\S]*## 原稿的问题[\s\S]*## 修改方案/);
+  // 修订版按主文档写
+  assert.match(calls.find((c) => c.stage === '修订版').prompt, /讨论形成的修改说明（主文档）/);
   assert.deepEqual(res.revision.changed, ['goldenFinger']);
   assert.equal(res.state.revision.fields.goldenFinger, '离线收益，按天复利');
   assert.equal(res.state.subject.version, 'v1');
@@ -153,7 +156,9 @@ test('网页：发起打磨 → 讨论结束有修订版 → 确认后写回墨�
   assert.equal(detail.status, 200);
   assert.ok(detail.body.revision, '有修订版');
   assert.ok(detail.body.posts.length > 3, '发言写进了 thread.jsonl');
-  assert.equal(detail.body.requirement, '金手指太强');
+  assert.equal(detail.body.topic, '金手指太强');
+  assert.equal(detail.body.mode, 'refine');
+  assert.equal(detail.body.channel, 'web');
 
   // 跨站请求被拒
   const foreign = await request(port, 'POST', `/api/runs/${number}/apply`, {}, { origin: 'http://evil.example' });

@@ -113,7 +113,8 @@ test('主笔只把变化发给人看，完整方案交给评审和主席', async
   const finals = summary.prompt.slice(summary.prompt.indexOf('各主笔的最终方案'));
   assert.match(finals, /PLAN-A/);
   assert.match(finals, /PLAN-B/);
-  assert.equal(publisher.posts.find((m) => m.meta?.stage === 'summary').brief, '- 结论：做');
+  // 主席写的主文档：讨论里只发开头的结论
+  assert.match(publisher.posts.find((m) => m.meta?.stage === 'doc').body, /结论：做[\s\S]*「文档」页/);
 });
 
 test('超出字数上限时压缩重写一次，发布重写后的版本；压缩时丢了完整方案就沿用原来的', async () => {

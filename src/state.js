@@ -36,6 +36,30 @@ export function nextNumber(runsDir) {
 
 export function saveState(runDir, state) {
   writeJsonAtomic(path.join(runDir, STATE_FILE), state);
+  writeDocFiles(runDir, state);
+}
+
+export const DOC_FILE = '主文档.md';
+const ATTACHMENT = /^附录-.+\.md$/;
+const fileSafe = (s) => s.replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 40);
+
+/**
+ * 把最新一版主文档写成 Markdown 文件，方便在本机直接打开：主文档.md、附录-<标题>.md。
+ * 历史版本只在 state.json 的 docs 里。没有主文档时不写；新版删掉的附录，对应的文件也去掉。
+ */
+export function writeDocFiles(runDir, state) {
+  const doc = state?.docs?.at(-1);
+  if (!doc?.text) return;
+  fs.writeFileSync(path.join(runDir, DOC_FILE), `${doc.text.trim()}\n`);
+  const keep = new Set();
+  for (const [title, text] of Object.entries(doc.attachments ?? {})) {
+    const name = `附录-${fileSafe(title)}.md`;
+    keep.add(name);
+    fs.writeFileSync(path.join(runDir, name), `# ${title}\n\n${text.trim()}\n`);
+  }
+  for (const name of fs.readdirSync(runDir)) {
+    if (ATTACHMENT.test(name) && !keep.has(name)) fs.unlinkSync(path.join(runDir, name));
+  }
 }
 
 /** 所有有 state.json 的讨论：[{ dir, state }]，按编号从大到小。 */

@@ -60,7 +60,7 @@ test('自动轮数：评审都没有意见时提前结束，主笔不再修订',
   assert.deepEqual(calls.filter((c) => c.round === 3).map((c) => c.who).sort(), ['R1', 'R2']);
   // 评审被要求给结论，主席知道讨论是怎么结束的
   assert.match(calls.find((c) => c.who === 'R1').prompt, /评审结论：继续讨论」或「评审结论：没有意见了/);
-  assert.match(calls.at(-1).prompt, /第 3 轮所有评审都表示没有新意见/);
+  assert.match(calls.find((c) => c.stageText === '主文档').prompt, /第 3 轮所有评审都表示没有新意见/);
   assert.match(publisher.posts[0].body, /直到评审都没有新意见（最多 20 轮）/);
   assert.match(publisher.posts.at(-1).subtitle, /共 3 轮，评审都没有新意见/);
   assert.deepEqual(events.at(-1).ending, 'converged');
@@ -72,7 +72,7 @@ test('自动轮数：一直有意见就跑到上限，主席被告知强制结�
   const res = await runDiscussion({ cfg, topic: 't', providers: registry, publisher: createMemoryPublisher() });
   assert.equal(res.roundsUsed, 4);
   assert.equal(res.ending.reason, 'max');
-  assert.match(calls.at(-1).prompt, /达到上限 4 轮，评审仍有意见/);
+  assert.match(calls.find((c) => c.stageText === '主文档').prompt, /达到上限 4 轮，评审仍有意见/);
 });
 
 test('自动轮数：没写结论或评审失败不算同意；有新插话时不结束', async () => {

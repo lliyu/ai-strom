@@ -8,7 +8,7 @@ import { loadDotEnv, loadConfig, normalizeConfig, resolveWebhook, maskUrl, Confi
 import { createProviderRegistry } from './providers/index.js';
 import { createLarkPublisher } from './publishers.js';
 import { createInterjectionReader } from './lark/interjections.js';
-import { RUNS, log, cleanupSessions, runPrepared, followUpOne } from './runner.js';
+import { RUNS, log, cleanupSessions, runOne, followUpOne, docOne } from './runner.js';
 import { buildCardWithinLimit } from './lark/card.js';
 import { sendCard } from './lark/webhook.js';
 import { watchLoop, acquireLock, isTrigger, DEFAULT_TRIGGERS } from './watch.js';
@@ -26,7 +26,8 @@ const HELP = `ai-storm：多个模型分角色讨论，每个模型用自己的 
   node src/cli.js watch [--interval 30]        监听讨论群，收到「/讨论 <议题>」「/脑洞 <题目>」就自动开讨论
   node src/cli.js repos                        列出登记的仓库和组，以及各仓库当前的分支与改动
   node src/cli.js followup [--run 12] "<问题>"   追问一场讨论（默认最近一场）：主席判断直接回答还是重新讨论
-  node src/cli.js web [--port 8790] [--mock]   本地网页：从墨稿挑脑洞 / 梗概 / 总纲做多模型打磨，确认后写回（不发 Lark）
+  node src/cli.js doc <编号> [--mock]          给还没有主文档的旧讨论补写一份（主席写、主笔核对；不发群）
+  node src/cli.js web [--port 8790] [--mock]   本地网页：看全部讨论、插话、追问；发起方案讨论 / 脑洞风暴（不发群）和作品打磨
 
 选项：
   --config <文件>     配置文件，默认 ./config.json
@@ -39,7 +40,7 @@ const HELP = `ai-storm：多个模型分角色讨论，每个模型用自己的 
                       不写时调研员从全部登记的仓库里按议题定位；--repos none 不读代码
   -h, --help          显示帮助
 
-本地记录写在 runs/<时间>-<议题>/：transcript.md 与 events.jsonl。`;
+本地记录写在 runs/<时间>-<议题>/：transcript.md 与 events.jsonl；讨论的结论在 主文档.md（追问后更新同一份）。`;
 
 async function main(argv) {
   const { values, positionals } = parseArgs({
@@ -92,6 +93,15 @@ async function main(argv) {
       await followUpOne(cfg, { question, number: values.run, dryRun: values['dry-run'], mock: values.mock, interject: !values['no-interject'] });
       return 0;
     }
+    case 'doc': {
+      const number = Number(rest[0]?.replace(/^#/, ''));
+      if (!number) {
+        console.error('缺少讨论编号：doc <编号>，例如 doc 7');
+        return 2;
+      }
+      await docOne(cfg, { number, mock: values.mock });
+      return 0;
+    }
     default:
       console.error(`未知命令 ${command}\n\n${HELP}`);
       return 2;
@@ -107,32 +117,6 @@ async function discuss(cfg, values, rest) {
   }
   await runOne(cfg, { topic, dryRun: values['dry-run'], mock: values.mock, interject: !values['no-interject'], repos: values.repos });
   return 0;
-}
-
-/** 跑一场讨论：discuss 与 watch 共用。 */
-async function runOne(cfg, { topic, dryRun = false, mock = false, interject = true, triggers, repos }) {
-  // 先解析并准备仓库：别名写错、分支不存在时在发任何消息之前就报错
-  const code = prepareCode(cfg, repos);
-  try {
-    return await runPrepared(cfg, { topic, dryRun, mock, interject, triggers, code });
-  } finally {
-    code?.cleanup();
-  }
-}
-
-/**
- * 指定了仓库就读这些；写「无」不读；没写时（方案讨论）把全部登记的仓库交给调研员按议题定位。
- */
-function prepareCode(cfg, repos) {
-  if (repos === undefined || repos === null) {
-    const auto = cfg.mode === 'decision' && cfg.research?.auto !== false && Object.keys(cfg.repos).length > 0;
-    if (!auto) return null;
-    const code = prepareRepos(resolveRepos(cfg, allRepoSpecs(cfg)), { skipMissing: true });
-    for (const p of code.skipped) log(`⚠️ 登记的目录不存在，跳过：${p}`);
-    return { ...code, auto: true };
-  }
-  const specs = parseRepoSpecs(repos);
-  return specs.length ? prepareRepos(resolveRepos(cfg, specs)) : null;
 }
 
 /** 监听讨论群里的 /讨论、/脑洞 指令，自动发起讨论。 */

@@ -46,5 +46,5 @@ test('接口没返回费用时，讨论里用估算值并标记', async () => {
   await runDiscussion({ cfg, topic: 't', providers, publisher: createMemoryPublisher(), onEvent: (e) => events.push(e) });
   const done = events.filter((e) => e.type === 'call_finished');
   assert.ok(done.every((e) => e.costEstimated && e.costOriginal.amount === 2 && e.costOriginal.currency === 'CNY'));
-  assert.ok(Math.abs(events.at(-1).stats.costUsd - (3 * 2) / 7.1) < 1e-4);
+  assert.ok(Math.abs(events.at(-1).stats.costUsd - (done.length * 2) / 7.1) < 1e-4);
 });

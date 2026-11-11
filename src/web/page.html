@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ai-storm 打磨</title>
+<title>ai-storm</title>
 <style>
   :root {
     --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e4e2dc;
@@ -26,7 +26,15 @@
   button, input, textarea, select { font: inherit; color: inherit; }
   .app { display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
   aside { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
-  .brand { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
+  .brand { padding: 14px 52px 10px 16px; border-bottom: 1px solid var(--line); position: relative; }
+  .sidetoggle { border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 8px; width: 30px; height: 30px; cursor: pointer; font-size: 15px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
+  .sidetoggle:hover { color: var(--ink); border-color: var(--muted); }
+  .brand .sidetoggle { position: absolute; right: 12px; top: 12px; }
+  #openSide { position: fixed; left: 12px; top: 12px; z-index: 6; display: none; box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+  body.side-off .app { grid-template-columns: 1fr; }
+  body.side-off aside { display: none; }
+  body.side-off #openSide { display: inline-flex; }
+  body.side-off .wrap { padding-left: 56px; }
   .brand h1 { margin: 0; font-size: 16px; letter-spacing: .02em; }
   .brand .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .tabs { display: flex; gap: 4px; padding: 10px 12px 0; flex-wrap: wrap; }
@@ -92,9 +100,32 @@
   .diff { white-space: pre-wrap; word-break: break-word; }
   .diff del { background: var(--del-bg); color: var(--del-ink); text-decoration: line-through; }
   .diff ins { background: var(--ins-bg); color: var(--ins-ink); text-decoration: none; }
+  .md h3 { margin: 4px 0 10px; font-size: 17px; }
+  .docbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 12px 0 4px; }
+  .docmeta { font-size: 12px; color: var(--muted); margin: 4px 0 8px; word-break: break-all; }
+  .dl { white-space: pre-wrap; word-break: break-word; padding: 1px 6px; font-size: 13px; line-height: 1.6; border-left: 3px solid transparent; }
+  .dl.del { background: var(--del-bg); color: var(--del-ink); border-left-color: var(--del-ink); }
+  .dl.ins { background: var(--ins-bg); color: var(--ins-ink); border-left-color: var(--ins-ink); }
+  .dl.mod { border-left-color: var(--accent); }
+  .dl.mod del { background: var(--del-bg); color: var(--del-ink); } .dl.mod ins { background: var(--ins-bg); color: var(--ins-ink); text-decoration: none; }
+  .dl.skip { color: var(--muted); font-style: italic; }
   .applybar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 14px; background: var(--soft); border-radius: var(--radius); margin-top: 14px; }
+  .newmsg { position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%); background: var(--accent); color: var(--accent-ink); border: none; border-radius: 999px; padding: 6px 16px; cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,.18); font-weight: 600; z-index: 5; }
+  @media (min-width: 821px) { body:not(.side-off) .newmsg { left: calc(170px + 50%); } }
   .toast { position: fixed; right: 18px; bottom: 18px; background: var(--ink); color: var(--panel); padding: 9px 14px; border-radius: 8px; max-width: 420px; box-shadow: 0 6px 24px rgba(0,0,0,.2); }
   .welcome { color: var(--muted); padding-top: 12vh; text-align: center; }
+  .newbtn { margin: 10px 12px 0; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: none; background: var(--panel); padding: 5px 14px; cursor: pointer; color: var(--muted); }
+  .seg button.on { background: var(--ink); color: var(--panel); }
+  .form label { display: block; font-weight: 600; margin: 14px 0 6px; }
+  .form input[type=text], .form select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: var(--bg); }
+  .form textarea { min-height: 140px; }
+  .chip.lark { color: #2a7de1; border-color: #2a7de1; }
+  .chip.web { color: var(--muted); }
+  .post.followup-start { margin-top: 22px; }
+  .divider { margin: 22px 0 4px; color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
+  .divider::before, .divider::after { content: ''; flex: 1; border-top: 1px dashed var(--line); }
   @media (max-width: 820px) {
     .app { grid-template-columns: 1fr; height: auto; }
     aside { max-height: 46vh; border-right: none; border-bottom: 1px solid var(--line); }
@@ -106,18 +137,24 @@
 <div class="app">
   <aside>
     <div class="brand">
-      <h1>ai-storm · 作品打磨</h1>
+      <h1>ai-storm</h1>
+      <button class="sidetoggle" id="closeSide" title="收起侧边栏（快捷键 [ ）" aria-label="收起侧边栏">⟨</button>
       <div class="sub" id="status">连接中…</div>
     </div>
     <div class="tabs" id="tabs"></div>
-    <input class="search" id="search" placeholder="搜索书名、内容、作品">
+    <button class="btn primary newbtn" id="new">＋ 新讨论</button>
+    <input class="search" id="search" placeholder="搜索">
     <div class="list" id="list"></div>
   </aside>
-  <main><div class="wrap" id="main"><div class="welcome">从左边挑一份脑洞、梗概或总纲，让几个模型一起找不足、讨论怎么改。</div></div></main>
+  <button class="sidetoggle" id="openSide" title="展开侧边栏（快捷键 [ ）" aria-label="展开侧边栏">☰</button>
+  <main><div class="wrap" id="main"><div class="welcome">左边「讨论」里是群里和网页上的全部讨论；「脑洞 / 梗概 / 总纲」里挑一项可以做作品打磨。</div></div></main>
 </div>
 <script>
-const TABS = [['idea', '脑洞'], ['premise', '梗概'], ['outline', '总纲'], ['runs', '打磨记录']];
+const TABS = [['runs', '讨论'], ['idea', '脑洞'], ['premise', '梗概'], ['outline', '总纲']];
 const TYPE_LABEL = { idea: '脑洞', premise: '梗概', outline: '总纲' };
+const MODE_LABEL = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨' };
+const MODE_SHORT = { decision: '方案', brainstorm: '脑洞', refine: '打磨' };
+const CHANNEL_LABEL = { lark: '群里', web: '网页', 'dry-run': 'dry-run' };
 const STATUS_LABEL = { queued: '排队中', running: '进行中', done: '已结束', failed: '失败', idle: '已结束' };
 const COLORS = { blue: '#3370ff', wathet: '#4bb3f5', turquoise: '#14c0b0', green: '#34a853', yellow: '#e6b800', orange: '#f08a24', red: '#e5484d', carmine: '#c2185b', violet: '#8e5cf7', purple: '#7b3fbf', indigo: '#4f5bd5', grey: '#8f959e' };
 const FIELD_LABELS = {
@@ -128,7 +165,7 @@ const FIELD_LABELS = {
   summary: '概要', climax: '卷末高潮', estimatedChapters: '预计章数',
 };
 
-const S = { tab: 'idea', items: [], runs: [], q: '', sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null };
+const S = { tab: 'runs', form: { mode: 'decision' }, items: [], runs: [], q: '', sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null, docIdx: null, docDiff: false };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -157,7 +194,7 @@ function md(text) {
     if ((m = /^\s*[-*]\s+(.*)$/.exec(line))) { if (list !== 'ul') { close(); out.push('<ul>'); list = 'ul'; } out.push(`<li>${inline(m[1])}</li>`); continue; }
     if ((m = /^\s*\d+[.、)]\s+(.*)$/.exec(line))) { if (list !== 'ol') { close(); out.push('<ol>'); list = 'ol'; } out.push(`<li>${inline(m[1])}</li>`); continue; }
     close();
-    if ((m = /^#{1,6}\s+(.*)$/.exec(line))) { out.push(`<h4>${inline(m[1])}</h4>`); continue; }
+    if ((m = /^(#{1,6})\s+(.*)$/.exec(line))) { const h = Math.min(m[1].length + 2, 5); out.push(`<h${h}>${inline(m[2])}</h${h}>`); continue; }
     if (line.trim()) out.push(`<p>${inline(line)}</p>`);
   }
   if (code !== null) out.push(`<pre>${esc(code)}</pre>`);
@@ -192,6 +229,35 @@ function diffHtml(a, b) {
   while (i < n) push('-', x[i++]); while (j < m) push('+', y[j++]);
   return out.map((o) => (o.t === '=' ? esc(o.s) : o.t === '-' ? `<del>${esc(o.s)}</del>` : `<ins>${esc(o.s)}</ins>`)).join('');
 }
+// 主文档两版之间按行对比：改了一行的显示行内差异，大段没变的折叠
+function lineDiffHtml(a, b) {
+  const x = a ? String(a).split('\n') : [], y = b ? String(b).split('\n') : [];
+  const n = x.length, m = y.length;
+  if (n * m > 4e6) return `<div class="dl del">${esc(a)}</div><div class="dl ins">${esc(b)}</div>`;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = x[i] === y[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const ops = []; let i = 0, j = 0;
+  while (i < n && j < m) { if (x[i] === y[j]) { ops.push({ t: '=', s: x[i] }); i++; j++; } else if (dp[i + 1][j] >= dp[i][j + 1]) ops.push({ t: '-', s: x[i++] }); else ops.push({ t: '+', s: y[j++] }); }
+  while (i < n) ops.push({ t: '-', s: x[i++] }); while (j < m) ops.push({ t: '+', s: y[j++] });
+  const out = [];
+  for (let k = 0; k < ops.length;) {
+    if (ops[k].t === '=') {
+      let e = k; while (e < ops.length && ops[e].t === '=') e++;
+      const run = ops.slice(k, e).map((o) => o.s);
+      // 没变的段落只留首尾各 2 行
+      if (run.length > 6 && k > 0 && e < ops.length) out.push(...run.slice(0, 2).map((l) => `<div class="dl">${esc(l) || '&nbsp;'}</div>`), `<div class="dl skip">…… ${run.length - 4} 行没变 ……</div>`, ...run.slice(-2).map((l) => `<div class="dl">${esc(l) || '&nbsp;'}</div>`));
+      else if (run.length > 4 && (k === 0 || e === ops.length)) { const keep = k === 0 ? run.slice(-2) : run.slice(0, 2); if (k === 0) out.push(`<div class="dl skip">…… ${run.length - 2} 行没变 ……</div>`); out.push(...keep.map((l) => `<div class="dl">${esc(l) || '&nbsp;'}</div>`)); if (k !== 0) out.push(`<div class="dl skip">…… ${run.length - 2} 行没变 ……</div>`); }
+      else out.push(...run.map((l) => `<div class="dl">${esc(l) || '&nbsp;'}</div>`));
+      k = e; continue;
+    }
+    let e = k; while (e < ops.length && ops[e].t !== '=') e++;
+    const del = ops.slice(k, e).filter((o) => o.t === '-').map((o) => o.s), ins = ops.slice(k, e).filter((o) => o.t === '+').map((o) => o.s);
+    if (del.length === ins.length) out.push(...del.map((d, q) => `<div class="dl mod diff">${diffHtml(d, ins[q])}</div>`));
+    else out.push(...del.map((l) => `<div class="dl del">${esc(l) || '&nbsp;'}</div>`), ...ins.map((l) => `<div class="dl ins">${esc(l) || '&nbsp;'}</div>`));
+    k = e;
+  }
+  return out.join('') || '<div class="dl skip">两版一样</div>';
+}
 function compare(before, after) {
   const a = new Map(flatten(before).map((r) => [r.key, r])), b = new Map(flatten(after).map((r) => [r.key, r]));
   const keys = [...new Set([...a.keys(), ...b.keys()])];
@@ -208,12 +274,12 @@ function renderList() {
   const match = (...xs) => !q || xs.some((x) => String(x ?? '').toLowerCase().includes(q));
   let html;
   if (S.tab === 'runs') {
-    const rows = S.runs.filter((r) => match(r.title, r.requirement));
+    const rows = S.runs.filter((r) => match(r.topic, r.requirement, MODE_LABEL[r.mode], `#${r.number}`));
     html = rows.map((r) => `<div class="item ${S.run?.number === r.number ? 'on' : ''}" data-run="${r.number}">
-      <div class="t">#${r.number} · ${esc(TYPE_LABEL[r.type] || '')}「${esc(r.title)}」</div>
-      <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span> ${r.hasRevision ? '有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.followUps ? ` · 追问 ${r.followUps} 次` : ''}${r.mock ? ' · mock' : ''}</div>
+      <div class="t">#${r.number} · ${r.mode === 'refine' ? `${esc(TYPE_LABEL[r.type] || '')}「${esc(r.topic)}」` : esc(r.topic)}</div>
+      <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span> <span class="chip">${MODE_SHORT[r.mode] || r.mode}</span> <span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.followUps ? ` 追问 ${r.followUps} 次` : ''}${r.hasRevision ? ' · 有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.mock ? ' · mock' : ''}</div>
       ${r.requirement ? `<div class="p">要求：${esc(r.requirement)}</div>` : ''}</div>`).join('');
-    if (!rows.length) html = '<div class="empty">还没有打磨记录</div>';
+    if (!rows.length) html = '<div class="empty">还没有讨论</div>';
   } else {
     const rows = S.items.filter((i) => i.type === S.tab && match(i.title, i.preview, i.project, i.meta));
     html = rows.map((i) => `<div class="item ${S.sel?.type === i.type && S.sel?.id === i.id ? 'on' : ''}" data-type="${i.type}" data-id="${esc(i.id)}">
@@ -235,8 +301,10 @@ async function loadRuns() {
 async function loadStatus() {
   try {
     S.status = await api('/api/status');
-    const cur = S.status.current ? `正在打磨 #${S.status.current.number}` : '空闲';
-    $('status').textContent = `墨稿 ${S.status.novel} · ${cur}${S.status.queued.length ? ` · 排队 ${S.status.queued.length}` : ''}${S.status.mock ? ' · mock 演练' : ''}`;
+    const st = S.status;
+    const web = st.current ? `网页在跑 #${st.current.number}` : '网页空闲';
+    const watch = st.watch ? (st.watch.phase === 'running' ? '群监听在跑讨论' : '群监听中') : '群监听没开';
+    $('status').textContent = `${web}${st.queued.length ? `（排队 ${st.queued.length}）` : ''} · ${watch}${st.mock ? ' · mock 演练' : ''}`;
   } catch (e) { $('status').textContent = `连不上 ai-storm：${e.message}`; }
 }
 
@@ -246,8 +314,8 @@ async function openItem(type, id) {
   $('main').innerHTML = '<div class="welcome">读取中…</div>';
   let item;
   try { item = await api(`/api/novel/item?type=${type}&id=${encodeURIComponent(id)}`); } catch (e) { $('main').innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
-  const parts = (S.status?.participants || []).map((p) => `${esc(p.name)}（${esc(p.role)}${p.part === 'reviewer' ? '，评审' : ''}）`).join('、');
-  const past = S.runs.filter((r) => r.type === type && S.items.find((i) => i.id === id)?.title === r.title);
+  const parts = (S.status?.participants?.refine || []).map((p) => `${esc(p.name)}（${esc(p.role)}${p.part === 'reviewer' ? '，评审' : ''}）`).join('、');
+  const past = S.runs.filter((r) => r.mode === 'refine' && r.type === type && item.title === r.topic);
   $('main').innerHTML = `
     <div class="head"><h2>${esc(item.title)}</h2><span class="chip">${TYPE_LABEL[type]}</span></div>
     <div class="card">
@@ -267,29 +335,68 @@ async function openItem(type, id) {
   };
 }
 
-// ---------- 一场打磨 ----------
-function closeStream() { if (S.es) { S.es.close(); S.es = null; } clearInterval(S.ticker); }
+// ---------- 新讨论 ----------
+function openForm() {
+  closeStream(); S.run = null; S.sel = null; S.tab = 'runs'; renderTabs(); renderList();
+  const st = S.status || {};
+  const f = S.form;
+  const people = (st.participants?.[f.mode] || []).map((p) => `${esc(p.name)}（${esc(p.role)}${p.part === 'reviewer' ? '，评审' : ''}）`).join('、');
+  const repoHint = [...(st.groups || []).map((g) => `${g}（组）`), ...(st.repos || [])].join('、');
+  $('main').innerHTML = `
+    <div class="head"><h2>新讨论</h2><span class="chip web">只在网页上，不发到群里</span></div>
+    <div class="card form">
+      <div class="seg" id="modeSeg">${['decision', 'brainstorm'].map((m) => `<button data-mode="${m}" class="${f.mode === m ? 'on' : ''}">${MODE_LABEL[m]}</button>`).join('')}</div>
+      <label>${f.mode === 'brainstorm' ? '题目' : '议题'}</label>
+      <textarea id="topic" placeholder="${f.mode === 'brainstorm' ? '例如：给一款面向独居老人的智能音箱想功能' : '例如：订单服务要不要从单库拆成按用户分库？目前日订单 50 万……'}">${esc(f.topic || '')}</textarea>
+      ${f.mode === 'decision' ? `<label>代码仓库</label>
+      <input type="text" id="repos" value="${esc(f.repos || '')}" placeholder="不写：调研员按议题自己定位；写「无」：不读代码；或者写别名，逗号分隔，@ 后写分支">
+      <div class="hint" style="margin-top:4px">可用：${esc(repoHint) || '（还没登记仓库）'}</div>` : ''}
+      <label>轮数</label>
+      <select id="rounds"><option value="auto">自动：评审都没有新意见就结束（最多 ${st.maxRounds || 8} 轮）</option>${[2, 3, 4, 5, 6, 8].map((n) => `<option value="${n}" ${String(f.rounds) === String(n) ? 'selected' : ''}>固定 ${n} 轮</option>`).join('')}</select>
+      <div class="row"><button class="btn primary" id="startDiscuss">开始</button><span class="hint">${people ? `参与：${people}` : ''}</span></div>
+    </div>`;
+  const keep = () => { f.topic = $('topic').value; f.repos = $('repos')?.value ?? f.repos; f.rounds = $('rounds').value; };
+  $('modeSeg').onclick = (ev) => { const b = ev.target.closest('[data-mode]'); if (!b) return; keep(); f.mode = b.dataset.mode; openForm(); };
+  $('startDiscuss').onclick = async () => {
+    keep();
+    if (!f.topic.trim()) { toast('先写议题'); return; }
+    $('startDiscuss').disabled = true;
+    try {
+      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ mode: f.mode, topic: f.topic, repos: f.mode === 'decision' ? f.repos : '', rounds: f.rounds }) });
+      S.form = { mode: f.mode };
+      await loadRuns(); openRun(number);
+    } catch (e) { toast(e.message, 6000); $('startDiscuss').disabled = false; }
+  };
+}
+
+// ---------- 一场讨论 ----------
+function closeStream() { if (S.es) { S.es.close(); S.es = null; } clearInterval(S.ticker); hideNewMsg(); }
 async function openRun(number, sub) {
   closeStream(); S.sel = null; S.revIdx = null; if (sub) S.sub = sub;
   let run;
   try { run = await api(`/api/runs/${number}`); } catch (e) { toast(e.message); return; }
-  S.run = run; renderList(); renderRun();
+  S.run = run; S.docIdx = null; S.docDiff = false;
+  if (run.mode !== 'refine' && !['talk', 'conclusion', 'doc'].includes(S.sub)) S.sub = 'talk';
+  if (S.sub === 'conclusion' && run.docs?.length) S.sub = 'doc';
+  if (S.sub === 'doc' && !run.docs?.length && run.mode !== 'refine') S.sub = run.summary ? 'conclusion' : 'talk';
+  renderList(); renderRun();
   const after = run.posts.length ? run.posts[run.posts.length - 1].seq : 0;
   const es = new EventSource(`/api/runs/${number}/events?after=${after}`);
   S.es = es;
   es.addEventListener('post', (ev) => {
     const p = JSON.parse(ev.data);
     if (S.run?.number !== number || S.run.posts.some((x) => x.seq === p.seq)) return;
-    S.run.posts.push(p); appendPost(p);
+    const prev = S.run.posts[S.run.posts.length - 1];
+    S.run.posts.push(p); appendPost(p, prev);
   });
   es.addEventListener('progress', async (ev) => {
     const prog = JSON.parse(ev.data);
     const was = S.run?.progress?.status;
     if (S.run?.number !== number) return;
     S.run.progress = prog; renderProgress();
-    if (was && was !== prog.status && (prog.status === 'done' || prog.status === 'failed')) {
+    if (was !== prog.status && (prog.status === 'done' || prog.status === 'failed' || prog.status === 'running')) {
       const fresh = await api(`/api/runs/${number}`).catch(() => null);
-      if (fresh && S.run?.number === number) { S.run = fresh; renderRun(); if (fresh.revision && prog.status === 'done') toast('修订版写好了，去「修订版」里对比'); }
+      if (fresh && S.run?.number === number) { const s = scroller(), top = s.scrollTop; S.run = fresh; renderRun(); s.scrollTop = top; if (fresh.mode === 'refine' && fresh.revision && prog.status === 'done') toast('修订版写好了，去「修订版」里对比'); }
       loadRuns(); loadStatus();
     }
   });
@@ -308,18 +415,38 @@ function postHtml(p) {
     ${p.footer ? `<div class="foot">${esc(p.footer)}</div>` : ''}</div>`;
   }
   const long = (p.body || '').length > 1400;
+  const docLink = p.stage === 'doc' ? '<button class="btn" data-sub="doc" style="margin-top:6px">查看主文档</button>' : '';
   return `<div class="post ${p.error ? 'error' : ''} ${long ? 'fold' : ''}" style="--c:${color}">
     <div class="ph"><span class="who">${esc(p.title)}</span><span class="sub">${esc(p.subtitle)}</span></div>
-    <div class="body">${md(p.body)}</div>
+    <div class="body">${md(p.body)}</div>${docLink}
     ${long ? '<button class="more">展开全文</button>' : ''}
     ${plan}
     ${p.footer ? `<div class="foot">${esc(p.footer)}</div>` : ''}</div>`;
 }
-function appendPost(p) {
+// 每次追问的发言在单独的目录里（part 1、2……），换目录时画一条分隔线
+function divider(p, prev) { return p.part > 0 && p.part !== prev?.part ? `<div class="divider">追问 ${p.part} · ${new Date(p.at).toLocaleString('zh-CN', { hour12: false })}</div>` : ''; }
+function postsHtml(posts) { return posts.map((p, i) => divider(p, posts[i - 1]) + postHtml(p)).join(''); }
+// 宽屏时滚动的是右侧 main，窄屏（main 不出滚动条）时滚动的是整个页面
+function scroller() { const m = document.querySelector('main'); return m.scrollHeight > m.clientHeight + 1 ? m : document.scrollingElement; }
+function nearBottom() { const s = scroller(); return s.scrollTop + s.clientHeight >= s.scrollHeight - 120; }
+function toBottom() { const s = scroller(); s.scrollTop = s.scrollHeight; hideNewMsg(); }
+// 在看前面的消息时不打断：只累计条数，底部出一个按钮，点了才跳到最新
+let unseen = 0;
+function showNewMsg() {
+  let b = $('newmsg');
+  if (!b) { b = document.createElement('button'); b.id = 'newmsg'; b.className = 'newmsg'; b.onclick = toBottom; document.body.append(b); }
+  b.textContent = `${unseen} 条新消息 ↓`;
+}
+function hideNewMsg() { unseen = 0; $('newmsg')?.remove(); }
+const onScroll = () => { if (unseen && nearBottom()) hideNewMsg(); };
+document.querySelector('main').addEventListener('scroll', onScroll, { passive: true });
+window.addEventListener('scroll', onScroll, { passive: true });
+function appendPost(p, prev) {
   const box = $('posts'); if (!box) return;
-  const atBottom = innerHeight + scrollY >= document.body.scrollHeight - 80 || document.querySelector('main').scrollTop + document.querySelector('main').clientHeight >= document.querySelector('main').scrollHeight - 80;
-  box.insertAdjacentHTML('beforeend', postHtml(p));
-  if (atBottom) box.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  const follow = nearBottom(); // 要在插入之前判断
+  box.insertAdjacentHTML('beforeend', divider(p, prev) + postHtml(p));
+  if (follow) { const sc = scroller(); sc.scrollTop = sc.scrollHeight; } // 直接跳到底：平滑滚动没滚完时，下一条消息会误以为你离开了底部
+  else { unseen += 1; showNewMsg(); }
 }
 function ago(at) { const s = Math.max(0, Math.round((Date.now() - Date.parse(at)) / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; }
 function renderProgress() {
@@ -331,24 +458,26 @@ function renderProgress() {
     : running ? (who || '准备中…')
     : p.status === 'failed' ? `<span class="err">失败：${esc(p.error || '')}</span>` : '';
   const canTalk = running;
-  const canAsk = !running && !queued && !S.run.expired && S.run.summary !== null;
+  const canAsk = !running && !queued && S.run.canFollowUp;
+  const lark = S.run.channel === 'lark';
+  const refine = S.run.mode === 'refine';
   box.querySelector('.bar').innerHTML = line ? `${running || queued ? '<span class="dot"></span>' : ''}<span>${line}</span>` : '';
   const comp = box.querySelector('.composer');
   const mode = canTalk ? 'talk' : canAsk ? 'ask' : 'none';
   if (comp.dataset.mode !== mode) {
     comp.dataset.mode = mode;
     comp.innerHTML = mode === 'talk'
-      ? '<textarea id="say" placeholder="插话：下一轮开始时交给所有模型（例如：别动主角的名字；结局我想要开放式）"></textarea><button class="btn primary" id="send">插话</button>'
+      ? `<textarea id="say" placeholder="插话：下一轮开始时交给所有模型${lark ? '，群里也会出一张卡片' : ''}${refine ? '（例如：别动主角的名字；结局我想要开放式）' : ''}"></textarea><button class="btn primary" id="send">插话</button>`
       : mode === 'ask'
-        ? '<textarea id="say" placeholder="追问：主编判断直接回答还是重新讨论；重新讨论后会重写修订版"></textarea><button class="btn primary" id="send">追问</button>'
-        : S.run.expired ? '<span class="hint">已超过保留期，会话已清理，不能再追问；修订版仍然可以写回。</span>' : '';
+        ? `<textarea id="say" placeholder="追问：${refine ? '主编' : '主席'}判断直接回答还是重新讨论${refine ? '；重新讨论后会重写修订版' : ''}${lark ? '。这是群里的讨论，追问过程会发到群里' : ''}"></textarea><button class="btn primary" id="send">追问</button>`
+        : S.run.expired ? `<span class="hint">已超过保留期，会话已清理，不能再追问${refine ? '；修订版仍然可以写回' : ''}。</span>` : '';
     const send = $('send');
     if (send) send.onclick = async () => {
       const text = $('say').value.trim(); if (!text) return;
       send.disabled = true;
       try {
-        if (mode === 'talk') { const r = await api(`/api/runs/${S.run.number}/interject`, { method: 'POST', body: JSON.stringify({ text }) }); toast(`已收到，下一轮开始时交给模型（待发 ${r.pending} 条）`); }
-        else { await api(`/api/runs/${S.run.number}/followup`, { method: 'POST', body: JSON.stringify({ question: text }) }); toast('追问已排队'); }
+        if (mode === 'talk') { await api(`/api/runs/${S.run.number}/interject`, { method: 'POST', body: JSON.stringify({ text }) }); toast('已收到，下一轮开始时交给模型'); }
+        else { const r = await api(`/api/runs/${S.run.number}/followup`, { method: 'POST', body: JSON.stringify({ question: text }) }); toast(r.lark ? '追问已排队，过程会发到群里' : '追问已排队'); }
         $('say').value = '';
       } catch (e) { toast(e.message); }
       send.disabled = false;
@@ -359,19 +488,45 @@ function renderRun() {
   const r = S.run, p = r.progress || {};
   const status = p.status === 'idle' ? 'done' : p.status;
   const revs = r.revisions?.length ? r.revisions : r.revision ? [r.revision] : [];
+  const refine = r.mode === 'refine';
+  const chips = `<span class="chip ${status}">${STATUS_LABEL[status] || status}</span><span class="chip">${MODE_LABEL[r.mode] || r.mode}</span><span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.mock ? '<span class="chip">mock</span>' : ''}`;
+  const title = refine && r.subject ? `${TYPE_LABEL[r.subject.type]}「${esc(r.subject.title)}」` : esc((r.topic || '').split('\n')[0].slice(0, 80));
+  const docs = r.docs || [];
+  const docTab = ['doc', docs.length ? `文档 · 第 ${docs[docs.length - 1].version} 版` : '文档（还没有）'];
+  const tabs = refine
+    ? [['talk', '讨论'], docTab, ['rev', `修订版${revs.length ? '' : '（还没有）'}`], ['orig', '原稿']]
+    : docs.length || !r.summary ? [['talk', '讨论'], docTab] : [['talk', '讨论'], ['conclusion', '结论（旧版汇总）']];
   $('main').innerHTML = `
-    <div class="head"><h2>#${r.number} · ${TYPE_LABEL[r.subject.type]}「${esc(r.subject.title)}」</h2><span class="chip ${status}">${STATUS_LABEL[status] || status}</span>${r.mock ? '<span class="chip">mock</span>' : ''}</div>
-    <div class="meta">作者的要求：${esc(r.requirement || '（没有额外要求）')}${r.followUps.length ? ` · 追问 ${r.followUps.length} 次` : ''}</div>
-    <div class="subtabs">
-      <button class="subtab ${S.sub === 'talk' ? 'on' : ''}" data-sub="talk">讨论</button>
-      <button class="subtab ${S.sub === 'rev' ? 'on' : ''}" data-sub="rev">修订版${revs.length ? '' : '（还没有）'}</button>
-      <button class="subtab ${S.sub === 'orig' ? 'on' : ''}" data-sub="orig">原稿</button>
-    </div>
+    <div class="head"><h2>#${r.number} · ${title}</h2>${chips}</div>
+    <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整议题</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : ''}${r.followUps.length ? ` · 追问 ${r.followUps.length} 次` : ''}</div>
+    <div class="subtabs">${tabs.map(([k, l]) => `<button class="subtab ${S.sub === k ? 'on' : ''}" data-sub="${k}">${l}</button>`).join('')}</div>
     <div id="pane"></div>`;
   const pane = $('pane');
   if (S.sub === 'talk') {
-    pane.innerHTML = `<div id="posts">${r.posts.map(postHtml).join('')}</div><div class="progress" id="progress"><div class="bar"></div><div class="composer"></div></div>`;
+    pane.innerHTML = `<div id="posts">${postsHtml(r.posts)}</div><div class="progress" id="progress"><div class="bar"></div><div class="composer"></div></div>`;
     renderProgress();
+  } else if (S.sub === 'conclusion') {
+    const asked = r.followUps.filter((f) => f.answer);
+    pane.innerHTML = r.conclusion
+      ? `<div class="card">${md(r.conclusion)}</div>${asked.length ? `<div class="card"><h3>追问</h3>${asked.map((f) => `<details style="margin-top:8px"><summary>${esc(f.question)}（${f.handling === 'discuss' ? '重新讨论' : '直接回答'}）</summary>${md(f.answer)}</details>`).join('')}</div>` : ''}`
+      : `<div class="card hint">${status === 'running' || status === 'queued' ? '讨论结束后这里显示主席的汇总。' : '这场讨论没有汇总。'}</div>`;
+  } else if (S.sub === 'doc') {
+    if (!docs.length) { pane.innerHTML = `<div class="card hint">${status === 'running' || status === 'queued' ? '讨论结束后主席会写主文档，主笔核对后发在这里。' : r.summary ? '这场讨论还没有主文档（旧讨论只有汇总）。可以在终端运行 node src/cli.js doc ' + r.number + ' 补写。' : '这场讨论没有主文档。'}</div>`; return; }
+    const idx = Math.min(S.docIdx ?? docs.length - 1, docs.length - 1);
+    const d = docs[idx], prev = docs[idx - 1];
+    const diff = S.docDiff && prev;
+    const check = d.check ? (d.check.issues ? `主笔核对提了 ${d.check.issues} 份意见${d.check.fixed ? '，已按意见修改' : ''}` : '主笔核对没有意见') : '';
+    const atts = Object.entries(d.attachments || {});
+    const gone = diff ? Object.keys(prev.attachments || {}).filter((k) => !(k in (d.attachments || {}))) : [];
+    const asked = r.followUps.filter((f) => f.question);
+    pane.innerHTML = `
+      <div class="docbar">${docs.map((v, i) => `<button class="btn ${i === idx ? 'primary' : ''}" data-docv="${i}" title="${esc(v.reason)}">第 ${v.version} 版</button>`).join('')}
+        ${prev ? `<button class="btn" data-docdiff="1">${diff ? '看全文' : `和第 ${prev.version} 版对比`}</button>` : ''}</div>
+      <div class="docmeta">${esc(d.reason)} · ${new Date(d.at).toLocaleString('zh-CN', { hour12: false })}${check ? ` · ${check}` : ''}${idx === docs.length - 1 && r.docFile ? `<br>本机文件：${esc(r.docFile)}` : ''}</div>
+      <div class="card">${diff ? lineDiffHtml(prev.text, d.text) : md(d.text)}</div>
+      ${atts.map(([title, text]) => `<div class="card"><details ${diff ? 'open' : ''}><summary>附录《${esc(title)}》${diff && !(title in (prev.attachments || {})) ? ' <span class="chip">新增</span>' : ''}</summary>${diff ? lineDiffHtml(prev.attachments?.[title] ?? '', text) : md(text)}</details></div>`).join('')}
+      ${gone.map((title) => `<div class="card hint">附录《${esc(title)}》在这一版删掉了</div>`).join('')}
+      ${asked.length ? `<div class="card"><h3>追问记录</h3>${asked.map((f) => `<details style="margin-top:8px"><summary>${esc(f.question)}（${f.handling === 'discuss' ? '重新讨论' : '直接回答'}${f.doc ? ` → 第 ${f.doc} 版` : ''}）</summary>${md(f.answer || '（没有结论）')}</details>`).join('')}</div>` : ''}`;
   } else if (S.sub === 'orig') {
     pane.innerHTML = `<div class="card"><div class="pre">${esc(r.subject.current)}</div></div><div class="card"><details><summary>背景</summary><div class="pre" style="margin-top:8px">${esc(r.subject.background)}</div></details></div>`;
   } else {
@@ -402,20 +557,38 @@ function renderRun() {
 
 // ---------- 事件 ----------
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],.more');
+  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docdiff],.more');
   if (!t) return;
   if (t.matches('.more')) { const post = t.closest('.post'); post.classList.remove('fold'); t.remove(); return; }
   ev.preventDefault();
   if (t.dataset.tab) { S.tab = t.dataset.tab; renderTabs(); renderList(); if (S.tab === 'runs') loadRuns(); }
   else if (t.dataset.run) openRun(Number(t.dataset.run), 'talk');
   else if (t.dataset.type) openItem(t.dataset.type, t.dataset.id);
-  else if (t.dataset.sub) { S.sub = t.dataset.sub; renderRun(); }
+  else if (t.dataset.sub) { hideNewMsg(); S.sub = t.dataset.sub; renderRun(); }
   else if (t.dataset.rev) { S.revIdx = Number(t.dataset.rev); renderRun(); }
+  else if (t.dataset.docv) { S.docIdx = Number(t.dataset.docv); renderRun(); }
+  else if (t.dataset.docdiff) { S.docDiff = !S.docDiff; renderRun(); }
 });
 $('search').addEventListener('input', (e) => { S.q = e.target.value; renderList(); });
+$('new').onclick = () => openForm();
+// 侧边栏收起 / 展开：记在本机浏览器里，下次打开保持
+function setSide(off) {
+  document.body.classList.toggle('side-off', off);
+  try { localStorage.setItem('ai-storm.sideOff', off ? '1' : '0'); } catch { /* 隐私模式等存不了就算了 */ }
+}
+try { if (localStorage.getItem('ai-storm.sideOff') === '1') document.body.classList.add('side-off'); } catch { /* 同上 */ }
+$('closeSide').onclick = () => setSide(true);
+$('openSide').onclick = () => setSide(false);
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== '[' || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  if (ev.target instanceof Element && ev.target.closest('input, textarea, select, [contenteditable]')) return; // 打字时不触发
+  ev.preventDefault();
+  setSide(!document.body.classList.contains('side-off'));
+});
 renderTabs();
 loadStatus().then(() => Promise.all([loadItems(), loadRuns()]));
 setInterval(loadStatus, 10000);
+setInterval(loadRuns, 10000);
 </script>
 </body>
 </html>

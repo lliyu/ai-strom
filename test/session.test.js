@@ -98,10 +98,15 @@ test('会话：每位参与者一条会话，只发新内容，评审先跟进�
   const { calls, registry } = scripted(({ who }) => (who === 'R' ? '【阻断】还有问题\n评审结论：继续讨论' : null));
   const res = await runDiscussion({ cfg, topic: 't', providers: registry, publisher: createMemoryPublisher(), interjections, rng: () => 0 });
   const of = (w) => calls.filter((c) => c.who === w);
-  // 同一个人用同一条会话，轮次递增；主席不用会话
+  // 同一个人用同一条会话，轮次递增（最后一次是核对主文档）；主席只在写主文档时用一条临时会话
   assert.equal(new Set(of('A').map((c) => c.session.id)).size, 1);
-  assert.deepEqual(of('A').map((c) => c.turnsBefore), [0, 1, 2]);
-  assert.ok(of('主席').every((c) => !c.session));
+  assert.deepEqual(of('A').map((c) => c.turnsBefore), [0, 1, 2, 3]);
+  assert.equal(of('A').at(-1).stage, '核对主文档');
+  const doc = calls.filter((c) => /主文档/.test(c.stage) && c.who !== 'A' && c.who !== 'B');
+  assert.deepEqual(doc.map((c) => c.stage), ['主文档', '按核对意见修改主文档']); // 主笔提了意见，主席修改
+  assert.equal(new Set(doc.map((c) => c.session.id)).size, 1);
+  assert.equal(doc[1].turnsBefore, 1); // 修改时初稿和讨论记录已经在会话里
+  assert.doesNotMatch(doc[1].prompt, /你写的初稿/);
   // 身份只说一次；自己的上一版不重贴
   assert.match(of('A')[0].prompt, /^你是「A/);
   assert.doesNotMatch(of('A')[1].prompt, /^你是「/);
@@ -115,7 +120,7 @@ test('会话：每位参与者一条会话，只发新内容，评审先跟进�
   assert.match(of('R')[1].prompt, /你上一轮的意见就在本会话里[\s\S]*已解决或被合理反驳的不要再写[\s\S]*上轮未解决/);
   // 导出的状态可以续接
   assert.equal(res.state.lastRound, 3);
-  assert.equal(res.state.sessions.a.turns.length, 3);
+  assert.equal(res.state.sessions.a.turns.length, 4);
   assert.match(res.state.tags.a.tag, /^方案 [AB]$/);
 });
 
@@ -125,6 +130,9 @@ test('非会话模式：每轮都是新会话，照旧贴全部内容', async ()
   await runDiscussion({ cfg, topic: 't', providers: registry, publisher: createMemoryPublisher(), rng: () => 0 });
   assert.ok(calls.every((c) => !c.session));
   assert.ok(calls.filter((c) => c.who === 'A').every((c) => /^你是「A/.test(c.prompt)));
+  // 核对主文档时带上自己最后的方案，主席修改时贴回初稿
+  assert.match(calls.find((c) => c.who === 'A' && c.stage === '核对主文档').prompt, /## 你最后的方案/);
+  assert.match(calls.find((c) => c.stage === '按核对意见修改主文档').prompt, /## 你写的初稿/);
 });
 
 async function finished(extra = {}) {
@@ -136,16 +144,27 @@ async function finished(extra = {}) {
 
 test('追问：主席判断直接回答，不惊动参与者', async () => {
   const { cfg, state } = await finished();
-  const { calls, registry } = scripted(({ who }) => (who === '主席' ? '处理方式：直接回答\n第 2 轮方案 A 说的是……' : null));
+  const { calls, registry } = scripted(({ who, stage }) => (stage === '更新主文档' ? '【无需修改】' : who === '主席' ? '处理方式：直接回答\n第 2 轮方案 A 说的是……' : null));
   const pub = createMemoryPublisher();
   const out = await runFollowUp({ cfg, state, question: '方案 A 的熔断是什么意思？', providers: registry, publisher: pub });
   assert.equal(out.handling, 'answer');
-  assert.equal(calls.length, 1);
+  // 主席回答后判断要不要改主文档，参与者不发言
+  assert.deepEqual(calls.map((c) => c.stage), ['追问判断', '更新主文档']);
+  assert.match(calls[1].prompt, /现在的主文档（第 1 版）[\s\S]*你对追问的回答[\s\S]*【无需修改】/);
+  assert.deepEqual(out.state.docs, state.docs); // 不需要修改：版本不变
   assert.match(calls[0].prompt, /讨论记录[\s\S]*人类的追问[\s\S]*方案 A 的熔断/);
   assert.equal(calls[0].system, state.shared); // 和原讨论同一份系统提示词
   assert.match(pub.posts[1].body, /^第 2 轮方案 A 说的是/); // 卡片里去掉「处理方式」那行
   assert.equal(out.state.followUps[0].handling, 'answer');
   assert.equal(out.state.lastRound, state.lastRound);
+
+  // 回答里有值得留下的信息：主文档改到第 2 版，不用主笔核对
+  const again = scripted(({ who, stage }) => (stage === '更新主文档' ? '【说明】补了熔断的解释\n【主文档】\n# 新版' : who === '主席' ? '处理方式：直接回答\n熔断是……' : null));
+  const out2 = await runFollowUp({ cfg, state, question: '熔断？', providers: again.registry, publisher: createMemoryPublisher() });
+  assert.equal(again.calls.length, 2);
+  assert.deepEqual(out2.state.docs.map((d) => d.version), [1, 2]);
+  assert.equal(out2.state.summary, '# 新版');
+  assert.equal(out2.state.followUps[0].doc, 2);
 });
 
 test('追问：主席判断重新讨论，参与者在原会话里接着讨论，直到评审没有新意见', async () => {
@@ -153,6 +172,8 @@ test('追问：主席判断重新讨论，参与者在原会话里接着讨论�
   const { calls, registry } = scripted(({ who, stage }) => {
     if (who === '主席' && /追问判断/.test(stage)) return '处理方式：重新讨论\n**给参与者的说明**\n大促只剩两周，重新权衡上线节奏';
     if (who === 'R') return /第 4 轮/.test(stage) ? '评审结论：没有意见了' : '【阻断】还有问题\n评审结论：继续讨论';
+    if (stage === '核对主文档') return '没有问题';
+    if (stage === '更新主文档') return '【说明】两周内先上第一阶段\n【主文档】\n# 第 2 版\n【附录：上线排期】\n- 第一周';
     return null;
   });
   const out = await runFollowUp({ cfg, state, question: '如果大促只剩两周呢？', providers: registry, publisher: createMemoryPublisher() });
@@ -162,17 +183,25 @@ test('追问：主席判断重新讨论，参与者在原会话里接着讨论�
     '主席:追问判断',
     'A:第 3 轮回应追问', 'B:第 3 轮回应追问',
     'R:第 4 轮评审意见', // 评审没有新意见，提前结束
-    '主席:汇总',
+    '主席:更新主文档',
+    'A:核对主文档', 'B:核对主文档',
   ]);
   // 主笔接着原来的会话：会话 id 不变，历史还在
   const a = calls.find((c) => c.who === 'A');
   assert.equal(a.session.id, state.sessions.a.id);
   assert.equal(a.turnsBefore, state.sessions.a.turns.length);
   assert.match(a.prompt, /如果大促只剩两周[\s\S]*主席的说明[\s\S]*重新权衡上线节奏/);
-  assert.match(calls.at(-1).prompt, /追问之前的汇总[\s\S]*和之前结论相比的变化/);
+  // 主席改同一份主文档：拿到现有的文档和追问之后的讨论
+  const update = calls.find((c) => c.stage === '更新主文档');
+  assert.match(update.prompt, /现在的主文档（第 1 版）[\s\S]*如果大促只剩两周[\s\S]*追问之后的讨论（匿名）[\s\S]*第 3 轮/);
+  assert.doesNotMatch(update.prompt, /### 第 2 轮/); // 原讨论的记录不再贴，已经在文档里
   assert.equal(out.state.lastRound, 4);
   assert.equal(out.state.followUps[0].handling, 'discuss');
-  assert.equal(out.state.sessions.a.turns.length, state.sessions.a.turns.length + 1);
+  assert.equal(out.state.followUps[0].answer, '两周内先上第一阶段');
+  assert.deepEqual(out.state.docs.map((d) => d.version), [1, 2]);
+  assert.deepEqual(out.state.docs[1].attachments, { 上线排期: '- 第一周' });
+  assert.equal(out.state.summary, '# 第 2 版');
+  assert.equal(out.state.sessions.a.turns.length, state.sessions.a.turns.length + 2); // 回应追问 + 核对
 });
 
 for (const conversation of [true, false]) {
@@ -275,4 +304,76 @@ test('callCost：不续接直接用；续接旧会话没有累计值时交给价
   assert.equal(old.cliCostUsd, 1.6);
   assert.equal(callCost(1.7, old), 0.1);
   assert.equal(callCost(0.05, old), 0.05); // 累计值变小：当作本次费用
+});
+
+// ---------- 主文档 ----------
+
+test('解析主文档：说明、正文、附录（删除）、无需修改；没写标记时整段当正文', async () => {
+  const { parseDoc, mergeAttachments, parseDocCheck, docLead } = await import('../src/modes.js');
+  const r = parseDoc('【说明】\n结论：做\n【主文档】\n# 标题\n正文\n【附录：迁移步骤】\n1. 先迁规则\n**【附录：旧清单】**\n（删除）');
+  assert.equal(r.note, '结论：做');
+  assert.equal(r.doc, '# 标题\n正文');
+  assert.deepEqual(r.attachments, { 迁移步骤: '1. 先迁规则', 旧清单: null });
+  assert.deepEqual(mergeAttachments({ 旧清单: 'x', 别的: 'y' }, r.attachments), { 别的: 'y', 迁移步骤: '1. 先迁规则' });
+  assert.deepEqual(parseDoc('【无需修改】'), { unchanged: true });
+  assert.equal(parseDoc('# 只有正文').doc, '# 只有正文');
+  assert.equal(parseDoc('【说明】一句话\n【主文档】\n# T').note, '一句话'); // 内容接在标记后面同一行
+  // 正文里出现别的【…】不算标记
+  assert.match(parseDoc('【主文档】\n- 【阻断】已解决').doc, /【阻断】已解决/);
+  assert.throws(() => parseDoc('【说明】x\n【主文档】\n'), /主文档是空的/);
+  assert.equal(parseDocCheck('**没有问题**'), null);
+  assert.equal(parseDocCheck('没有问题。\n- 但是漏了 X'), '没有问题。\n- 但是漏了 X');
+  assert.equal(docLead('# T\n**一句话结论**：做\n## 要点\n- a\n## 问题\n不要'), '**一句话结论**：做\n- a');
+});
+
+test('主文档文件：写最新一版和附录，删掉的附录文件也去掉', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'storm-doc-'));
+  const state = (attachments) => ({ version: 1, number: 1, docs: [{ version: 1, text: '# v1', attachments: {} }, { version: 2, text: '# v2', attachments }] });
+  saveState(dir, state({ '迁移/步骤': '1. a', 清单: '- x' }));
+  assert.equal(fs.readFileSync(path.join(dir, '主文档.md'), 'utf8'), '# v2\n');
+  assert.equal(fs.readFileSync(path.join(dir, '附录-迁移-步骤.md'), 'utf8'), '# 迁移/步骤\n\n1. a\n');
+  saveState(dir, state({ 清单: '- y' }));
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort(), ['主文档.md', '附录-清单.md']);
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'storm-doc-'));
+  saveState(empty, { version: 1, number: 2 });
+  assert.deepEqual(fs.readdirSync(empty), ['state.json']);
+});
+
+test('补写主文档：旧讨论读全部记录和之前的汇总、追问，主笔在原会话里核对', async () => {
+  const { backfillDoc } = await import('../src/orchestrator.js');
+  const { state } = await finished();
+  // 模拟改造前的旧讨论：只有汇总，没有主文档
+  const old = { ...state, docs: undefined, summary: '旧汇总：做', followUps: [{ question: '换分库？', handling: 'answer', answer: '不用' }] };
+  const { calls, registry } = scripted(({ stage }) => {
+    if (stage === '核对主文档') return '没有问题';
+    if (stage === '主文档') return '【说明】结论：做\n【主文档】\n# 补写的主文档';
+    return null;
+  });
+  const out = await backfillDoc({ cfg: base(), state: old, providers: registry, publisher: createMemoryPublisher() });
+  const doc = calls.find((c) => c.stage === '主文档');
+  assert.match(doc.prompt, /讨论记录（匿名）[\s\S]*之前的汇总和追问[\s\S]*旧汇总：做[\s\S]*追问 1：换分库？\n不用/);
+  assert.deepEqual(calls.filter((c) => c.stage === '核对主文档').map((c) => c.session.id).sort(), [state.sessions.a.id, state.sessions.b.id].sort());
+  assert.equal(out.state.docs[0].version, 1);
+  assert.equal(out.state.docs[0].reason, '补写');
+  assert.equal(out.state.summary, '# 补写的主文档');
+  assert.equal(out.state.legacySummary, '旧汇总：做');
+  assert.equal(out.state.sessions.a.turns.length, state.sessions.a.turns.length + 1);
+  await assert.rejects(backfillDoc({ cfg: base(), state: out.state, providers: registry, publisher: createMemoryPublisher() }), /已经有主文档/);
+});
+
+test('追问：旧讨论没有主文档时，重新讨论后补写一份', async () => {
+  const { state } = await finished();
+  const old = { ...state, docs: undefined, summary: '旧汇总' };
+  const { calls, registry } = scripted(({ who, stage }) => {
+    if (who === '主席' && /追问判断/.test(stage)) return '处理方式：重新讨论\n**给参与者的说明**\n重新权衡';
+    if (who === 'R') return '评审结论：没有意见了';
+    if (stage === '核对主文档') return '没有问题';
+    return null;
+  });
+  const out = await runFollowUp({ cfg: base({ maxRounds: 2 }), state: old, question: '还要拆吗？', providers: registry, publisher: createMemoryPublisher() });
+  const doc = calls.find((c) => c.stage === '主文档');
+  assert.match(doc.prompt, /旧汇总[\s\S]*追问 1：还要拆吗？/);
+  assert.equal(out.state.docs.length, 1);
+  assert.match(out.state.docs[0].reason, /^补写（追问：还要拆吗？）/);
+  assert.equal(out.state.legacySummary, '旧汇总');
 });

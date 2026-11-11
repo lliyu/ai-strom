@@ -16,7 +16,8 @@
       "webhook": {
         "urlEnv": "STORM_WEBHOOK_ARCHITECT",
         "secretEnv": "STORM_SECRET_ARCHITECT"
-      }
+      },
+      "effort": "high"
     },
     {
       "id": "risk",
@@ -29,7 +30,8 @@
       "webhook": {
         "urlEnv": "STORM_WEBHOOK_RISK",
         "secretEnv": "STORM_SECRET_RISK"
-      }
+      },
+      "effort": "high"
     }
   ],
   "chair": {
@@ -51,8 +53,18 @@
       "effort": "medium",
       "timeoutMs": 600000,
       "pricing": {
-        "claude-opus-5-5": { "inputPerM": 4, "outputPerM": 20, "cacheReadRatio": 0.05, "cacheWriteRatio": 2 },
-        "claude-fable-5-2": { "inputPerM": 8, "outputPerM": 40, "cacheReadRatio": 0.025, "cacheWriteRatio": 2 }
+        "claude-opus-5-5": {
+          "inputPerM": 4,
+          "outputPerM": 20,
+          "cacheReadRatio": 0.05,
+          "cacheWriteRatio": 2
+        },
+        "claude-fable-5-2": {
+          "inputPerM": 8,
+          "outputPerM": 40,
+          "cacheReadRatio": 0.025,
+          "cacheWriteRatio": 2
+        }
       }
     },
     "deepseek": {
