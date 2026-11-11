@@ -404,7 +404,8 @@ function lineupHtml(mode) {
       <span>${chairName}（最后汇总${mode === 'refine' ? '并写修订版' : '、写主文档'}）用 <select id="lnChair">${(st.models || []).map((m) => `<option value="${esc(m.id)}" ${m.id === l.chair ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></span>
       <span class="hint" id="lnHint"></span>
     </div>
-    ${mode === 'decision' && (st.repos || []).length ? `<div class="lnbar"><span>代码核实 <select id="lnChecker" title="讨论中「待核实的事实」由谁读代码回答"><option value="">调研员直接核实</option>${(st.models || []).filter((m) => m.readsCode).map((m) => `<option value="${esc(m.id)}" ${m.id === l.factChecker ? 'selected' : ''}>${esc(m.name)} 答，调研员审查纠正后再发</option>`).join('')}</select></span></div>` : ''}
+    ${mode === 'decision' ? `<div class="lnbar"><span>核实员 <select id="lnChecker" title="有代码时读代码回答「待核实的事实」；本场无代码时联网搜集资料、联网核实"><option value="">不用（${(st.repos || []).length ? '调研员直接读代码核实；无代码时不联网' : '不联网搜集资料'}）</option>${(st.models || []).filter((m) => m.readsCode).map((m) => `<option value="${esc(m.id)}" ${m.id === l.factChecker ? 'selected' : ''}>${esc(m.name)}：先答，调研员审查纠正后再发</option>`).join('')}</select></span></div>
+    <div class="hint">选了核实员：有代码时它读代码回答「待核实的事实」；本场无代码时，主席先判断要不要联网搜集资料，它联网查、调研员联网审查，讨论中的待核实问题也联网查。搜索关键词不带公司内部信息。</div>` : ''}
     <div class="hint" style="margin-top:4px">${mode === 'brainstorm' ? '主笔发散并修订脑洞；评审只做盲审、不出脑洞。' : '主笔出方案并多轮修订；评审只提意见，不出方案。'}同一个模型可以选多次，扮演不同角色。阵容记在这台电脑的浏览器里，下次默认沿用。</div>`;
 }
 // 绑定阵容编辑；onChange 在阵容是否可用变化时调用（用来启用 / 禁用开始按钮）

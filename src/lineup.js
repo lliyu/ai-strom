@@ -124,9 +124,9 @@ export function lineupConfig(cfg, { mode, rounds, lineup }) {
     for (const k of MODEL_ONLY) delete chair[k];
     Object.assign(chair, pick(m, MODEL_ONLY));
   }
-  // 核实员：只在登记了仓库（有调研员）时有意义
+  // 核实员：有代码时读代码答「待核实的事实」；本场无代码时联网搜集资料、联网核实。都由调研员审查后再发
   let research = cfg.research;
-  if (lineup.factChecker && Object.keys(cfg.repos ?? {}).length) {
+  if (lineup.factChecker && mode === 'decision') {
     const m = pool.get(lineup.factChecker);
     if (!m) throw new ConfigError(`核实员：没有「${lineup.factChecker}」这个模型`);
     if (!readsCode(cfg, m)) throw new ConfigError(`核实员：${m.name} 不能读代码，只能选 claude-cli 的模型`);

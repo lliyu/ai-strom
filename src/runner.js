@@ -226,7 +226,7 @@ export function withBudget(state, dir) {
  * 旧讨论没记 code 时：自动定位的按 auto 处理，指定仓库的从 context.repos 的说明里取别名。
  */
 export function codeForFollowUp(cfg, state) {
-  if (!state.context || !cfg.research || !Object.keys(cfg.repos ?? {}).length) return null;
+  if (!state.context || state.context.web || !cfg.research || !Object.keys(cfg.repos ?? {}).length) return null;
   try {
     const auto = state.code ? state.code.auto : Boolean(state.context.auto);
     if (auto) return { ...prepareRepos(resolveRepos(cfg, allRepoSpecs(cfg)), { skipMissing: true }), auto: true };

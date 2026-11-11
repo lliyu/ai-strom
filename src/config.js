@@ -168,7 +168,8 @@ function normalizeRepos(cfg, errors) {
     g.docs = (g.docs ?? []).map(expandHome);
     for (const a of g.repos) if (!cfg.repos[a]) errors.push(`repoGroups.${name}：repos 里没有 ${a}`);
   }
-  if (!Object.keys(cfg.repos).length) return;
+  // 没登记仓库时一般不需要调研员；网页阵容选了核实员时仍要调研员审查联网资料
+  if (!Object.keys(cfg.repos).length && !cfg.research?.factChecker) return;
 
   const r = cfg.research ?? {};
   cfg.research = {
@@ -180,6 +181,9 @@ function normalizeRepos(cfg, errors) {
     model: 'opus',
     effort: 'medium',
     tools: ['Read', 'Grep', 'Glob'],
+    // 本场无代码时，核实员和调研员联网搜集、核实资料用的工具
+    webTools: ['WebSearch', 'WebFetch'],
+    webMaxChars: 8000,
     timeoutMs: 15 * 60000,
     maxChars: 16000,
     auto: true,

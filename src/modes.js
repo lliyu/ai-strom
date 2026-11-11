@@ -44,6 +44,9 @@ export const STAGE_LABELS = {
   rewrite: '修订版',
   factcheck: '代码核实',
   factreview: '核实审查',
+  webplan: '资料搜集判断',
+  webresearch: '资料搜集',
+  webreview: '资料审查',
   doc: '主文档',
   doccheck: '核对主文档',
 };
@@ -252,6 +255,14 @@ export function subjectBlock(subject, requirement) {
 /** 调研员整理的背景资料；所有参与者和主席都拿同一份。 */
 export function contextBlock(context) {
   if (!context?.text) return '';
+  if (context.web) {
+    return [
+      '## 背景资料（讨论前联网搜集的公开资料，已经调研员逐条审查；每条都注明了来源链接）',
+      '本场没有读代码。讨论要以这里的事实为准；资料没覆盖、也不是公开资料能回答的（例如公司内部的系统和数据），写进需要确认的问题，不要猜。',
+      '',
+      context.text,
+    ].join('\n');
+  }
   return [
     `## 背景资料（调研员在讨论前从代码里整理${context.auto ? '，仓库由调研员按议题定位' : `，涉及仓库：${context.repos.map((r) => r.alias).join('、')}`}）`,
     '讨论要以这里的事实为准。资料里的源码坐标写作「仓库别名:路径:行号」，可以直接引用。资料没覆盖的代码细节不要猜，写进需要确认的问题。',
@@ -364,6 +375,96 @@ export function codeAccessNote({ repos, docs, tools = ['Read', 'Grep', 'Glob'], 
 }
 
 /** 请参与者把没查清、又影响结论的代码事实列出来，交给调研员在下一轮开始前核实。 */
+/** 本场没有代码、但可以联网查证时，参与者怎么提待核实的问题。 */
+export function webAskLine() {
+  return `**事实核实**：如果有会影响结论、但背景资料里没写清的外部事实（开源软件的行为和限制、公开标准、厂商文档、行业公开数据等），在发言末尾（有评审结论的写在评审结论之前）单独写一节「**${FACT_HEADING}**」，下面每行一个能用公开资料回答的具体问题。核实员会联网查证、调研员审查后发给所有人。公司内部的系统、代码和数据联网查不到，不要问；没有就不写这一节，已经核实过的不要重复问。`;
+}
+
+/** 内部信息不外发：搜索关键词只用公开的说法。 */
+const NO_INTERNAL = '搜索关键词里不要出现公司内部的系统名、服务名、项目代号、内部数据和人名：这些既搜不到，也不该发给搜索引擎。只用公开的技术名词、开源项目名和行业通用说法。';
+
+/** 开场：主席判断本场要不要联网搜集资料，要的话列出问题和关键词。 */
+export function webPlanPrompt({ topic, interjections }) {
+  return join(
+    `【阶段：${STAGE_LABELS.webplan}】`,
+    [
+      '你是「主席」。一场多 AI 方案讨论马上开始，本场没有读代码。你先判断：要不要在讨论前联网搜集一些公开资料，给参与者当背景。',
+      '只有当结论明显取决于外部事实时才需要搜集，例如开源软件或云服务的行为与限制、公开标准、厂商文档、公开的行业数据。纯粹的取舍、团队内部的事、常识性的问题不需要。',
+    ].join('\n'),
+    `## 议题\n${String(topic ?? '').trim()}`,
+    interjectionBlock(interjections),
+    [
+      '## 输出格式',
+      '第一行只能写「搜集资料：需要」或「搜集资料：不需要」。',
+      '写「需要」时，接着写一节「**要查的问题**」，每行一个具体问题（最多 6 个），句末用括号写搜索关键词，例如「- Kafka 单分区的顺序保证在消费者重平衡时是否会被打破？（关键词：Kafka partition ordering rebalance）」。',
+      NO_INTERNAL,
+      '写「不需要」时，接着用一句话说明原因。不要写别的。',
+    ].join('\n'),
+  );
+}
+
+/** 解析主席的搜集判断：{ need, questions }。没写第一行时按不需要处理。 */
+export function parseWebPlan(text) {
+  const t = String(text ?? '');
+  const need = /搜集资料\**\s*[:：]\s*\**\s*需要/.test(t) && !/搜集资料\**\s*[:：]\s*\**\s*不需要/.test(t);
+  if (!need) return { need: false, questions: [] };
+  const start = t.search(/要查的问题/);
+  const lines = (start >= 0 ? t.slice(start).split('\n').slice(1) : []);
+  const questions = [];
+  for (const raw of lines) {
+    const m = /^\s*(?:[-*]|\d+[.、)])\s+(.+)$/.exec(raw);
+    if (m) questions.push(m[1].trim());
+    else if (raw.trim() && questions.length) break;
+  }
+  return { need: questions.length > 0, questions: questions.slice(0, 6) };
+}
+
+/** 联网查证的写法，开场搜集和讨论中核实共用。 */
+function webRules(maxChars) {
+  return [
+    '## 要求',
+    '- 用 WebSearch 搜索，用 WebFetch 打开原始页面确认。优先官方文档、源码仓库、标准原文和厂商公告，其次是有署名的技术文章；论坛和问答帖只能作旁证。',
+    '- 每条事实后面写来源链接；版本相关的写明适用的版本和资料日期。',
+    '- 搜不到或资料互相矛盾的写「公开资料查不到」或「资料有冲突：……」，不要推测。属于公司内部信息的写「公开资料回答不了」，不要去搜。',
+    `- ${NO_INTERNAL}`,
+    `- 不要提建议，不要评价方案。全文不超过 ${maxChars} 字，只输出回答本身。用中文，使用 Markdown 的加粗和列表，不要使用表格和 # 标题。`,
+  ].join('\n');
+}
+
+/** 联网搜集 / 核实的初稿：核实员（例如 Sonnet）写，调研员审查后才发给参与者。 */
+export function webResearchPrompt({ round, topic, questions, who = '核实员', maxChars = 8000, opening = false, draft = true }) {
+  const draftNote = draft ? '你写的是初稿：调研员会逐条审查、纠正后，定稿才发给参与者。' : '参与者会直接以你的回答为准。';
+  return join(
+    `【阶段：${opening ? STAGE_LABELS.webresearch : `第 ${round} 轮${STAGE_LABELS.factcheck}`}】`,
+    opening
+      ? `你是「${who}」。一场多 AI 方案讨论马上开始，本场没有读代码。主席列出了下面这些需要联网查的问题，请查清后整理成背景资料。${draftNote}`
+      : `你是「${who}」。讨论参与者提出了下面这些需要用公开资料核实的问题，他们会以核实结果为准修改方案。${draftNote}`,
+    opening ? `## 议题\n${String(topic ?? '').trim()}` : '',
+    `## ${opening ? '要查的问题' : '待核实的问题'}\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+    '逐条回答，编号和问题一致。每条先写结论，再写依据和来源链接。',
+    webRules(maxChars),
+  );
+}
+
+/** 联网资料的审查：调研员（Opus）同样能联网，逐条打开来源核对，纠正后输出定稿。 */
+export function webReviewPrompt({ round, topic, questions, draft, checker = '核实员', maxChars = 8000, opening = false }) {
+  return join(
+    `【阶段：${opening ? STAGE_LABELS.webreview : `第 ${round} 轮${STAGE_LABELS.factreview}`}】`,
+    `你是「调研员」，这次负责审查。「${checker}」已经联网查过下面的问题，写了初稿。初稿还没有发给讨论参与者：你审查、纠正之后的定稿才会发出去，主笔和评审会以定稿为准，所以每条结论都必须站得住。`,
+    opening ? `## 议题\n${String(topic ?? '').trim()}` : '',
+    `## ${opening ? '要查的问题' : '待核实的问题'}\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+    `## ${checker}的初稿\n${draft}`,
+    [
+      '## 审查要求',
+      '- 逐条打开初稿引用的来源核对：链接是否存在、内容是否真的支撑结论、版本和日期是否对得上。拿不准的自己再搜一次。',
+      '- 有错就改，漏了就补；来源撑不住、你也查不到的结论，改成「公开资料查不到」，不要保留。',
+      '- 第一行写审查结论：「**审查**：共 N 条，全部无误」或「**审查**：共 N 条，M 条有更正（第 x、y 条）」。',
+      '- 然后写定稿：逐条回答，编号和问题一致，每条先写结论，再写依据和来源链接。更正过的条目在结论前标「【已更正】」，再用一句话说明初稿错在哪里。参与者看不到初稿，定稿要完整独立，不要写「同初稿」。',
+    ].join('\n'),
+    webRules(maxChars),
+  );
+}
+
 export function factAskLine() {
   return `**代码核实**：如果有会影响结论、但背景资料里没写清、你也没能自己查清的代码事实，在发言末尾（有评审结论的写在评审结论之前）单独写一节「**${FACT_HEADING}**」，下面每行一个能用代码回答的具体问题，例如「SP 的 stack_strategy 对同一 promotion_type 的多条规则是叠加还是只取一条？」。调研员会查代码回答，结果发给所有人。没有就不写这一节；已经核实过的不要重复问。`;
 }
@@ -371,6 +472,12 @@ export function factAskLine() {
 /** 核实结果：给参与者时只给新的（会话模式），给主席时给全部。 */
 export function factsBlock(facts, { forChair = false } = {}) {
   if (!facts?.length) return '';
+  if (facts.every((f) => f.source === 'web')) {
+    const webHead = forChair
+      ? '## 讨论中的事实核实结果（联网查证、调研员审查后的定稿；方案和它冲突时以它为准，主文档里要指出冲突）'
+      : '## 事实核实结果（联网查证、调研员审查后的定稿；和之前的判断冲突时以这里为准，受影响的结论要改）';
+    return [webHead, ...facts.map((f) => `### 第 ${f.round} 轮核实\n**问题**\n${f.questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\n**结果**\n${f.answer}`)].join('\n\n');
+  }
   const head = forChair
     ? '## 讨论中的代码核实结果（调研员查代码得出；方案或背景资料和它冲突时以它为准，汇总里要指出冲突）'
     : '## 代码核实结果（调研员刚查代码得出；和背景资料或之前的判断冲突时以这里为准，受影响的结论要改）';
@@ -616,7 +723,7 @@ function omittedBlock(omitted) {
 
 /** 本场没有读代码：涉及代码现状的说法都是参与者的推测。 */
 function noCodeBlock(noCode) {
-  return noCode ? '## 代码上下文\n本场无代码：讨论前没有读代码，讨论中也没有核实代码事实。参与者关于代码现状的说法都是推测，主文档里涉及代码现状的结论要标为「未核实」，并在开头注明「本场无代码」。' : '';
+  return noCode ? '## 代码上下文\n本场无代码：讨论前没有读代码，讨论中也没有核实代码事实（联网查证的只是公开资料）。参与者关于代码现状的说法都是推测，主文档里涉及代码现状的结论要标为「未核实」，并在开头注明「本场无代码」。' : '';
 }
 
 /** 讨论没有收敛（熔断或到上限）时，主文档要写成能让人直接裁决的样子。 */

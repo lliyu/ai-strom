@@ -9,6 +9,7 @@ import {
   docSystem, docPrompt, docUpdatePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead,
   limitsFor, splitReply, overLimit, compressPrompt, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
   parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
+  webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
 } from './modes.js';
 import { describeRepo } from './repos.js';
 import { estimateCost, priceFor } from './pricing.js';
@@ -104,9 +105,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 有值时：readCode 的参与者发言时带只读工具；参与者列出的「待核实的事实」由调研员在下一轮开始前查代码回答。
    */
   run.code = null;
+  /** 本场无代码、但网页阵容选了核实员：待核实的事实联网查（核实员答、调研员审查）。 */
+  run.web = false;
   run.facts = [...facts]; // [{ round, questions, answer }]，追问时接着原讨论的
   const research = cfg.research ?? null;
-  const factChecking = () => Boolean(run.code && research && research.factCheck !== false);
+  const factChecking = () => Boolean((run.code || run.web) && research && research.factCheck !== false);
   const canReadCode = (p) => Boolean(run.code && research && p.readCode === true);
   const toldCode = new Set(); // 本次运行已经拿到完整目录说明的参与者
 
@@ -230,7 +233,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    */
   run.speak = async (speaker, { stage, round, system, prompt, callOptions = {}, session, subtitle, quiet = false, limit = null }) => {
     const tag = tags.get(speaker.id)?.tag;
-    const noRound = ['research', 'summary', 'triage', 'rewrite', 'doc', 'doccheck'].includes(stage);
+    const noRound = ['research', 'summary', 'triage', 'rewrite', 'doc', 'doccheck', 'webplan', 'webresearch', 'webreview'].includes(stage);
     log(`${speaker.name} · ${STAGE_LABELS[stage]}${stage === 'research' ? '（只读查看代码，通常要几分钟）' : noRound ? '' : ` 第 ${round} 轮`} …`);
     try {
       let res = await call(speaker, { stage, round, system, prompt, callOptions, session });
@@ -309,6 +312,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 能查代码时附带只读工具和目录。
    */
   run.codeFor = (p, session) => {
+    if (!run.code && run.web) {
+      const fresh = convo ? run.facts.slice(session?.factsSeen ?? 0) : run.facts;
+      const parts = [fresh.length ? factsBlock(fresh) : '', factChecking() ? webAskLine() : ''].filter(Boolean);
+      return { text: parts.length ? `${parts.join('\n\n')}\n\n` : '', callOptions: {} };
+    }
     if (!run.code) return { text: '', callOptions: {} };
     const parts = [];
     const fresh = convo ? run.facts.slice(session?.factsSeen ?? 0) : run.facts;
@@ -353,6 +361,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     const questions = fresh.slice(0, max);
     pendingQuestions = fresh.slice(max);
     if (pendingQuestions.length) log(`待核实的问题有 ${fresh.length} 个，这次先查 ${max} 个，其余留到下一轮`);
+    if (!run.code && run.web) return run.webFactCheck({ round, questions });
     const tools = research.tools ?? ['Read', 'Grep', 'Glob'];
     const maxChars = research.factCheckMaxChars ?? 4000;
     const where = { repos: run.code.repos, docs: run.code.docs, tools, maxChars };
@@ -396,20 +405,66 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         subtitle: `第 ${round} 轮 · 代码核实 · ${questions.length} 个问题`,
       });
     }
+    return run.factDone({ round, questions, answer, review, draft });
+  };
+
+  /** 本场无代码时联网核实：核实员联网写初稿，调研员联网审查纠正；审查没过不发。 */
+  run.webFactCheck = async ({ round, questions }) => {
+    const checker = research.factChecker;
+    const webOptions = { tools: research.webTools ?? ['WebSearch', 'WebFetch'], timeoutMs: research.timeoutMs };
+    const maxChars = research.factCheckMaxChars ?? 4000;
+    let answer = null;
+    let review = null;
+    const draft = await run.speak(checker, {
+      stage: 'factcheck',
+      round,
+      system: run.shared,
+      prompt: webResearchPrompt({ round, questions, who: checker.name, maxChars }),
+      callOptions: { ...webOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
+      subtitle: `第 ${round} 轮 · 联网核实初稿 · ${questions.length} 个问题 · 待调研员审查，不发给参与者`,
+    });
+    if (draft) {
+      answer = await run.speak(research, {
+        stage: 'factreview',
+        round,
+        system: run.shared,
+        prompt: webReviewPrompt({ round, questions, draft, checker: checker.name, maxChars }),
+        callOptions: { ...webOptions, maxBudgetUsd: research.maxBudgetUsd },
+        subtitle: `第 ${round} 轮 · 联网核实审查定稿 · ${questions.length} 个问题`,
+      });
+      if (answer) review = { checker: checker.model ?? checker.provider, corrections: parseReviewCorrections(answer) };
+    } else {
+      log(`${checker.name}没答出来，这次由调研员直接联网核实`);
+      answer = await run.speak(research, {
+        stage: 'factcheck',
+        round,
+        system: run.shared,
+        prompt: webResearchPrompt({ round, questions, who: '调研员', maxChars, draft: false }),
+        callOptions: { ...webOptions, maxBudgetUsd: research.maxBudgetUsd },
+        subtitle: `第 ${round} 轮 · 联网核实 · ${questions.length} 个问题`,
+      });
+    }
+    return run.factDone({ round, questions, answer, review, draft, source: 'web' });
+  };
+
+  /** 核实收尾：失败时问题回到队列（连续失败条数减半），成功时记下结果。 */
+  run.factDone = ({ round, questions, answer, review, draft, source }) => {
     if (!answer) {
       factFailures += 1;
-      if (factFailures >= 2 && max > 1) {
-        factBatch = Math.max(1, Math.ceil(max / 2));
+      // 这次查的条数就是当前批次大小
+      const size = questions.length;
+      if (factFailures >= 2 && size > 1) {
+        factBatch = Math.max(1, Math.ceil(size / 2));
         factFailures = 0;
-        log(`代码核实连续失败，下一次只查 ${factBatch} 个问题`);
-      } else log('代码核实失败，这些问题下一轮再试');
+        log(`核实连续失败，下一次只查 ${factBatch} 个问题`);
+      } else log('核实失败，这些问题下一轮再试');
       pendingQuestions = [...questions, ...pendingQuestions];
       return false;
     }
     factFailures = 0;
     factBatch = null;
     for (const q of questions) asked.add(normQ(q));
-    run.facts.push({ round, questions, answer, ...(review ? { review: { ...review, draft } } : {}) });
+    run.facts.push({ round, questions, answer, ...(source ? { source } : {}), ...(review ? { review: { ...review, draft } } : {}) });
     emit({ type: 'fact_checked', round, questions: questions.length, ...(review ? { reviewed: true, corrections: review.corrections } : {}) });
     if (review?.corrections) log(`调研员审查更正了核实初稿里的 ${review.corrections} 条`);
     return true;
@@ -689,6 +744,54 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /**
+   * 开场联网搜集资料（本场无代码、网页阵容选了核实员时）：主席判断要不要搜、列出问题和关键词 →
+   * 核实员联网写初稿 → 调研员联网审查纠正。只有审查后的定稿作为背景资料发给参与者；任何一步失败都不带资料讨论。
+   * 返回背景资料 { web: true, text, questions, review } 或 null。
+   */
+  run.webResearch = async ({ topic }) => {
+    const checker = research?.factChecker;
+    if (!checker) return null;
+    const planText = await run.speak(cfg.chair, {
+      stage: 'webplan',
+      round: 0,
+      prompt: webPlanPrompt({ topic, interjections: heard }),
+      subtitle: '开场 · 要不要联网搜集资料（关键词不带公司内部信息）',
+    });
+    const plan = parseWebPlan(planText);
+    if (!plan.need) {
+      log(`${cfg.chair.name}判断不需要联网搜集资料`);
+      return null;
+    }
+    const webOptions = { tools: research.webTools ?? ['WebSearch', 'WebFetch'], timeoutMs: research.timeoutMs };
+    const maxChars = research.webMaxChars ?? 8000;
+    const draft = await run.speak(checker, {
+      stage: 'webresearch',
+      round: 0,
+      prompt: webResearchPrompt({ topic, questions: plan.questions, who: checker.name, maxChars, opening: true }),
+      callOptions: { ...webOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
+      subtitle: `开场 · 资料初稿 · ${plan.questions.length} 个问题 · 待调研员审查，不发给参与者`,
+    });
+    if (!draft) {
+      log(`${checker.name}没搜出资料，这场不带联网资料讨论`);
+      return null;
+    }
+    const final = await run.speak(research, {
+      stage: 'webreview',
+      round: 0,
+      prompt: webReviewPrompt({ topic, questions: plan.questions, draft, checker: checker.name, maxChars, opening: true }),
+      callOptions: { ...webOptions, maxBudgetUsd: research.maxBudgetUsd },
+      subtitle: `开场 · 资料审查定稿 · ${plan.questions.length} 个问题`,
+    });
+    if (!final) {
+      log('调研员没能审查联网资料，没审过的初稿不发，这场不带联网资料讨论');
+      return null;
+    }
+    const corrections = parseReviewCorrections(final);
+    emit({ type: 'web_researched', questions: plan.questions.length, corrections });
+    return { web: true, text: final, questions: plan.questions, review: { checker: checker.model ?? checker.provider, corrections, draft } };
+  };
+
+  /**
    * 阻断原文存档：每位评审最近一次提出【阻断】的那一轮的阻断原文。之后的轮次里这位评审不再提阻断时，记下从哪一轮起。
    * 交给主席写主文档、判断追问，也存进 state.json。
    */
@@ -805,7 +908,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     updatedAt: new Date().toISOString(),
     tags: Object.fromEntries(tags),
     shared,
-    context: context ? { auto: Boolean(context.auto), repos: context.repos.map(describeRepo), text: context.text } : null,
+    context: contextOut(context),
     code: codeSpecOf(code),
     facts,
     sessions: Object.fromEntries(sessions),
@@ -893,7 +996,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
       reviewers.length ? `**主笔**：${who(leads)}\n**评审**：${who(reviewers)}（只提意见，不出方案）` : null,
       code?.auto ? `**代码上下文**：没有指定仓库，调研员会从已登记的 ${code.repos.length} 个仓库里按议题定位相关代码（读本机当前分支），整理成背景资料发给所有人。想指定仓库可以写 \`仓库:别名\`，不想读代码写 \`仓库:无\`` : null,
       code && !code.auto ? `**代码上下文**：先由调研员只读查看下面的仓库，整理成背景资料发给所有人\n${code.repos.map((r) => `- ${describeRepo(r)}`).join('\n')}` : null,
-      !code && cfg.mode === 'decision' ? '**代码上下文**：本场无代码，参与者不能查代码，也不会核实代码事实；涉及代码现状的说法都按未核实处理。' : null,
+      !code && cfg.mode === 'decision' ? `**代码上下文**：本场无代码，参与者不能查代码，也不会核实代码事实；涉及代码现状的说法都按未核实处理。${cfg.research?.factChecker ? `\n**联网资料**：主席先判断要不要联网搜集公开资料；需要的话由${cfg.research.factChecker.role ? cfg.research.factChecker.role.replace(/^代码核实 · /, '') : '核实员'}联网查、调研员联网审查纠正后再发给所有人。讨论中的待核实问题也联网查。搜索关键词不带公司内部信息。` : ''}` : null,
       interjections ? (refine ? '**插话**：在页面下方输入，会在下一轮开始时交给所有模型。' : '**插话**：直接在群里发消息，会在下一轮开始时交给所有模型。') : null,
       refine ? '**写回**：修订版不会自动写回墨稿，要你在页面上确认。' : null,
     ].filter((l) => l !== null).join('\n'),
@@ -924,10 +1027,15 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     }
   }
 
+  // ---------- 本场无代码：联网搜集资料（网页阵容选了核实员时） ----------
+  const webEnabled = cfg.mode === 'decision' && !context && Boolean(cfg.research?.factChecker);
+  if (webEnabled) context = await run.webResearch({ topic });
+
   // 议题和背景资料整场不变，所有人共用同一份系统提示词，后面的调用都能命中缓存
   run.shared = sharedSystem({ mode: cfg.mode, topic, context, subject });
-  // 调研员确认涉及代码后，讨论中才能查代码、核实事实
-  if (context) run.code = code;
+  // 调研员确认涉及代码后，讨论中才能查代码、核实事实；本场无代码时可以联网核实
+  if (context && !context.web) run.code = code;
+  run.web = webEnabled;
 
   // ---------- 第 1 轮：主笔出方案 ----------
   await run.pullInterjections();
@@ -978,7 +1086,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     stats,
     roundsUsed: lastRound,
     ending,
-    context: context ? { repos: context.repos.map(describeRepo), text: context.text } : null,
+    context: contextOut(context),
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc: doc?.text ? doc : null,
     state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget, blockers }),
@@ -1006,7 +1114,9 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   const { leads, participants, stats, emit, heard, ideasPerAgent } = run;
   run.shared = state.shared; // 和原讨论完全一样，缓存还能命中
   // 原讨论带了代码背景时，调用方会重新准备代码目录：追问中照样能查代码、核实事实
-  if (code && state.context) run.code = code;
+  if (code && state.context && !state.context.web) run.code = code;
+  // 本场无代码、阵容里有核实员：追问中的待核实问题照样联网查
+  run.web = !run.code && state.mode === 'decision' && Boolean(cfg.research?.factChecker);
   const no = state.number ? ` #${state.number}` : '';
   const maxRounds = cfg.followUpMaxRounds ?? 10;
 
@@ -1235,7 +1345,14 @@ function endingSuffix(ending, stopRule) {
 
 /** 方案讨论没有带代码背景：主席写文档时要把代码相关的说法标为未核实。 */
 function noCodeOf(mode, context) {
-  return mode === 'decision' && !context;
+  return mode === 'decision' && (!context || Boolean(context.web));
+}
+
+/** 存进 state.json / result.json 的背景资料。联网资料没有仓库。 */
+function contextOut(context) {
+  if (!context) return null;
+  if (context.web) return { web: true, text: context.text, questions: context.questions, ...(context.review ? { review: context.review } : {}) };
+  return { auto: Boolean(context.auto), repos: context.repos.map(describeRepo), text: context.text };
 }
 
 /** 发言里带【阻断】的那几行，原文照抄（最多 10 行，每行最多 300 字）。 */
