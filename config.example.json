@@ -1,0 +1,164 @@
+{
+  "mode": "decision",
+  "rounds": "auto",
+  "maxRounds": 20,
+  "followUpMaxRounds": 10,
+  "concurrency": 3,
+  "participants": [
+    {
+      "id": "architect",
+      "name": "Claude Opus",
+      "role": "架构视角",
+      "persona": "你关注系统边界、数据一致性、扩展性和长期维护成本。",
+      "provider": "claude-cli",
+      "model": "opus",
+      "color": "blue",
+      "webhook": {
+        "urlEnv": "STORM_WEBHOOK_ARCHITECT",
+        "secretEnv": "STORM_SECRET_ARCHITECT"
+      }
+    },
+    {
+      "id": "risk",
+      "name": "Claude Sonnet",
+      "role": "风险视角",
+      "persona": "你关注上线风险、故障场景、回滚方案、数据错误的影响面和可观测性。",
+      "provider": "claude-cli",
+      "model": "sonnet",
+      "color": "orange",
+      "webhook": {
+        "urlEnv": "STORM_WEBHOOK_RISK",
+        "secretEnv": "STORM_SECRET_RISK"
+      }
+    }
+  ],
+  "chair": {
+    "id": "chair",
+    "name": "主席",
+    "role": "汇总",
+    "provider": "claude-cli",
+    "model": "opus",
+    "color": "purple",
+    "webhook": {
+      "urlEnv": "STORM_WEBHOOK_CHAIR",
+      "secretEnv": "STORM_SECRET_CHAIR"
+    }
+  },
+  "providers": {
+    "claude-cli": {
+      "type": "claude-cli",
+      "bin": "claude",
+      "effort": "medium",
+      "timeoutMs": 600000,
+      "pricing": {
+        "claude-opus-5-5": { "inputPerM": 4, "outputPerM": 20, "cacheReadRatio": 0.05, "cacheWriteRatio": 2 },
+        "claude-fable-5-2": { "inputPerM": 8, "outputPerM": 40, "cacheReadRatio": 0.025, "cacheWriteRatio": 2 }
+      }
+    },
+    "deepseek": {
+      "type": "openai-compatible",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "timeoutMs": 600000
+    },
+    "bailian": {
+      "type": "anthropic-compatible",
+      "baseUrl": "https://<工作空间>.maas.aliyuncs.com/apps/anthropic",
+      "apiKeyEnv": "BAILIAN_API_KEY",
+      "maxTokens": 131072,
+      "timeoutMs": 1800000,
+      "pricing": {
+        "deepseek-v4.1-flash-1017": {
+          "currency": "CNY",
+          "usdRate": 7.1,
+          "inputPerM": 2,
+          "outputPerM": 8,
+          "cacheReadRatio": 0.1,
+          "offPeak": {
+            "from": "22:00",
+            "to": "08:00",
+            "timezone": "Asia/Shanghai",
+            "inputPerM": 1,
+            "outputPerM": 4
+          }
+        }
+      }
+    }
+  },
+  "lark": {
+    "maxCardBytes": 18000,
+    "minIntervalMs": 250,
+    "interjection": {
+      "enabled": false,
+      "chatId": "oc_xxx",
+      "allowFrom": [
+        "ou_xxx"
+      ]
+    },
+    "watch": {
+      "intervalMs": 30000,
+      "triggers": {
+        "/讨论": "decision",
+        "/脑洞": "brainstorm",
+        "/追问": "followup"
+      }
+    }
+  },
+  "repos": {
+    "fission": {
+      "path": "/Users/me/code/hotel/fission",
+      "description": "酒店价格计算、缓存与分发"
+    },
+    "price-center-job": {
+      "path": "/Users/me/code/hotel/pricing/price-center-job",
+      "description": "GTTD 批量定价任务调度"
+    }
+  },
+  "repoGroups": {
+    "pricing": {
+      "description": "价格中心",
+      "repos": [
+        "price-center-job"
+      ],
+      "docs": [
+        "/Users/me/code/hotel/pricing/docs"
+      ]
+    }
+  },
+  "research": {
+    "provider": "claude-cli",
+    "model": "opus",
+    "effort": "medium",
+    "maxChars": 16000
+  },
+  "personas": {
+    "refine": {
+      "opus": {
+        "role": "结构与人物",
+        "persona": "你是资深网文编辑，关注故事结构、主线和人物：核心创意能不能撑起长篇，人物的动机和成长立不立得住，卷与卷之间有没有递进。"
+      },
+      "fable": {
+        "role": "读者视角",
+        "persona": "你站在挑剔的网文读者一边：前三章能不能留住人，爽点和情绪是否具体，哪里会让人觉得套路、憋屈而弃书。可以认可，但必须先认真找过弃书的理由。"
+      },
+      "gemini": {
+        "role": "市场与差异",
+        "persona": "你熟悉番茄、起点等平台的热门作品和读者口味，关注同质化风险、卖点能不能一句话说清、和同类热门书的差异站不站得住。"
+      },
+      "deepseek": {
+        "role": "逻辑与可持续",
+        "persona": "你专门找设定和逻辑漏洞：金手指的边界是否自洽，世界规则有没有被剧情打破，按这个设计写到一两百万字会不会崩、会不会没东西可写。"
+      },
+      "chair": {
+        "name": "主编",
+        "role": "汇总与修订"
+      }
+    }
+  },
+  "novel": {
+    "baseUrl": "http://127.0.0.1:3000"
+  },
+  "web": {
+    "port": 8790
+  }
+}

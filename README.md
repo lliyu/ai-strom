@@ -1,0 +1,305 @@
+# ai-storm
+
+让多个模型分角色讨论同一个问题，每个模型用自己的 Lark 群自定义机器人发言，最后由主席汇总。
+
+- **decision（方案讨论）**：第 1 轮主笔各自独立出方案 → 之后每轮评审先提意见，主笔看到别人的匿名方案和评审意见后互评并修订，直到所有评审都表示没有新意见（最多 20 轮）→ 主席汇总共识、分歧、待拍板的问题和评审提出但仍未解决的问题。有新插话的那一轮不会提前结束，主笔要先回应。
+- **brainstorm（脑洞风暴）**：第 1 轮按各自视角发散 → 每个循环先「盲审」（只给意见、不改写），再各自独立修订 → 主编挑选和组合。不让模型自由群聊，避免几轮之后点子越来越像。
+- **refine（作品打磨）**：在本地网页上从墨稿（novel-idea）挑一份脑洞、梗概或总纲，几个模型找不足、讨论怎么改，最后主编写出修订版，你确认后才写回墨稿。不经过 Lark，见[作品打磨](#作品打磨本地网页)。
+
+## 工作方式
+
+```
+本机主持程序（node src/cli.js）
+  保存完整讨论记录，决定每一轮谁发言、能看到什么
+      │                                   │
+      ▼ 调用模型                           ▼ 每个发言者用自己的机器人发卡片
+  claude CLI / OpenAI 兼容接口         Lark 讨论群（展示过程）
+      ▲                                   │
+      └──── 每轮开始前用 lark-cli 只读群里的新消息（你的插话）◄┘
+```
+
+- 模型之间不在群里直接对话。每一轮由主持程序把别人上一轮的发言（匿名成「方案 A / B / C」）交给每个模型。
+- 主席和互评时只看到匿名代号；讨论结束后由程序补发「代号对照」。
+- 每次讨论在 `runs/<时间>-<议题>/` 留本地记录：`transcript.md`（全文）、`events.jsonl`、`result.json`。
+- 篇幅控制（方案讨论和作品打磨；脑洞风暴不限）：
+  - 每条发言开头是不超过 3 行的**要点**。卡片和网页上只露出要点，详细内容放在折叠面板里；主席的汇总默认展开。飞书客户端要 V7.9 及以上才能显示折叠面板。
+  - 主笔从第 2 轮起只写这一轮的变化：改了什么、对评审的回应、立场变化。完整方案写在「【完整方案】」这一行之后，交给评审、其他主笔和主席，卡片上收在「当前完整方案」面板里。
+  - 评审只写问题，不写优点，每个问题标【阻断】或【建议】。只有还剩【阻断】级问题才算「继续讨论」；写了继续却没有【阻断】的，按没有意见处理。
+  - 每类发言都有字数上限，按去掉空白和 Markdown 符号后的字数计算。超出上限 1.25 倍时，程序会让发言者压缩重写一次，群里只发重写后的版本。上限见配置里的 `limits`。
+
+## 第一次使用
+
+需要 Node.js 20 以上、已登录的 Claude Code CLI（`claude`）。没有第三方依赖，不需要 `npm install`。
+
+1. 准备配置：
+   ```bash
+   cp config.example.json config.json
+   cp .env.example .env
+   ```
+2. 在 Lark 建一个专用讨论群。每个发言者（含主席）在「群设置 → 群机器人 → 添加机器人 → 自定义机器人」里建一个机器人，设置名字和头像，**开启签名校验**。
+3. 把每个机器人的 webhook 地址和签名密钥写进 `.env`，变量名对应 `config.json` 里各发言者的 `webhook.urlEnv` / `webhook.secretEnv`。`.env` 和 `config.json` 都不会进 Git。
+4. 检查并发测试卡片：
+   ```bash
+   node src/cli.js check
+   node src/cli.js send-test
+   ```
+5. 先在终端演练，再正式发到群里：
+   ```bash
+   node src/cli.js discuss "要不要把价格计算拆成独立服务？" --mock --dry-run   # 不调用模型，看流程
+   node src/cli.js discuss "要不要把价格计算拆成独立服务？" --dry-run          # 调用模型，只打印不发群
+   node src/cli.js discuss "要不要把价格计算拆成独立服务？"                    # 正式讨论
+   node src/cli.js discuss --topic-file topic.md --mode brainstorm --rounds 3
+   ```
+
+## 配置说明（config.json）
+
+| 字段 | 含义 |
+|---|---|
+| `mode` | `decision` 或 `brainstorm`，可用 `--mode` 覆盖 |
+| `rounds` | `"auto"`（默认）：每轮评审在最后写「评审结论：继续讨论 / 没有意见了」，所有评审都写「没有意见了」就提前结束，否则一直讨论到 `maxRounds`。没有评审的方案讨论看主笔的「立场变化」是否都为「无」。写数字则是固定总轮数（含第 1 轮），1 到 20。brainstorm 里每多一轮是一个「盲审 → 修订」循环 |
+| `maxRounds` | 自动轮数的上限，默认 20，最大 20。达到上限时主席会被告知「评审仍有意见」，汇总里列出卡住的问题 |
+| `conversation` | 默认 `true`：每位参与者整场讨论在同一条会话里，记得自己说过的话，每轮只发新内容；`false` 时每轮都是新会话 |
+| `limits` | 字数上限，可以只覆盖其中几项。方案讨论的默认值：要点 `brief` 150，第 1 轮方案 `propose` 1500，评审 `critique` 700，主笔修订 `review` 800，回应追问 `followup` 800，完整方案 `plan` 1800；作品打磨的默认值是 150 / 2200 / 900 / 1000 / 1000 / 2500。`tolerance` 默认 1.25，超过「上限 × tolerance」才要求压缩重写 |
+| `followUpMaxRounds` | 追问后重新讨论的轮数上限，默认 10 |
+| `sessionRetentionDays` | 会话保留天数，默认 7，过期后不能再追问 |
+| `concurrency` | 同一轮里同时调用的模型数 |
+| `ideasPerAgent` | brainstorm 每人给几个脑洞，默认 3 |
+| `participants[]` | 发言者：`id`、`name`、`role`、`persona`（角色设定）、`part`、`provider`、`model`、`effort`、`color`、`webhook`、`contextWindow`（上下文窗口 tokens，可选） |
+| `part` | `lead`（主笔，默认）：出方案并多轮修订；`reviewer`（评审）：不出方案，每轮先给主笔的方案提意见，主笔再回应并修订。配置了评审时 `rounds` 至少为 2 |
+| `chair` | 主席（brainstorm 时是主编），字段同上 |
+| `providers` | 模型接入方式，见下文 |
+| `lark.interjection` | 插话读取：`enabled`、`chatId`（oc_ 开头）、`allowFrom`（只收这些 open_id 的消息，留空表示群里所有人） |
+
+卡片标题颜色可选：`blue wathet turquoise green yellow orange red carmine violet purple indigo grey`。
+
+## 模型接入
+
+- **claude-cli**（当前在用）：通过本机已登录的 `claude -p` 调用，无工具、不保存会话，在临时空目录里运行。`model` 填 `opus`、`sonnet`、`haiku` 或完整模型 ID。
+- **openai-compatible**（预留）：DeepSeek、Kimi、Qwen、OpenRouter 等。在 `providers` 里加一项，key 放 `.env`：
+  ```json
+  "deepseek": { "type": "openai-compatible", "baseUrl": "https://api.deepseek.com/v1", "apiKeyEnv": "DEEPSEEK_API_KEY" }
+  ```
+  然后在发言者上写 `"provider": "deepseek", "model": "deepseek-chat"`。
+- **anthropic-compatible**：Anthropic Messages 兼容接口（请求 `{baseUrl}/v1/messages`），例如阿里百炼的 `/apps/anthropic`。返回里的 thinking 块会被忽略，只取正文：
+  ```json
+  "bailian": { "type": "anthropic-compatible", "baseUrl": "https://<工作空间>.maas.aliyuncs.com/apps/anthropic", "apiKeyEnv": "BAILIAN_API_KEY", "maxTokens": 8192 }
+  ```
+  鉴权默认用 `x-api-key` 头，需要 `Authorization: Bearer` 时加 `"authHeader": "bearer"`。
+- **新增其他类型**：在 `src/providers/` 实现 `complete({ model, system, prompt })`，返回 `{ text, model, durationMs, usage }`，再在 `src/providers/index.js` 的 `FACTORIES` 里登记。
+
+## 在 Lark 群里发起讨论（watch）
+
+```bash
+node src/cli.js watch                 # 前台运行，Ctrl+C 停止（当前讨论结束后退出）
+node src/cli.js watch --interval 60   # 改轮询间隔（秒）
+node src/cli.js watch --dry-run       # 讨论只打印到终端，不发群（指令仍从群里读）
+```
+
+在讨论群里发：
+
+| 指令 | 作用 |
+|---|---|
+| `/讨论 <议题>` | 方案讨论 |
+| `/讨论 3轮 <议题>` | 固定总轮数（含第 1 轮）。不写时评审都没有新意见就结束，最多 20 轮 |
+| `/讨论 仓库:pricing,fission@master <议题>` | 指定读哪些仓库；不写时调研员按议题自己定位，`仓库:无` 不读代码，见「代码上下文」 |
+| `/脑洞 <题目>` | 脑洞风暴 |
+| `/追问 [#编号] <问题>` | 追问一场讨论（默认最近一场），主席判断直接回答还是重新讨论，见「会话与追问」 |
+
+- 议题可以换行写长一些；讨论进行中直接发的消息是插话，进行中再发的指令会在当前讨论结束后排队执行。
+- 只响应 `lark.interjection.allowFrom`（或 `lark.watch.allowFrom`）里的 open_id，没配置时拒绝启动，避免群里任何人都能触发模型调用。
+- 每隔 `lark.watch.intervalMs`（默认 30 秒）用 lark-cli 用户身份只读一次群消息。lark-cli 的应用是全公司共用的，偶尔会遇到短暂限流（99991400）：同一次读取里隔 3、6、10 秒重试，仍限流就等下一个间隔再读，不会加长等待，指令也不会丢（每次往回多读 2 分钟、按消息 id 去重）；单次开销约 0.1 秒 CPU。电脑睡眠时暂停，醒来后继续处理。
+- 只处理 watch 启动之后的消息；同一台机器只能跑一个 watch（锁文件 `runs/.watch.pid`）。
+- 运行状态写在 `runs/.watch.state.json`（阶段、当前议题、上次读群时间、上一场结果），klook-console「模型用量」页的「群内发起」面板读它，并可以在页面上启动、停止、强制停止；从页面启动时输出写到 `runs/.watch.log`。
+- 停止：空闲时立即退出；讨论进行中会等这场讨论结束再退出，再发一次停止信号（或页面上的「强制停止」）立即退出。
+
+## 代码上下文
+
+先在 `config.json` 登记仓库。之后方案讨论默认都会先读代码：
+
+```
+/讨论 分析下 pricecenter 里 priceable 的缓存策略          # 不写仓库：调研员按议题自己定位
+/讨论 仓库:pricing 要不要给批量定价加分布式锁？            # 指定仓库或组
+/讨论 3轮 仓库:fission,price-center@develop 议题……         # 指定分支
+/讨论 仓库:无 团队要不要统一用 pnpm？                      # 不读代码
+```
+
+```bash
+node src/cli.js discuss "议题"                              # 自动定位
+node src/cli.js discuss "议题" --repos pricing,fission@master
+node src/cli.js discuss "议题" --repos none                 # 不读代码
+node src/cli.js repos        # 列出登记的仓库和组，以及各仓库当前的分支与未提交改动
+```
+
+流程：讨论开始前，**调研员**（默认 Opus，用主席的机器人发言）只读查看代码，整理一份背景资料发到群里；之后所有主笔、评审和主席的提示词里都带着这份资料。调研失败时讨论不开始。
+
+- **不写仓库时**：调研员拿到全部登记仓库的清单（别名、目录、描述、当前分支）和各组的参考资料，先按议题判断涉及哪些仓库。议题里写简称、服务名或中文业务词都可以，比如 pricecenter、价格中心。之后只读相关的仓库，背景资料开头会写「涉及的仓库」。议题和代码无关时，调研员只回「无相关代码」，讨论照常进行，不带背景资料。脑洞风暴不会自动读代码；不想要自动定位，可以设置 `research.auto: false`。
+
+- 别名可以是单个仓库，也可以是组（展开成组里的所有仓库）。`@` 后面写分支、tag 或 commit；不写时读本机工作区，也就是当前分支加未提交改动，开场卡片会写明读的是哪个分支、有几个未提交改动。
+- 写了 `@分支` 时，用 `git archive` 把那个版本导出到临时目录再读，不切换你本地的分支，结束后删除临时目录。只用本地已有的 ref（也会试 `origin/<分支>`），不会自动 fetch。
+- 调研员用 `claude -p --restricted --tools Read,Grep,Glob` 运行：没有 Bash，不加载你的用户和项目设置与 Hook，文件工具只能读登记的仓库和参考资料目录。
+- 资料里的源码坐标写作 `别名:仓内路径:行号`，讨论时可以直接引用。
+- 背景资料会发给所有参与者，包括 Gemini 和 DeepSeek。
+
+讨论中查代码：背景资料是讨论开始前一次性写好的，难免漏掉细节。所以讨论过程中还有两道补充：
+
+- **主笔自己查**：用 claude-cli 的主笔默认带同样的只读工具（`Read,Grep,Glob`，`--restricted`，只能读这次的代码目录），背景资料没写到、或者对某个代码事实没把握时，可以自己去代码里查。评审和走 HTTP 接口的模型（Gemini、DeepSeek）没有这个能力。发言者上写 `"readCode": false` 可以关掉，`maxBudgetUsd` 可以限制单次发言的费用。查代码会让主笔每轮更慢、更贵。
+- **调研员核实**：每位参与者都可以在发言末尾写一节「**待核实的事实**」，每行一个能用代码回答的问题。下一轮开始前，调研员带着只读工具把这些问题查一遍，结果以「代码核实」卡片发到群里，并发给所有参与者（会话模式下每人只收到一次）；和背景资料冲突时以核实结果为准。有新核实结果的那一轮不会提前结束，主笔要先按结果修订。最后一轮提出的问题在主席汇总前查掉，主席汇总时拿到全部核实结果。已经查过的问题不重复查，单次最多查 `research.factCheckMaxQuestions` 个，多出来的留到下一轮；核实失败时问题留到下一轮再试。
+- **追问时**：原讨论带了背景资料的，追问时会重新准备代码目录（读本机当前的代码，可能和原讨论时有出入），主笔照样能查代码，调研员照样核实；原讨论的核实结果会保留。
+
+配置：
+
+```json
+"repos": {
+  "fission": { "path": "/Users/me/code/hotel/fission", "description": "酒店价格计算" },
+  "price-center-job": { "path": "/Users/me/code/hotel/pricing/price-center-job", "description": "GTTD 批量定价任务", "docs": [] }
+},
+"repoGroups": {
+  "pricing": { "description": "价格中心", "repos": ["price-center-job"], "docs": ["/Users/me/code/hotel/pricing/docs"] }
+},
+"research": { "provider": "claude-cli", "model": "opus", "effort": "medium", "maxChars": 16000 }
+```
+
+| 字段 | 含义 |
+|---|---|
+| `repos.<别名>.path` | 仓库的本机绝对路径，可以用 `~/` |
+| `repos.<别名>.docs` / `repoGroups.<组>.docs` | 参考资料（目录或文件），调研员先看这里找线索，再到代码里核实。例如 insight 的 `domains/hotel` |
+| `research.model` / `effort` | 调研员用的模型，只能是 claude-cli |
+| `research.maxBudgetUsd` | 可选，单次调研的费用上限，超出就失败；默认不限制 |
+| `research.timeoutMs` | 调研超时，默认 15 分钟 |
+| `research.auto` | 方案讨论没写仓库时，是否让调研员从全部登记的仓库里按议题定位，默认 true |
+| `research.maxChars` | 背景资料的字数上限，默认 16000；超出 1.5 倍会被截断 |
+| `research.webhook` | 调研员用哪个机器人发卡片，默认和主席一样 |
+| `research.factCheck` | 讨论中是否收集「待核实的事实」并由调研员查代码回答，默认 true |
+| `research.factCheckMaxQuestions` | 单次核实最多查几个问题，默认 8 |
+| `research.factCheckMaxChars` | 单次核实回答的字数上限，默认 4000 |
+| `participants[].readCode` | 讨论中能否自己只读查看代码。不写时 claude-cli 的主笔为 true，其他为 false；只有 claude-cli 能设为 true |
+
+## 会话与追问
+
+**会话**：每位参与者（主笔、评审）整场讨论在同一条会话里，模型记得自己之前说过的话。
+
+- 每轮只发新内容：别人的最新方案、评审意见、新的插话。自己的上一版不再重贴，身份和规则只在第一条消息里说。
+- 评审从第 3 轮起先跟进自己上一轮的意见，逐条标明「已解决 / 被合理反驳 / 仍未解决」，再提新问题。
+- 接入方式：
+  - claude CLI 第一次用 `--session-id`，之后用 `--resume`。工作目录固定为 `~/.cache/ai-storm/claude`，所以会话文件在 `~/.claude/projects/-Users-…-cache-ai-storm-claude/`。
+  - HTTP 接口没有会话，由程序把之前的往来作为历史消息带上。
+- 会话前缀固定，缓存命中率随轮数上升，实测第 3 轮以后约 50%–80%。
+- 主席和调研员不用会话。
+
+**追问**：每场讨论有编号，开场和结束卡片上都会显示，例如 `#12`。讨论结束后在群里发：
+
+```
+/追问 如果大促只剩三周，方案要怎么调整？        # 追问最近一场
+/追问 #12 换成按商家分库呢？                   # 追问指定的一场
+```
+
+```bash
+node src/cli.js followup "问题"            # 命令行，默认最近一场
+node src/cli.js followup --run 12 "问题"
+```
+
+主席先判断怎么处理：
+
+- **直接回答**：追问是澄清、解释，或者讨论记录里已经有答案。只调用一次主席。
+- **重新讨论**：追问带来新的约束或信息、质疑结论或要求换方向。主席写一段「给参与者的说明」，主笔在**原来的会话**里回应追问并修订，之后照常「评审提意见 → 主笔修订」，直到评审没有新意见（最多 `followUpMaxRounds` 轮）。评审会收到追问原文作为「本次讨论范围」：追问里已经拍板的决定不再质疑，范围外的问题不提、也不算【阻断】；主席的说明只给主笔，不给评审，以免评审被主席的判断带偏。最后主席说明结论相比之前变了什么。
+
+讨论状态保存在 `runs/<讨论>/state.json`：会话、各方最新方案、讨论记录、之前的追问。每次追问的记录单独存在 `runs/<时间>-追问#12-…/`。
+
+几点规则：
+
+- 会话保留 `sessionRetentionDays` 天（默认 7），从最后一次更新算起。过期后删除 Claude 会话文件，清空 `state.json` 里的对话记录，这场讨论就不能再追问了。讨论记录本身（`transcript.md` 等）不受影响。
+- dry-run 和正式讨论分开找「最近一场」。
+- `--mock` 演练不编号、不保存会话。
+
+## 作品打磨（本地网页）
+
+个人创作用，不发到 Lark。先启动墨稿（Work Console 的墨稿模块，或在 novel-idea 里 `npm run dev`），再启动打磨页面：
+
+```bash
+node src/cli.js web            # 打开 http://127.0.0.1:8790/
+node src/cli.js web --mock     # 演练：不调用模型，修订版不能写回
+```
+
+1. 左边列出墨稿里的**脑洞、梗概、总纲**，点一项看现在的版本和背景（定位、素材、墨稿评委已经给过的意见、已写的章节）。
+2. 可以写一句「这次想怎么改」，然后点「开始打磨」。讨论一场一场排队。
+3. 流程同方案讨论：主笔各自诊断并给修改方案 → 评审提意见 → 主笔修订，直到评审没有新意见（最多 `maxRounds` 轮）→ 主编汇总共识、分歧和需要你拍板的问题 → 主编按汇总写出**完整修订版**。
+4. 讨论过程实时显示在页面上。进行中可以**插话**，下一轮开始时交给所有模型；结束后可以**追问**，主编判断直接回答还是重新讨论，重新讨论后会重写修订版。
+5. 「修订版」页逐处对比原稿（删掉的标红、新写的标绿）。确认后点「**写回墨稿**」才会改墨稿：
+   - 脑洞、梗概直接覆盖原来那一条；原稿在「原稿」页和 `state.json` 里都留着。
+   - 总纲连同分卷一起改：分卷按顺序对应，已经写了章节的分卷不能删。写回前墨稿会自动存一份历史版本，可以在大纲页恢复。
+   - 讨论开始后你在墨稿里又改过这一项，写回会被拒绝，免得覆盖新内容。
+
+角色按模式换：`personas.refine` 把四个模型换成「结构与人物 / 读者视角 / 市场与差异 / 逻辑与可持续」，主席换成「主编」。模型通道和方案讨论共用同一套配置。
+
+打磨讨论和群里的讨论共用编号；群里的 `/追问`（不写编号时）不会落到打磨讨论上，打磨只能在页面上追问。每场打磨的发言存在 `runs/<讨论>/thread.jsonl`，修订版和写回记录在 `state.json`。
+
+配置项：`novel.baseUrl`（墨稿地址，默认 `http://127.0.0.1:3000`）、`web.port`（默认 8790）、`web.host`（只能是本机地址，页面没有登录）。
+
+## 插话
+
+把 `lark.interjection.enabled` 设为 `true` 并填上讨论群的 `chatId`。群 ID 可以这样查：
+
+```bash
+lark-cli im +chat-search --query "<群名>" --as user
+```
+
+讨论中你在群里发的消息，会在**下一轮开始时**交给所有模型，主席汇总时也会看到。读取用的是 lark-cli 的用户身份，只读这个群、只读讨论开始之后的消息，机器人自己的发言不算插话。`--no-interject` 可以临时关闭。
+
+## 用量与上下文记录
+
+每场讨论的 `runs/<id>/usage.jsonl` 逐行记录事件，供 klook-console 的「模型用量」页面读取：
+
+| 事件 | 内容 |
+|---|---|
+| `run_started` | 议题、模式、轮数、参与者与主席（provider、配置的模型、`contextWindow`）、进程号、是否 dry-run / mock |
+| `call_started` | 谁开始调用、哪个阶段、第几轮 |
+| `call_finished` | 实际模型、输入/输出 tokens、上下文窗口、费用、耗时、是否被截断；调研员还有工具调用轮数 `turns` |
+| `call_failed` | 失败原因 |
+| `fact_checked` | 第几轮做了代码核实、查了几个问题 |
+| `run_finished` / `run_failed` | 汇总或错误 |
+
+上下文窗口的来源：claude CLI 会返回实际模型和窗口大小；OpenAI 兼容接口在没写 `contextWindow` 时会查一次 `{baseUrl}/models`（LiteLLM 网关返回 `max_input_tokens`）；Anthropic 兼容接口（百炼）查不到，需要在发言者上写 `contextWindow`。
+
+缓存：三种接入方式都会记录缓存读取（`cacheReadTokens`）和写入（`cacheWriteTokens`），卡片页脚显示命中率。
+
+费用：claude CLI 自带费用，但 `--resume` 续接会话时返回的是整条会话的累计值，所以每条会话记下上次的累计值（`state.json` 里的 `cliCostUsd`），只计差值；续接一条没记过累计值的旧会话时按 `claude-cli` 上配置的 `pricing` 估算（`cacheWriteRatio: 2` 对应 Claude Code 的 1 小时缓存写入）。LiteLLM 网关从响应头 `x-litellm-response-cost` 读取；接口不返回费用时（百炼），按 provider 上配置的价格估算，事件里带 `costEstimated: true` 和原币金额，看板上显示为「≈」：
+
+```json
+"bailian": {
+  "type": "anthropic-compatible",
+  "pricing": {
+    "deepseek-v4.1-flash-1017": {
+      "currency": "CNY", "usdRate": 7.1,
+      "inputPerM": 2, "outputPerM": 8, "cacheReadRatio": 0.1,
+      "offPeak": { "from": "22:00", "to": "08:00", "timezone": "Asia/Shanghai", "inputPerM": 1, "outputPerM": 4 }
+    }
+  }
+}
+```
+
+单价是每百万 tokens；`cacheReadRatio` 是缓存命中按输入单价的比例；`offPeak` 是闲时价格；`usdRate` 是 1 美元折多少原币，用来和其他模型一起按美元汇总。上面的数字来自百炼官方价格页和上下文缓存说明（2026-11）。
+
+## 限制
+
+- 自定义机器人只能往群主时间线发消息，不能回复到话题，也不能接收 @。
+- 单个机器人限频 5 次/秒、100 次/分钟；请求体上限 20 KB。程序会排队发送，超长内容截断，完整内容在本地 `transcript.md`。
+- 插话不是实时打断，要等到下一轮开始。
+
+## 目录
+
+| 路径 | 内容 |
+|---|---|
+| `src/cli.js` | 命令行入口：`discuss`、`followup`、`check`、`send-test`、`watch`、`repos`、`web` |
+| `src/runner.js` | 跑一场讨论或追问：命令行、群监听和网页共用 |
+| `src/web/` | 作品打磨的本地网页（`server.js` 接口，`page.html` 页面） |
+| `src/novel.js` | 墨稿接口：列出、读取、写回 |
+| `src/orchestrator.js` | 讨论编排：匿名代号、轮次、失败处理、汇总与代号对照 |
+| `src/modes.js` | 三种模式的阶段和提示词，修订版解析 |
+| `src/repos.js` | 代码上下文：仓库别名解析、分支快照导出 |
+| `src/pricing.js` | 接口不返回费用时按配置价格估算 |
+| `src/state.js` | 讨论编号、state.json、按保留期清理会话 |
+| `src/watch.js` | 群指令解析与监听循环 |
+| `src/providers/` | 模型接入：claude-cli、openai-compatible、anthropic-compatible、mock |
+| `src/lark/` | 卡片生成、webhook 签名发送、插话读取 |
+| `src/publishers.js` | 发布到 Lark、终端和本地记录 |
+| `test/` | 单元测试：`npm test` |

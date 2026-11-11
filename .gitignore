@@ -1,0 +1,6 @@
+node_modules/
+# 本机配置与凭据：webhook 地址、签名密钥、API key
+.env
+config.json
+# 每次讨论的本地记录
+runs/

@@ -1,0 +1,17 @@
+{
+  "name": "ai-storm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "多模型讨论与头脑风暴：本机主持程序组织多轮讨论，每个模型用自己的 Lark 自定义机器人发言",
+  "type": "module",
+  "bin": {
+    "ai-storm": "src/cli.js"
+  },
+  "scripts": {
+    "storm": "node src/cli.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
