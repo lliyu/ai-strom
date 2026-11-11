@@ -45,6 +45,7 @@ export const STAGE_LABELS = {
   factcheck: '代码核实',
   factreview: '核实审查',
   webplan: '资料搜集判断',
+  final: '按裁决定稿',
   webresearch: '资料搜集',
   webreview: '资料审查',
   doc: '主文档',
@@ -873,13 +874,17 @@ export function revisePrompt({ topic, round, own, feedback, ideasPerAgent, inter
 
 export const TRIAGE_ANSWER = '直接回答';
 export const TRIAGE_DISCUSS = '重新讨论';
+export const TRIAGE_VERDICT = '裁决';
+export const TRIAGE_VERIFY = '核实';
+/** 追问的处理方式，给人看的名字。 */
+export const HANDLING_LABELS = { answer: '直接回答', discuss: '重新讨论', verdict: '按裁决定稿', verify: '核实' };
 
 function followUpHistory(followUps = []) {
   if (!followUps.length) return '';
   return `## 之前的追问\n${followUps.map((f, i) => `### 追问 ${i + 1}：${f.question}\n${f.handling === 'discuss' ? '（重新讨论过）' : ''}\n${f.answer ?? ''}`).join('\n\n')}`;
 }
 
-export function triagePrompt({ rounds, finals, summary, question, followUps, isDoc = false, omitted = '', blockers = [] }) {
+export function triagePrompt({ rounds, finals, summary, question, followUps, isDoc = false, omitted = '', blockers = [], canVerify = false }) {
   const history = rounds
     .map((r) => `### 第 ${r.round} 轮（${STAGE_LABELS[r.stage]}）\n\n${labeled(r.entries).replace(/^### /gm, '#### ')}`)
     .join('\n\n');
@@ -893,20 +898,91 @@ export function triagePrompt({ rounds, finals, summary, question, followUps, isD
     followUpHistory(followUps),
     `## 人类的追问\n${question.trim()}`,
     [
-      '先判断怎么处理这个追问，第一行只能写下面二选一：',
+      `先判断怎么处理这个追问，第一行只能写下面${canVerify ? '四' : '三'}选一：`,
       `「处理方式：${TRIAGE_ANSWER}」：追问是澄清、解释、找出讨论里已经有的内容，或者讨论记录足以回答。`,
+      `「处理方式：${TRIAGE_VERDICT}」：人在对分歧做选择，例如「按方案 A」「第 1 条按 B，第 2 条不做」。不用再讨论，按人的选择定稿。`,
+      canVerify ? `「处理方式：${TRIAGE_VERIFY}」：人要求查证某些事实（代码现状或公开资料），查清了就能回答，不需要参与者重新权衡。` : null,
       `「处理方式：${TRIAGE_DISCUSS}」：追问带来了新的约束或信息、质疑了结论、要求换方向，或者讨论里没覆盖、需要参与者重新权衡。`,
       '',
       `写「${TRIAGE_ANSWER}」时，接着直接回答，引用方案代号和轮次。`,
+      `写「${TRIAGE_VERDICT}」时，接着写 **按哪个方案定稿**：一个方案代号（例如「方案 A」）；人的选择不对应单个方案、需要把几个方案组合起来时写「合并」。再写 **人的裁决**：把人的选择逐条复述成定稿必须遵守的要求，不要加人没说的内容。`,
+      canVerify ? `写「${TRIAGE_VERIFY}」时，接着写 **要核实的问题**：每行一个具体问题（最多 8 个）。` : null,
       `写「${TRIAGE_DISCUSS}」时，接着写 **给参与者的说明**：追问改变了什么、要重点重新考虑哪些地方（不要自己给答案），以及一句 **为什么需要重新讨论**。`,
+    ].filter((l) => l !== null).join('\n'),
+  );
+}
+
+/** 解析主席的处理方式：'answer' | 'verdict' | 'verify' | 'discuss'（没写时按直接回答）。 */
+export function parseTriage(text) {
+  const m = /处理方式\**\s*[:：]\s*\**\s*(直接回答|重新讨论|裁决|核实)/.exec(String(text ?? ''));
+  return { [TRIAGE_DISCUSS]: 'discuss', [TRIAGE_VERDICT]: 'verdict', [TRIAGE_VERIFY]: 'verify' }[m?.[1]] ?? 'answer';
+}
+
+/** 某个加粗小标题后面的列表项（遇到空行之后的非列表内容就停）。 */
+function listAfter(text, heading) {
+  const t = String(text ?? '');
+  const at = t.indexOf(heading);
+  if (at < 0) return [];
+  const out = [];
+  for (const raw of t.slice(at + heading.length).split('\n').slice(1)) {
+    const m = /^\s*(?:[-*]|\d+[.、)])\s+(.+)$/.exec(raw);
+    if (m) out.push(m[1].trim());
+    else if (raw.trim() && out.length) break;
+  }
+  return out;
+}
+
+/** 裁决型追问：{ target: '方案 A' | 'merge' | null, ruling }。 */
+export function parseVerdictPick(text) {
+  const t = String(text ?? '');
+  const m = /按哪个方案定稿\**\s*[:：]\s*\**\s*(方案\s*[A-Z]|合并)/.exec(t);
+  const target = m ? (m[1] === '合并' ? 'merge' : m[1].replace(/\s+/, ' ')) : null;
+  const at = t.search(/\**人的裁决\**/);
+  const ruling = at >= 0 ? t.slice(at).replace(/^\**人的裁决\**\s*[:：]?\s*/, '').trim() : stripTriageLine(t);
+  return { target, ruling };
+}
+
+/** 核实型追问：要核实的问题。 */
+export function parseVerifyQuestions(text) {
+  return listAfter(text, '要核实的问题').slice(0, 8);
+}
+
+/** 裁决型追问：被选中的主笔按人的裁决写定稿，不再经过评审。 */
+export function finalPrompt({ round, question, ruling, others, interjections, mode, limits = limitsFor(mode) }) {
+  const plan = mode === 'refine' ? '修改方案' : '方案';
+  return join(
+    `【阶段：第 ${round} 轮${STAGE_LABELS.final}】`,
+    `## 人的追问\n${question.trim()}`,
+    `## 人的裁决（主席复述，定稿必须遵守）\n${ruling}`,
+    others?.length ? `## 其他主笔目前的${plan}（匿名，裁决要求借用其中的内容时参考）\n${planned(others)}` : '',
+    interjectionBlock(interjections),
+    [
+      `人已经对分歧做了选择，选的是你的${plan}。不再讨论，按裁决写出定稿：裁决里要求改的地方照改，裁决没提到的部分保持你上一版的内容。不要重新争论已经裁决的问题。`,
+      '你的回答分两部分。',
+      `第一部分给人看${limits ? `，不超过 ${limits.followup} 字` : ''}：`,
+      briefLine('定稿的结论，以及按裁决改了什么'),
+      '**按裁决改了什么**（每条一行：「原来… → 现在… · 依据裁决的哪一条」）',
+      '',
+      `第二部分单独一行写「${PLAN_MARKER}」，下面写完整的定稿${plan}${limits ? `（不超过 ${limits.plan} 字）` : ''}。必须完整写出，不能写「无变化」。`,
     ].join('\n'),
   );
 }
 
-/** 解析主席的处理方式：'discuss' | 'answer'（没写时按直接回答）。 */
-export function parseTriage(text) {
-  const m = /处理方式\**\s*[:：]\s*\**\s*(直接回答|重新讨论)/.exec(String(text ?? ''));
-  return m?.[1] === TRIAGE_DISCUSS ? 'discuss' : 'answer';
+/**
+ * 新会话追问（fresh）：参与者原来的对话不在新会话里，第一条消息里带上讨论到现在的结论。
+ * 原议题和背景资料在系统提示词里，不用重复。
+ */
+export function freshBlock({ doc, blockers = [], own, others = [], facts = [], omitted = '', interjections = [] }) {
+  return join(
+    '## 讨论现状（这是一条新会话：你之前的对话不在这里，下面是讨论到现在的结论，以此为准）',
+    doc ? `### 现在的主文档\n${doc}` : '',
+    own ? `### 你目前的方案（代号${own.tag}）\n${own.plan ?? own.text}` : '',
+    others.length ? `### 其他主笔目前的方案（匿名）\n${planned(others)}` : '',
+    blockersBlock(blockers),
+    omittedBlock(omitted),
+    facts.length ? factsBlock(facts) : '',
+    interjections.length ? `### 讨论中人的全部插话\n${interjections.map((m) => `- ${m.sender ?? '人'}：${m.text}`).join('\n')}` : '',
+  ) + '\n\n';
 }
 
 /** 去掉第一行的「处理方式：…」，留下给人看的正文。 */
@@ -1084,7 +1160,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
 /**
  * 追问之后更新主文档：直接回答的给回答，重新讨论的给追问之后的讨论记录。
  */
-export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '', blockers = [] }) {
+export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '', blockers = [], ruling, final, verifyQuestions = [] }) {
   return join(
     `【阶段：更新${STAGE_LABELS.doc}】`,
     `## 现在的主文档（第 ${version} 版）\n${doc}`,
@@ -1092,6 +1168,25 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
     `## 人类的追问\n${question.trim()}`,
     handling === 'answer'
       ? `## 你对追问的回答（主席判断讨论记录足以回答，没有重新讨论）\n${answer}`
+      : handling === 'verdict'
+      ? join(
+        `## 人的裁决（你复述的）\n${ruling}`,
+        final
+          ? `## 定稿${mode === 'refine' ? '修改方案' : '方案'}（被选中的主笔按裁决写出，没有经过评审）\n${final.plan}`
+          : '## 定稿\n人的选择不对应单个方案：由你按裁决把各方案组合成定稿，写进主文档的方案部分。',
+        finalsBlock(finals, '各主笔目前的方案'),
+        [
+          '## 这次更新的要求',
+          `- 方案部分换成定稿，开头标明「定稿（按人的裁决${final ? '' : '合并'}，未经评审）」，并逐条对上裁决。`,
+          '- 已裁决的分歧从「分歧与需要拍板的问题」里移走，改写成「已裁决：选了什么、理由」；没裁决的仍然保留。',
+          '- 定稿和已核实的事实冲突时，在风险里写明冲突，不要替人改裁决。',
+        ].join('\n'),
+      )
+      : handling === 'verify'
+      ? join(
+        `## 这次要核实的问题\n${verifyQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+        '核实结果见下面的核实部分（最后一次）。把结论合进主文档对应的位置；被核实推翻的说法直接改掉，受影响的结论和风险一起改。',
+      )
       : join(
         brief ? `## 你给参与者的说明\n${brief}` : '',
         omittedBlock(omitted),

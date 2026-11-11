@@ -236,7 +236,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       docFile: state?.docs?.length ? path.join(run.dir, DOC_FILE) : null,
       revision: state?.revision ?? null,
       revisions: state?.revisions ?? [],
-      followUps: (state?.followUps ?? []).map((f) => ({ question: f.question, handling: f.handling, answer: f.answer, doc: f.doc ?? null, at: f.at })),
+      followUps: (state?.followUps ?? []).map((f) => ({ question: f.question, handling: f.handling, answer: f.answer, doc: f.doc ?? null, context: f.context ?? 'resume', at: f.at })),
+      followUpContext: cfg.followUpContext === 'fresh' ? 'fresh' : 'resume',
       applied: state?.applied ?? null,
       expired: Boolean(state?.expired),
       docFailed: Boolean(state?.docFailed),
@@ -264,7 +265,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
         await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, number: job.number, repos: job.repos });
       } else {
         // 群里的讨论在网页上追问：照样发到群里（dry-run 的讨论打印到终端）
-        await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number });
+        await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number, context: job.context });
       }
     } catch (err) {
       log(`⚠️ #${job.number} 失败：${err.message}`);
@@ -356,7 +357,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return { ok: true, lark: channelOf(run) === 'lark' };
   }
 
-  function followUp(number, question) {
+  function followUp(number, question, context) {
+    if (context !== undefined && context !== null && context !== '' && !['resume', 'fresh'].includes(context)) throw httpError(400, 'context 只能是 resume 或 fresh');
     const q = String(question ?? '').trim();
     if (!q) throw httpError(400, '追问不能为空');
     const run = findRun(number);
@@ -364,7 +366,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     if (run.state.expired) throw httpError(409, `#${number} 已超过保留期，会话已清理，请重新发起讨论`);
     if (busyWith(number) || progressOf(number, run).status === 'running') throw httpError(409, `#${number} 还在进行或排队中`);
     const channel = channelOf(run);
-    enqueue({ kind: 'followup', number, mode: modeOf(run), question: q.slice(0, 4000), lark: channel !== 'web', dryRun: channel === 'dry-run' });
+    enqueue({ kind: 'followup', number, mode: modeOf(run), question: q.slice(0, 4000), lark: channel !== 'web', dryRun: channel === 'dry-run', context: context || undefined });
     return { ok: true, lark: channel === 'lark' };
   }
 
@@ -435,7 +437,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     if (req.method === 'GET' && !m[2]) return json(res, runDetail(number));
     if (req.method === 'GET' && m[2] === 'events') return sse(req, res, number);
     if (req.method === 'POST' && m[2] === 'interject') return json(res, interject(number, (await body(req)).text));
-    if (req.method === 'POST' && m[2] === 'followup') return json(res, followUp(number, (await body(req)).question), 202);
+    if (req.method === 'POST' && m[2] === 'followup') {
+      const b = await body(req);
+      return json(res, followUp(number, b.question, b.context), 202);
+    }
     if (req.method === 'POST' && m[2] === 'apply') return json(res, await apply(number, (await body(req)).revisionAt));
     throw httpError(405, '不支持的请求');
   }

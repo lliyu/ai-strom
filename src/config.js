@@ -62,6 +62,8 @@ export function normalizeConfig(raw, overrides = {}) {
   cfg.concurrency = Number(cfg.concurrency ?? 3);
   // 会话：每位参与者整场讨论在同一条会话里，记得自己之前说过的话。false 时每轮都是新会话
   cfg.conversation = cfg.conversation !== false;
+  // 追问时参与者接着原会话（resume），还是各开一条新会话、由程序拼出讨论现状（fresh）
+  cfg.followUpContext = cfg.followUpContext === 'fresh' ? 'fresh' : 'resume';
   cfg.providers ??= {};
   cfg.lark ??= {};
   cfg.lark.maxCardBytes ??= 18000;

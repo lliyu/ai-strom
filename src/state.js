@@ -107,7 +107,8 @@ export function expireOldSessions(runsDir, { retentionDays = 7, claudeCwd, now =
     if (state.expired) continue;
     const updated = Date.parse(state.updatedAt ?? state.createdAt ?? 0);
     if (!(now - updated > retentionDays * 86400000)) continue;
-    for (const s of Object.values(state.sessions ?? {})) {
+    // 当前会话和 fresh 追问时换下来的旧会话一起删
+    for (const s of [...Object.values(state.sessions ?? {}), ...(state.retiredSessions ?? [])]) {
       if (s.id && (claudeCwd || sessionFile)) {
         try {
           fs.rmSync(sessionFile(s.id), { force: true });
@@ -116,7 +117,7 @@ export function expireOldSessions(runsDir, { retentionDays = 7, claudeCwd, now =
         }
       }
     }
-    saveState(dir, { ...state, expired: true, expiredAt: new Date(now).toISOString(), sessions: {} });
+    saveState(dir, { ...state, expired: true, expiredAt: new Date(now).toISOString(), sessions: {}, retiredSessions: [] });
     cleaned.push(state.number);
   }
   return cleaned;

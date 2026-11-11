@@ -13,6 +13,7 @@ import { describeRepo, resolveRepos, prepareRepos, allRepoSpecs, parseRepoSpecs 
 import { createFileInbox, combineInterjections } from './inbox.js';
 import { savedLineup, configForState } from './lineup.js';
 import { budgetFromUsage } from './budget.js';
+import { HANDLING_LABELS } from './modes.js';
 
 /**
  * 跑一场讨论或一次追问：命令行（discuss / followup）、Lark 监听（watch）和本地网页（web）共用。
@@ -141,7 +142,7 @@ export async function runPrepared(cfg, { topic, dryRun, mock, interject, trigger
 }
 
 /** 追问一场讨论：默认最近一场；在原讨论的会话上接着进行，结束后更新原讨论的 state.json。 */
-export async function followUpOne(cfg, { question, number, dryRun = false, mock = false, interject = true, triggers, lark, extraPublishers, interjections: ownInterjections, onRunDir, onEvent: watcher, runsDir = RUNS, echo }) {
+export async function followUpOne(cfg, { question, number, dryRun = false, mock = false, interject = true, triggers, lark, extraPublishers, interjections: ownInterjections, onRunDir, onEvent: watcher, runsDir = RUNS, echo, context }) {
   cleanupSessions(cfg, runsDir);
   let found;
   try {
@@ -162,7 +163,7 @@ export async function followUpOne(cfg, { question, number, dryRun = false, mock 
   const code = codeForFollowUp(jobCfg, state);
   let result;
   try {
-    result = await runFollowUp({ cfg: jobCfg, state, question, providers, publisher, interjections, log, onEvent, code });
+    result = await runFollowUp({ cfg: jobCfg, state, question, providers, publisher, interjections, log, onEvent, code, context });
   } catch (err) {
     onEvent({ type: 'run_failed', error: err.message.slice(0, 500) });
     throw err;
@@ -170,8 +171,8 @@ export async function followUpOne(cfg, { question, number, dryRun = false, mock 
     code?.cleanup();
   }
   saveState(dir, result.state);
-  fs.writeFileSync(path.join(runDir, 'result.json'), JSON.stringify({ followUpOf: state.number, question, handling: result.handling, answer: result.answer, stats: result.stats }, null, 2));
-  log(`追问完成（${result.handling === 'answer' ? '主席直接回答' : '重新讨论'}）。本地记录：${path.relative(process.cwd(), runDir) || runDir}`);
+  fs.writeFileSync(path.join(runDir, 'result.json'), JSON.stringify({ followUpOf: state.number, question, handling: result.handling, context: result.context, answer: result.answer, stats: result.stats }, null, 2));
+  log(`追问完成（${HANDLING_LABELS[result.handling] ?? result.handling}，${result.context === 'fresh' ? '新会话' : '接着原会话'}）。本地记录：${path.relative(process.cwd(), runDir) || runDir}`);
   return result;
 }
 

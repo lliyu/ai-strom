@@ -14,6 +14,8 @@ import { splitReply } from './modes.js';
  */
 
 export const CHAIR_SHARE = 0.5;
+/** 参与者新会话（fresh 追问、会话轮换）的预算：窗口的 40%。 */
+export const PARTICIPANT_SHARE = 0.4;
 export const DEFAULT_TOKENS_PER_CHAR = 2;
 /** 主席的窗口不知道时（第一次调用之前、配置里也没写）按这个估，宁小勿大。 */
 export const DEFAULT_WINDOW = 200000;

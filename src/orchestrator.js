@@ -4,7 +4,7 @@ import {
   proposePrompt, critiquePrompt, reviewPrompt,
   divergePrompt, feedbackPrompt, revisePrompt,
   researchSystem, researchPrompt, sharedSystem, parseVerdict, parseStanceChange,
-  triagePrompt, parseTriage, stripTriageLine, followUpPrompt,
+  triagePrompt, parseTriage, stripTriageLine, followUpPrompt, parseVerdictPick, parseVerifyQuestions, finalPrompt, freshBlock, HANDLING_LABELS,
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
   docSystem, docPrompt, docUpdatePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead,
   limitsFor, splitReply, overLimit, compressPrompt, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
@@ -13,7 +13,7 @@ import {
 } from './modes.js';
 import { describeRepo } from './repos.js';
 import { estimateCost, priceFor } from './pricing.js';
-import { fitHistory, budgetChars, CHAIR_SHARE } from './budget.js';
+import { fitHistory, budgetChars, CHAIR_SHARE, PARTICIPANT_SHARE } from './budget.js';
 
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 /** 学每字 tokens 数时，提示词至少这么长。 */
@@ -114,11 +114,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   const toldCode = new Set(); // 本次运行已经拿到完整目录说明的参与者
 
   /** 各阶段的字数上限：给人看的部分 max，完整方案 plan。 */
-  const STAGE_LIMIT = { propose: 'propose', diagnose: 'propose', critique: 'critique', review: 'review', followup: 'followup' };
+  const STAGE_LIMIT = { propose: 'propose', diagnose: 'propose', critique: 'critique', review: 'review', followup: 'followup', final: 'followup' };
   run.limitOf = (stage) => {
     const key = STAGE_LIMIT[stage];
     if (!limits || !key) return null;
-    return { max: limits[key], brief: limits.brief, plan: stage === 'review' || stage === 'followup' ? limits.plan : undefined, tolerance: limits.tolerance };
+    return { max: limits[key], brief: limits.brief, plan: ['review', 'followup', 'final'].includes(stage) ? limits.plan : undefined, tolerance: limits.tolerance };
   };
 
   /** 发给这位发言者的插话：会话模式只发它还没收到过的，非会话模式每轮都发全部。 */
@@ -293,8 +293,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       const factsNow = run.facts.length;
       // 身份和规则只在会话的第一条消息里说一次；非会话模式每轮都要说
       const intro = session && session.turns.length ? '' : `${participantSystem(p, { mode: cfg.mode })}\n\n`;
+      const fresh = run.freshFor(p, session);
       const code = run.codeFor(p, session);
-      const text = await run.speak(p, { stage, round, system: run.shared, prompt: `${intro}${code.text}${promptFor(p)}`, session, limit: run.limitOf(stage), callOptions: code.callOptions });
+      const text = await run.speak(p, { stage, round, system: run.shared, prompt: `${intro}${fresh}${code.text}${promptFor(p)}`, session, limit: run.limitOf(stage), callOptions: code.callOptions });
       if (text != null && session) {
         session.seen = seenNow;
         session.factsSeen = factsNow;
@@ -311,6 +312,15 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 这位参与者本次发言要额外带上的代码相关内容：新的核实结果、能否自己查代码、怎么提待核实的问题；
    * 能查代码时附带只读工具和目录。
    */
+  /** 新会话追问（fresh）时第一条消息里带上的讨论现状；默认没有。runFollowUp 按需替换。 */
+  run.freshFor = () => '';
+  /** 能不能核实：有代码，或者本场无代码但可以联网。 */
+  run.canCheck = () => factChecking();
+  /** 追问时主席指定的核实问题，排到下一次核实里。 */
+  run.queueQuestions = (qs) => {
+    for (const q of qs) if (!asked.has(normQ(q)) && !pendingQuestions.some((x) => normQ(x) === normQ(q))) pendingQuestions.push(q);
+  };
+
   run.codeFor = (p, session) => {
     if (!run.code && run.web) {
       const fresh = convo ? run.facts.slice(session?.factsSeen ?? 0) : run.facts;
@@ -898,7 +908,7 @@ function codeSpecOf(code) {
   return { auto: Boolean(code.auto), repos: code.auto ? [] : code.repos.map((r) => ({ name: r.alias, ...(r.ref ? { ref: r.ref } : {}) })) };
 }
 
-function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [] }) {
+function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [], interjections = [] }) {
   return {
     version: STATE_VERSION,
     number: number ?? null,
@@ -917,6 +927,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     lastRound,
     ending: ending ? { reason: ending.reason, round: ending.round, ...(ending.tag ? { tag: ending.tag } : {}) } : null,
     blockers,
+    interjections,
     ...(budget ? { budget } : {}),
     ...(docFailed ? { docFailed: true } : {}),
     summary,
@@ -1089,7 +1100,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     context: contextOut(context),
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc: doc?.text ? doc : null,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget, blockers }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget, blockers, interjections: heard }),
   };
 }
 
@@ -1102,7 +1113,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
  * @param {object} opts.state  原讨论的 state.json
  * @returns {Promise<{ handling, answer, stats, state }>}  state 是更新后的，调用方负责写回
  */
-export async function runFollowUp({ cfg, state, question, providers, publisher, interjections, log = () => {}, onEvent = () => {}, code }) {
+export async function runFollowUp({ cfg, state, question, providers, publisher, interjections, log = () => {}, onEvent = () => {}, code, context: contextMode }) {
   if (state?.version !== STATE_VERSION) throw new Error('讨论状态的版本不对，无法追问');
   if (state.expired) throw new Error(`讨论 #${state.number} 已超过保留期，会话已清理，请重新发起讨论`);
   const tags = new Map(Object.entries(state.tags));
@@ -1111,7 +1122,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   const latest = new Map(state.latest.map((e) => [e.id, e]));
   const rounds = [...state.rounds];
   const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget });
-  const { leads, participants, stats, emit, heard, ideasPerAgent } = run;
+  const { leads, participants, stats, emit, heard, ideasPerAgent, tagOf } = run;
   run.shared = state.shared; // 和原讨论完全一样，缓存还能命中
   // 原讨论带了代码背景时，调用方会重新准备代码目录：追问中照样能查代码、核实事实
   if (code && state.context && !state.context.web) run.code = code;
@@ -1119,6 +1130,31 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   run.web = !run.code && state.mode === 'decision' && Boolean(cfg.research?.factChecker);
   const no = state.number ? ` #${state.number}` : '';
   const maxRounds = cfg.followUpMaxRounds ?? 10;
+
+  // 追问的会话：resume 接着原会话；fresh 给每位参与者开一条新会话，第一条消息由程序按预算拼出讨论现状
+  const ctxMode = (contextMode ?? cfg.followUpContext) === 'fresh' ? 'fresh' : 'resume';
+  const retired = [];
+  const pastInterjections = [...(state.interjections ?? [])];
+  if (ctxMode === 'fresh') {
+    for (const p of participants) {
+      const old = sessions.get(p.id);
+      if (old?.id) retired.push({ id: old.id, participant: p.id, at: new Date().toISOString() });
+      sessions.set(p.id, { id: randomUUID(), turns: [], seen: 0, factsSeen: run.facts.length });
+    }
+    const currentDoc = state.docs?.at(-1)?.text ?? state.summary ?? '';
+    run.freshFor = (p, session) => {
+      if (!session || session.turns.length) return '';
+      // 参与者的预算：窗口的 PARTICIPANT_SHARE；必须保留的内容（主文档、方案、阻断存档、插话）不受限，核实结果按预算从新到旧放
+      const window = p.contextWindow ?? run.budget.windows[`${p.provider}:${p.model ?? ''}`];
+      const total = budgetChars({ window, share: PARTICIPANT_SHARE, tokensPerChar: run.budget.tokenRatios[p.provider] });
+      const own = latest.get(p.id);
+      const others = run.latestOthers(p);
+      const build = (facts, omitted) => freshBlock({ doc: currentDoc, blockers: run.blockerArchive(), own, others, facts, omitted, interjections: [...pastInterjections, ...heard] });
+      const fit = fitHistory({ facts: run.facts, budgetChars: total - build([], '').length - (run.shared?.length ?? 0) });
+      return build(fit.facts, fit.note);
+    };
+    log(`追问用新会话：${participants.length} 位参与者各开一条新会话，第一条消息带上讨论现状`);
+  }
 
   emit({
     type: 'run_started',
@@ -1135,7 +1171,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     speaker: cfg.chair,
     title: `🔁 追问 · 讨论${no}`,
     subtitle: state.topic.split('\n')[0].slice(0, 60),
-    body: `**追问**\n${question.trim()}\n\n主席先判断：讨论记录里能回答的直接回答；需要重新权衡的，让参与者接着原来的会话再讨论。`,
+    body: `**追问**\n${question.trim()}\n\n主席先判断怎么处理：讨论记录里能回答的直接回答；对分歧做选择的按裁决定稿；要查证事实的先核实；需要重新权衡的让参与者再讨论（${ctxMode === 'fresh' ? '各开一条新会话，带上讨论现状' : '接着原来的会话'}）。`,
   });
 
   // ---------- 主席判断 ----------
@@ -1143,11 +1179,16 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     stage: 'triage',
     round: state.lastRound,
     system: run.shared,
-    prompt: run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: hist, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length), omitted, blockers: run.blockerArchive() })}${chairFacts(checked)}`, { rounds: state.rounds, facts: run.facts, stage: 'triage' }),
+    prompt: run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: hist, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length), omitted, blockers: run.blockerArchive(), canVerify: run.canCheck() })}${chairFacts(checked)}`, { rounds: state.rounds, facts: run.facts, stage: 'triage' }),
   });
   // 主席判断失败时不放弃这次追问：按重新讨论处理，让参与者直接回应追问
   if (!triage) log('⚠️ 主席没能判断这次追问，按重新讨论处理');
-  const handling = triage ? parseTriage(triage) : 'discuss';
+  let handling = triage ? parseTriage(triage) : 'discuss';
+  // 裁决型要有选中的方案或「合并」，核实型要有问题且能核实；不满足时按重新讨论处理
+  const pick = handling === 'verdict' ? parseVerdictPick(triage) : null;
+  const verifyQuestions = handling === 'verify' ? parseVerifyQuestions(triage) : [];
+  if (handling === 'verdict' && !pick.target) handling = 'discuss';
+  if (handling === 'verify' && (!verifyQuestions.length || !run.canCheck())) handling = 'discuss';
   const followUps = [...(state.followUps ?? [])];
   let answer = triage ? stripTriageLine(triage) : '';
   let lastRound = state.lastRound;
@@ -1169,8 +1210,78 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
       prompt: docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, answer }),
     }) : null;
     if (doc?.text) docs.push(doc);
-    followUps.push({ question, handling, answer, ...(doc?.text ? { doc: doc.version } : {}), at: new Date().toISOString() });
+    followUps.push({ question, handling, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
     await run.postEnd({ title: `追问已回答 · 讨论${no}`, subtitle: `主席直接回答 · ${stats.calls} 次模型调用` });
+  } else if (handling === 'verdict') {
+    // ---------- 裁决型：被选中的主笔按裁决定稿；选择不对应单个方案时由主席合并。不再经过评审 ----------
+    log(`主席判断：裁决，${pick.target === 'merge' ? '由主席合并定稿' : `由${pick.target}的主笔定稿`}`);
+    const r0 = state.lastRound + 1;
+    await run.pullInterjections();
+    const chosen = pick.target === 'merge' ? null : leads.find((p) => latest.has(p.id) && tagOf(p) === pick.target) ?? null;
+    let final = null;
+    if (chosen) {
+      const [e] = await run.runStage([chosen], r0, 'final', (p) => finalPrompt({ round: r0, question, ruling: pick.ruling, others: run.latestOthers(p), interjections: run.ijFor(p), mode: state.mode, limits: run.limits }));
+      if (e) {
+        latest.set(e.id, e);
+        final = { tag: e.tag, plan: e.plan ?? e.text };
+        lastRound = r0;
+      } else log(`⚠️ ${pick.target}的主笔没写出定稿，由主席按裁决合并`);
+    }
+    ending = { reason: 'verdict', round: lastRound };
+    const finals = [...latest.values()].sort(byTag);
+    const doc = await run.writeDoc(current
+      ? {
+        previous: current,
+        round: r0,
+        reason,
+        check: false,
+        prompt: (factor) => run.fitChair(({ facts: checked, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, ruling: pick.ruling, final, finals, interjections: heard, omitted, blockers: run.blockerArchive() })}${chairFacts(checked)}`, { facts: run.facts, factor }),
+      }
+      : {
+        round: r0,
+        reason: `补写（${reason}）`,
+        check: false,
+        prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals, interjections: heard, omitted, blockers: run.blockerArchive(), earlier: earlierOf(state.summary, [...followUps, { question, answer: `人的裁决：${pick.ruling}${final ? `\n\n定稿方案：\n${final.plan}` : '\n\n（由主席按裁决合并定稿）'}` }]) })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
+      });
+    if (doc?.text) docs.push(doc);
+    else if (!doc) {
+      docFailed = true;
+      await run.postDocFallback({ round: r0, ending, number: state.number });
+    }
+    answer = doc?.text ? doc.note : pick.ruling;
+    followUps.push({ question, handling, ruling: pick.ruling, target: pick.target, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
+    await run.postEnd({ title: `追问已按裁决定稿 · 讨论${no}`, subtitle: `${final ? `${final.tag}按裁决定稿` : '主席按裁决合并定稿'}，未经评审 · ${stats.calls} 次模型调用` });
+  } else if (handling === 'verify') {
+    // ---------- 核实型：按主席列的问题核实（有代码读代码，无代码联网），主席把结论合进主文档。不进入多轮讨论 ----------
+    log(`主席判断：核实 ${verifyQuestions.length} 个问题`);
+    const r0 = state.lastRound + 1;
+    run.queueQuestions(verifyQuestions);
+    const checked = await run.factCheck(r0);
+    ending = { reason: 'verified', round: state.lastRound };
+    if (!checked) {
+      answer = '这次核实没有成功，可以稍后再追问一次。';
+      await publisher.post({ speaker: cfg.chair, title: `追问核实失败 · 讨论${no}`, subtitle: '主文档没有改', body: `要核实的问题：\n${verifyQuestions.map((q) => `- ${q}`).join('\n')}\n\n${answer}`, meta: { stage: 'verify', round: r0 } });
+      followUps.push({ question, handling, questions: verifyQuestions, answer, failed: true, context: ctxMode, at: new Date().toISOString() });
+    } else {
+      const doc = await run.writeDoc(current
+        ? {
+          previous: current,
+          round: r0,
+          reason,
+          check: false,
+          prompt: (factor) => run.fitChair(({ facts: f, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, verifyQuestions, interjections: heard, omitted })}${chairFacts(f)}`, { facts: run.facts, factor }),
+        }
+        : {
+          round: r0,
+          reason: `补写（${reason}）`,
+          check: false,
+          prompt: (factor) => run.fitChair(({ rounds: hist, facts: f, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, omitted, earlier: earlierOf(state.summary, followUps) })}${chairFacts(f)}`, { rounds, facts: run.facts, factor }),
+        });
+      if (doc?.text) docs.push(doc);
+      answer = doc?.text ? doc.note : run.facts.at(-1).answer;
+      followUps.push({ question, handling, questions: verifyQuestions, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
+    }
+    await run.postEnd({ title: `追问已核实 · 讨论${no}`, subtitle: `核实 ${verifyQuestions.length} 个问题${checked ? '' : '（失败）'} · ${stats.calls} 次模型调用` });
   } else {
     log('主席判断：重新讨论');
     const briefText = answer;
@@ -1220,7 +1331,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
       await run.postDocFallback({ round: lastRound + 1, ending: it.ending, number: state.number });
     }
     answer = doc?.text ? doc.note : null;
-    followUps.push({ question, handling, brief: briefText, answer, ...(doc?.text ? { doc: doc.version } : {}), rounds: [r0, lastRound], ending: it.ending.reason, ...(triage ? {} : { triageFailed: true }), at: new Date().toISOString() });
+    followUps.push({ question, handling, brief: briefText, answer, ...(doc?.text ? { doc: doc.version } : {}), rounds: [r0, lastRound], ending: it.ending.reason, context: ctxMode, ...(triage ? {} : { triageFailed: true }), at: new Date().toISOString() });
     if (state.mode === 'refine' && state.subject && doc?.text) {
       revision = await run.rewrite({ subject: state.subject, summary: doc.text, round: lastRound + 1 });
     }
@@ -1231,7 +1342,14 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     });
   }
 
-  emit({ type: 'run_finished', stats, handling, roundsUsed: lastRound - state.lastRound, ending: ending.reason });
+  // fresh 时这次没发言的参与者（例如直接回答、核实）换回原会话，下次追问还能接着原会话
+  for (const r of [...retired]) {
+    if (!sessions.get(r.participant)?.turns.length) {
+      sessions.set(r.participant, { ...state.sessions[r.participant], turns: [...state.sessions[r.participant].turns], seen: 0 });
+      retired.splice(retired.indexOf(r), 1);
+    }
+  }
+  emit({ type: 'run_finished', stats, handling, context: ctxMode, roundsUsed: lastRound - state.lastRound, ending: ending.reason });
   const next = {
     ...state,
     updatedAt: new Date().toISOString(),
@@ -1243,13 +1361,15 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     facts: run.facts,
     budget: run.budget,
     blockers: run.blockerArchive(),
+    interjections: [...pastInterjections, ...heard],
+    ...(retired.length || state.retiredSessions?.length ? { retiredSessions: [...(state.retiredSessions ?? []), ...retired] } : {}),
     docs,
     ...(docFailed && !docs.length ? { docFailed: true } : { docFailed: undefined }),
     summary: docs.at(-1)?.text ?? state.summary,
     ...(docs.length && !state.docs?.length && state.summary ? { legacySummary: state.summary } : {}),
     ...(revision ? { revision, revisions: [...(state.revisions ?? []), revision] } : {}),
   };
-  return { handling, answer, stats, state: next, revision };
+  return { handling, answer, stats, state: next, revision, context: ctxMode };
 }
 
 /** 旧讨论补写主文档时，原来的汇总和每次追问的结论。 */
@@ -1331,6 +1451,8 @@ function endingText(ending) {
   if (ending.reason === 'fixed') return `按固定轮数在第 ${ending.round} 轮结束`;
   if (ending.reason === 'deadlock') return `第 ${ending.round} 轮以分歧结束：主笔连续两轮没改方案，评审仍有阻断`;
   if (ending.reason === 'dissent') return `第 ${ending.round} 轮以评审之间的分歧结束：${ending.tag ?? '一位评审'}连续 3 轮独自坚持阻断`;
+  if (ending.reason === 'verdict') return '按人的裁决定稿，未经评审';
+  if (ending.reason === 'verified') return '按追问核实了事实';
   return '';
 }
 
