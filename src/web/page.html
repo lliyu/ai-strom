@@ -359,7 +359,7 @@ function lineupOf(mode) {
   const ids = new Set((S.status?.models || []).map((m) => m.id));
   let saved = null;
   try { saved = JSON.parse(localStorage.getItem(LINEUP_KEY(mode)) || 'null'); } catch { /* 存不了就用默认 */ }
-  const ok = saved && Array.isArray(saved.participants) && saved.participants.length && saved.participants.every((p) => ids.has(p.model)) && (!saved.chair || ids.has(saved.chair));
+  const ok = saved && Array.isArray(saved.participants) && saved.participants.length && saved.participants.every((p) => ids.has(p.model)) && (!saved.chair || ids.has(saved.chair)) && (!saved.factChecker || ids.has(saved.factChecker));
   S.lineups[mode] = ok ? saved : defaultLineupOf(mode);
   return S.lineups[mode];
 }
@@ -404,6 +404,7 @@ function lineupHtml(mode) {
       <span>${chairName}（最后汇总${mode === 'refine' ? '并写修订版' : '、写主文档'}）用 <select id="lnChair">${(st.models || []).map((m) => `<option value="${esc(m.id)}" ${m.id === l.chair ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></span>
       <span class="hint" id="lnHint"></span>
     </div>
+    ${mode === 'decision' && (st.repos || []).length ? `<div class="lnbar"><span>代码核实 <select id="lnChecker" title="讨论中「待核实的事实」由谁读代码回答"><option value="">调研员直接核实</option>${(st.models || []).filter((m) => m.readsCode).map((m) => `<option value="${esc(m.id)}" ${m.id === l.factChecker ? 'selected' : ''}>${esc(m.name)} 答，调研员审查纠正后再发</option>`).join('')}</select></span></div>` : ''}
     <div class="hint" style="margin-top:4px">${mode === 'brainstorm' ? '主笔发散并修订脑洞；评审只做盲审、不出脑洞。' : '主笔出方案并多轮修订；评审只提意见，不出方案。'}同一个模型可以选多次，扮演不同角色。阵容记在这台电脑的浏览器里，下次默认沿用。</div>`;
 }
 // 绑定阵容编辑；onChange 在阵容是否可用变化时调用（用来启用 / 禁用开始按钮）
@@ -445,6 +446,7 @@ function bindLineup(mode, onChange) {
     l.participants.push({ model: m.id, part: 'lead', role: '', persona: '' }); saveLineup(mode); redraw();
   };
   $('lnChair').onchange = (ev) => { l.chair = ev.target.value; saveLineup(mode); };
+  if ($('lnChecker')) $('lnChecker').onchange = (ev) => { l.factChecker = ev.target.value || null; saveLineup(mode); };
   $('lnReset').onclick = () => {
     S.lineups[mode] = defaultLineupOf(mode); saveLineup(mode);
     const box = $('lnReset').closest('.form'); const html = lineupHtml(mode);
@@ -452,7 +454,7 @@ function bindLineup(mode, onChange) {
   };
   refresh();
 }
-const lineupPayload = (mode) => { const l = lineupOf(mode); return { participants: l.participants.map((p) => ({ model: p.model, part: p.part || 'lead', role: String(p.role || '').trim(), persona: String(p.persona || '').trim() })), chair: l.chair }; };
+const lineupPayload = (mode) => { const l = lineupOf(mode); return { participants: l.participants.map((p) => ({ model: p.model, part: p.part || 'lead', role: String(p.role || '').trim(), persona: String(p.persona || '').trim() })), chair: l.chair, factChecker: mode === 'decision' ? l.factChecker || null : null }; };
 
 // ---------- 新讨论 ----------
 function openForm() {

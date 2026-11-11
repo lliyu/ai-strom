@@ -43,6 +43,7 @@ export const STAGE_LABELS = {
   diagnose: '诊断与修改方案',
   rewrite: '修订版',
   factcheck: '代码核实',
+  factreview: '核实审查',
   doc: '主文档',
   doccheck: '核对主文档',
 };
@@ -83,6 +84,11 @@ export function limitsFor(mode, override = {}) {
 }
 
 export const PLAN_MARKER = '【完整方案】';
+/** 主笔这一轮没改方案时，【完整方案】下面只写这三个字，程序沿用上一版。 */
+export const UNCHANGED_MARK = '无变化';
+export function isUnchangedPlan(plan) {
+  return /^\s*\**\s*无变化\s*\**\s*[。.]?\s*$/.test(String(plan ?? ''));
+}
 const PLAN_LINE = /^[ \t]*\**[ \t]*【完整方案】[^\n]*$/m;
 const BRIEF_HEAD = /^[ \t]*\**[ \t]*要点[ \t]*\**[ \t]*(?:[（(][^\n]*?[)）])?[ \t]*\**[ \t]*[:：]?[ \t]*\**[ \t]*(.*)$/;
 const BOLD_HEAD = /^[ \t]*\*\*[^*\n]+\*\*/;
@@ -372,11 +378,13 @@ export function factsBlock(facts, { forChair = false } = {}) {
 }
 
 /** 调研员在讨论中途回答待核实的问题。系统提示词沿用讨论的共享提示词（有议题和背景资料）。 */
-export function factCheckPrompt({ round, questions, repos, docs = [], tools = ['Read', 'Grep', 'Glob'], maxChars = 4000 }) {
+export function factCheckPrompt({ round, questions, repos, docs = [], tools = ['Read', 'Grep', 'Glob'], maxChars = 4000, who = '调研员', draft = false }) {
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.factcheck}】`,
     [
-      '你是「调研员」。讨论参与者在讨论中提出了下面这些需要用代码核实的问题，他们会以你的回答为准修改方案。',
+      draft
+        ? `你是「${who}」。讨论参与者在讨论中提出了下面这些需要用代码核实的问题。你的回答是初稿：调研员会逐条审查、纠正后，定稿才发给参与者，他们会以定稿为准修改方案。`
+        : `你是「${who}」。讨论参与者在讨论中提出了下面这些需要用代码核实的问题，他们会以你的回答为准修改方案。`,
       `你只能用 ${tools.join('、')} 只读查看下面的目录：`,
       ...dirLines(repos, docs),
     ].join('\n'),
@@ -555,6 +563,7 @@ export function reviewPrompt({ topic, round, own, others, critiques = [], interj
       '**立场变化**（无 / 小幅 / 较大，一句话说明）',
       '',
       `第二部分不发到${mode === 'refine' ? '页面' : '群里'}，只给其他参与者和主席看：单独一行写「${PLAN_MARKER}」，下面写修订后的完整${plan}（结构同第 1 轮，${mode === 'refine' ? '完整写出，不要只写这一轮的变化，' : ''}${limits ? `不超过 ${limits.plan} 字` : ''}）。`,
+      `这一轮${plan}没有任何改动时，「${PLAN_MARKER}」下面只写「${UNCHANGED_MARK}」三个字，程序会沿用你上一版；改了哪怕一处，就写完整的${plan}。`,
     ].filter((l) => l !== '').join('\n'),
   );
 }
@@ -563,6 +572,41 @@ export function reviewPrompt({ topic, round, own, others, critiques = [], interj
 function finalsBlock(finals, title = '各主笔的最终方案') {
   if (!finals?.some((e) => e.plan)) return '';
   return `## ${title}（匿名，讨论记录里的修订轮只写了变化，完整方案以这里为准）\n${finals.map((e) => `### ${e.tag ?? `方案 ${e.label}`}\n${e.plan ?? e.text}`).join('\n\n')}`;
+}
+
+/**
+ * 核实审查：核实员（例如 Sonnet）先读代码写初稿，调研员（Opus）逐条复查、纠正，定稿才发给主笔和评审。
+ * 参与者看不到初稿，所以定稿要完整独立。
+ */
+export function factReviewPrompt({ round, questions, draft, checker = '核实员', repos, docs = [], tools = ['Read', 'Grep', 'Glob'], maxChars = 4000 }) {
+  return join(
+    `【阶段：第 ${round} 轮${STAGE_LABELS.factreview}】`,
+    [
+      `你是「调研员」，这次负责审查。「${checker}」已经按下面的问题查过代码，写了回答初稿。初稿还没有发给讨论参与者：你审查、纠正之后的定稿才会发出去，主笔和评审会以定稿为准修改方案，所以定稿里的每条结论都必须站得住。`,
+      `你只能用 ${tools.join('、')} 只读查看下面的目录：`,
+      ...dirLines(repos, docs),
+    ].join('\n'),
+    `## 待核实的问题\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+    `## ${checker}的初稿\n${draft}`,
+    [
+      '## 要求',
+      '- 逐条复查：结论对不对，引用的源码坐标是否存在、是否真的支撑结论，有没有漏掉适用条件或例外。拿不准的自己到代码里查，不要因为初稿写得肯定就相信。',
+      '- 有错就改，漏了就补。初稿没有依据、你也查不到的结论，改成「代码里找不到」（说明查了哪里）或「代码回答不了」，不要保留。',
+      '- 第一行写审查结论：「**审查**：共 N 条，全部无误」或「**审查**：共 N 条，M 条有更正（第 x、y 条）」。',
+      '- 然后写定稿：逐条回答，编号和问题一致。每条先写结论（是 / 否 / 具体的值或行为），再写依据，依据带源码坐标「仓库别名:仓内相对路径:行号」。更正过的条目在结论前标「【已更正】」，再用一句话说明初稿错在哪里。',
+      '- 结论和背景资料不一致或比它更完整时，明确写「背景资料有误：……」或「背景资料不完整：……」。',
+      `- 参与者看不到初稿，定稿要完整独立，不要写「同初稿」。不要提建议，不要评价方案。全文不超过 ${maxChars} 字，只输出审查结论和定稿。`,
+    ].join('\n'),
+  );
+}
+
+/** 审查里更正了几条：解析第一行「**审查**：共 N 条，M 条有更正」；写「全部无误」为 0；没写时返回 null。 */
+export function parseReviewCorrections(text) {
+  const head = String(text ?? '').split('\n').find((l) => l.trim()) ?? '';
+  if (!/审查/.test(head)) return null;
+  if (/全部无误/.test(head)) return 0;
+  const m = /(\d+)\s*条有更正/.exec(head);
+  return m ? Number(m[1]) : null;
 }
 
 /** 主席输入按预算缩略或省略了较早的讨论记录、核实结果时的说明。 */
@@ -575,11 +619,32 @@ function noCodeBlock(noCode) {
   return noCode ? '## 代码上下文\n本场无代码：讨论前没有读代码，讨论中也没有核实代码事实。参与者关于代码现状的说法都是推测，主文档里涉及代码现状的结论要标为「未核实」，并在开头注明「本场无代码」。' : '';
 }
 
+/** 讨论没有收敛（熔断或到上限）时，主文档要写成能让人直接裁决的样子。 */
+const VERDICT_RULES = [
+  '这次主文档要让人能直接裁决：',
+  '- 「要点」里写清讨论怎么结束的、有几条待裁决的分歧，列出最多 5 条分歧的标题。',
+  '- 「分歧与需要拍板的问题」逐条写待裁决项：引用阻断原文（见「阻断原文存档」），写双方的理由和证据、你倾向哪一边和为什么、可选项和各自的代价。',
+  '- 被代码核实结果否定、评审却仍然坚持的阻断，不算待裁决：单独写一节「已核实不成立」，写明是哪次核实、核实结论是什么。这一判断由你做，拿不准就仍然列为待裁决。',
+  '- 没有核实过的前提写进「风险与未核实的前提」。',
+  '- 「方案」写你推荐的方案，开头标明「推荐方案（未经评审）」：评审没有看过这个组合，每处注明取自哪种做法（用内容命名，不用代号），涉及代码事实的地方引用核实结果。',
+].join('\n');
+
+/** 阻断原文存档：每位评审最近一次提出阻断的那一轮，原文。 */
+export function blockersBlock(blockers = []) {
+  if (!blockers.length) return '';
+  return [
+    '## 阻断原文存档（每位评审最近一次提出【阻断】的那一轮，原文照录）',
+    ...blockers.map((b) => `### ${b.tag}（第 ${b.round} 轮${b.clearedAt ? `；第 ${b.clearedAt} 轮起已不再提阻断` : ''}）\n${b.lines.join('\n')}`),
+  ].join('\n');
+}
+
 /** 告诉主席讨论是怎么结束的。 */
 function endingBlock(ending) {
   if (!ending) return '';
   if (ending.reason === 'converged') return `## 讨论如何结束\n第 ${ending.round} 轮${ending.byReviewers ? '所有评审都表示没有新意见' : '所有主笔的立场都不再变化'}，讨论提前结束。`;
-  if (ending.reason === 'max') return `## 讨论如何结束\n已经达到上限 ${ending.round} 轮，${ending.byReviewers ? '评审仍有意见' : '主笔的立场仍在变化'}，讨论被强制结束。请把仍未解决的问题列清楚，说明还卡在哪里。`;
+  if (ending.reason === 'max') return `## 讨论如何结束\n已经达到上限 ${ending.round} 轮，${ending.byReviewers ? '评审仍有意见' : '主笔的立场仍在变化'}，讨论被强制结束。\n\n${VERDICT_RULES}`;
+  if (ending.reason === 'deadlock') return `## 讨论如何结束\n主笔连续两轮都没有改方案（第 ${ending.round - 1}、${ending.round} 轮），评审仍有阻断：双方各自坚持，讨论以分歧结束，交给人裁决。\n\n${VERDICT_RULES}`;
+  if (ending.reason === 'dissent') return `## 讨论如何结束\n${ending.tag ?? '一位评审'}连续 3 轮坚持阻断（到第 ${ending.round} 轮），其他评审都已经没有意见：讨论以评审之间的分歧结束，交给人裁决。\n\n${VERDICT_RULES}`;
   return '';
 }
 
@@ -707,7 +772,7 @@ function followUpHistory(followUps = []) {
   return `## 之前的追问\n${followUps.map((f, i) => `### 追问 ${i + 1}：${f.question}\n${f.handling === 'discuss' ? '（重新讨论过）' : ''}\n${f.answer ?? ''}`).join('\n\n')}`;
 }
 
-export function triagePrompt({ rounds, finals, summary, question, followUps, isDoc = false, omitted = '' }) {
+export function triagePrompt({ rounds, finals, summary, question, followUps, isDoc = false, omitted = '', blockers = [] }) {
   const history = rounds
     .map((r) => `### 第 ${r.round} 轮（${STAGE_LABELS[r.stage]}）\n\n${labeled(r.entries).replace(/^### /gm, '#### ')}`)
     .join('\n\n');
@@ -717,6 +782,7 @@ export function triagePrompt({ rounds, finals, summary, question, followUps, isD
     history ? `## 讨论记录（匿名）\n${history}` : '',
     finalsBlock(finals, '各主笔目前的方案'),
     summary ? `## ${isDoc ? '现在的主文档（讨论结论，之前追问的结论已经合进去）' : '你上次的汇总'}\n${summary}` : '',
+    blockersBlock(blockers),
     followUpHistory(followUps),
     `## 人类的追问\n${question.trim()}`,
     [
@@ -769,7 +835,7 @@ export function followUpPrompt({ mode, round, question, brief, others, interject
         '**改了什么**（每条一行：「原来… → 现在… · 原因」；没改写「无变化」）',
         '**立场变化**（无 / 小幅 / 较大，一句话说明）',
         '',
-        `第二部分不发给人，只给其他参与者和主席看：单独一行写「${PLAN_MARKER}」，下面写修订后的完整${plan}${limits ? `（不超过 ${limits.plan} 字）` : ''}。`,
+        `第二部分不发给人，只给其他参与者和主席看：单独一行写「${PLAN_MARKER}」，下面写修订后的完整${plan}${limits ? `（不超过 ${limits.plan} 字）` : ''}。${plan}没有任何改动时，下面只写「${UNCHANGED_MARK}」。`,
       ].join('\n'),
   );
 }
@@ -887,7 +953,7 @@ function attachmentsBlock(attachments) {
 /**
  * 初稿：讨论结束时写。补写旧讨论时 earlier 带上原来的汇总和追问记录。
  */
-export function docPrompt({ mode, rounds, finals, interjections, ending, earlier, noCode = false, omitted = '' }) {
+export function docPrompt({ mode, rounds, finals, interjections, ending, earlier, noCode = false, omitted = '', blockers = [] }) {
   const hasCritique = rounds?.some((r) => r.stage === 'critique');
   return join(
     `【阶段：${STAGE_LABELS.doc}】`,
@@ -897,6 +963,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
       ? (finals?.length ? `## 各方最终版脑洞（匿名）\n${labeled(finals)}` : '')
       : finalsBlock(finals, mode === 'refine' ? '各主笔最终的修改方案' : '各主笔的最终方案'),
     earlier ? `## 之前的汇总和追问（按时间先后，后面的结论推翻前面时以后面为准）\n${earlier}` : '',
+    blockersBlock(blockers),
     endingBlock(ending),
     noCodeBlock(noCode),
     interjectionBlock(interjections),
@@ -910,7 +977,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
 /**
  * 追问之后更新主文档：直接回答的给回答，重新讨论的给追问之后的讨论记录。
  */
-export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '' }) {
+export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '', blockers = [] }) {
   return join(
     `【阶段：更新${STAGE_LABELS.doc}】`,
     `## 现在的主文档（第 ${version} 版）\n${doc}`,
@@ -923,6 +990,7 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
         omittedBlock(omitted),
         historyBlock(rounds).replace('## 讨论记录（匿名）', '## 追问之后的讨论（匿名）'),
         mode === 'brainstorm' ? (finals?.length ? `## 各方最新的脑洞（匿名）\n${labeled(finals)}` : '') : finalsBlock(finals, '各主笔目前的方案'),
+        blockersBlock(blockers),
         endingBlock(ending),
         noCodeBlock(noCode),
       ),

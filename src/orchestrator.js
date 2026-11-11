@@ -7,8 +7,8 @@ import {
   triagePrompt, parseTriage, stripTriageLine, followUpPrompt,
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
   docSystem, docPrompt, docUpdatePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead,
-  limitsFor, splitReply, overLimit, compressPrompt, hasBlocker, PLAN_MARKER,
-  parseFactQuestions, factsBlock, factCheckPrompt, codeAccessNote, factAskLine,
+  limitsFor, splitReply, overLimit, compressPrompt, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
+  parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
 } from './modes.js';
 import { describeRepo } from './repos.js';
 import { estimateCost, priceFor } from './pricing.js';
@@ -354,14 +354,48 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     pendingQuestions = fresh.slice(max);
     if (pendingQuestions.length) log(`待核实的问题有 ${fresh.length} 个，这次先查 ${max} 个，其余留到下一轮`);
     const tools = research.tools ?? ['Read', 'Grep', 'Glob'];
-    const answer = await run.speak(research, {
-      stage: 'factcheck',
-      round,
-      system: run.shared,
-      prompt: factCheckPrompt({ round, questions, repos: run.code.repos, docs: run.code.docs, tools, maxChars: research.factCheckMaxChars ?? 4000 }),
-      callOptions: { tools, addDirs: run.code.dirs, maxBudgetUsd: research.maxBudgetUsd, timeoutMs: research.timeoutMs },
-      subtitle: `第 ${round} 轮 · 代码核实 · ${questions.length} 个问题`,
-    });
+    const maxChars = research.factCheckMaxChars ?? 4000;
+    const where = { repos: run.code.repos, docs: run.code.docs, tools, maxChars };
+    const callOptions = { tools, addDirs: run.code.dirs, maxBudgetUsd: research.maxBudgetUsd, timeoutMs: research.timeoutMs };
+    const checker = research.factChecker ?? null;
+    let answer = null;
+    let review = null;
+    let draft = null;
+    if (checker) {
+      // 两步：核实员（例如 Sonnet）读代码写初稿 → 调研员（Opus）审查纠正，定稿才发给主笔和评审
+      draft = await run.speak(checker, {
+        stage: 'factcheck',
+        round,
+        system: run.shared,
+        prompt: factCheckPrompt({ round, questions, ...where, who: checker.name, draft: true }),
+        callOptions: { ...callOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
+        subtitle: `第 ${round} 轮 · 代码核实初稿 · ${questions.length} 个问题 · 待调研员审查，不发给参与者`,
+      });
+      if (draft) {
+        answer = await run.speak(research, {
+          stage: 'factreview',
+          round,
+          system: run.shared,
+          prompt: factReviewPrompt({ round, questions, draft, checker: checker.name, ...where }),
+          callOptions,
+          subtitle: `第 ${round} 轮 · 核实审查定稿 · ${questions.length} 个问题`,
+        });
+        // 审查失败时不把没审过的初稿发出去：这批问题留到下一轮
+        if (answer) review = { checker: checker.model ?? checker.provider, corrections: parseReviewCorrections(answer) };
+      } else {
+        log(`${checker.name}没答出来，这次由调研员直接核实`);
+      }
+    }
+    if (!answer && !(checker && draft)) {
+      answer = await run.speak(research, {
+        stage: 'factcheck',
+        round,
+        system: run.shared,
+        prompt: factCheckPrompt({ round, questions, ...where }),
+        callOptions,
+        subtitle: `第 ${round} 轮 · 代码核实 · ${questions.length} 个问题`,
+      });
+    }
     if (!answer) {
       factFailures += 1;
       if (factFailures >= 2 && max > 1) {
@@ -375,8 +409,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     factFailures = 0;
     factBatch = null;
     for (const q of questions) asked.add(normQ(q));
-    run.facts.push({ round, questions, answer });
-    emit({ type: 'fact_checked', round, questions: questions.length });
+    run.facts.push({ round, questions, answer, ...(review ? { review: { ...review, draft } } : {}) });
+    emit({ type: 'fact_checked', round, questions: questions.length, ...(review ? { reviewed: true, corrections: review.corrections } : {}) });
+    if (review?.corrections) log(`调研员审查更正了核实初稿里的 ${review.corrections} 条`);
     return true;
   };
 
@@ -387,12 +422,13 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 方案讨论和打磨的评审要给问题分级：写了「继续讨论」却没有任何【阻断】级问题，按没有意见处理。
    */
   const graded = cfg.mode !== 'brainstorm';
-  const reviewersDone = (entries) => reviewers.length > 0 && reviewers.every((p) => {
+  const reviewerDone = (p, entries) => {
     const e = entries.find((x) => x.id === p.id);
     if (!e) return false;
     const verdict = parseVerdict(e.text);
     return verdict === 'done' || (graded && verdict === 'continue' && !hasBlocker(e.text));
-  });
+  };
+  const reviewersDone = (entries) => reviewers.length > 0 && reviewers.every((p) => reviewerDone(p, entries));
 
   /**
    * 第 from 到 to 轮：方案讨论是「评审提意见 → 主笔互评修订」，脑洞是「盲审 → 修订」。
@@ -413,6 +449,10 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       ending = { reason: 'converged', round, byReviewers: reviewers.length > 0 };
       log(`第 ${round} 轮${run.stopRule}，提前结束`);
     };
+    // 熔断只看确定性信号：主笔的「无变化」标记、评审有没有【阻断】、评审结论
+    const breakers = adaptive && graded && reviewers.length > 0;
+    let stuck = 0; // 连续几轮：主笔全部「无变化」，评审仍有阻断
+    const lone = new Map(); // 评审 id -> 连续几轮独自坚持阻断（其他评审都没有意见）
 
     for (let round = from; round <= to; round += 1) {
       await run.pullInterjections();
@@ -467,9 +507,47 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           limits,
         }));
       }
+      // 「无变化」：沿用上一版完整方案；没写这个标记、发言失败或写了别的内容，都算有变化
+      for (const e of revised) {
+        if (e.plan !== undefined && isUnchangedPlan(e.plan)) {
+          const prev = latest.get(e.id);
+          e.unchanged = true;
+          e.plan = prev?.plan ?? prev?.text;
+        }
+      }
+      const allUnchanged = cfg.mode !== 'brainstorm' && revised.length === activeLeads.length && revised.length > 0 && revised.every((e) => e.unchanged);
       // 本轮失败的主笔沿用上一版
       for (const e of revised) latest.set(e.id, e);
       answered = heard.length;
+      if (breakers && cfg.mode !== 'brainstorm') {
+        const critiques = rounds.find((x) => x.round === round && x.stage === 'critique')?.entries ?? [];
+        const blocking = reviewers.filter((p) => {
+          const e = critiques.find((x) => x.id === p.id);
+          return e && parseVerdict(e.text) === 'continue' && hasBlocker(e.text);
+        });
+        // 修订后结束：评审都没有阻断（这一轮因为新核实或新插话没有提前结束），主笔看完也都没改
+        if (newInterjections && reviewersDone(critiques) && allUnchanged) {
+          converge(round);
+          break;
+        }
+        // 熔断一：主笔连续 2 轮全部「无变化」，这两轮评审都有阻断
+        stuck = allUnchanged && blocking.length ? stuck + 1 : 0;
+        if (stuck >= 2) {
+          ending = { reason: 'deadlock', round, byReviewers: true };
+          log(`第 ${round - 1}、${round} 轮主笔都没改方案，评审仍有阻断：以分歧结束`);
+          break;
+        }
+        // 熔断二：评审不少于 2 位，同一位评审连续 3 轮独自坚持阻断，其他评审都没有意见
+        const alone = blocking.length === 1 && reviewers.length >= 2
+          && reviewers.filter((q) => q.id !== blocking[0].id).every((q) => reviewerDone(q, critiques))
+          ? blocking[0] : null;
+        for (const p of reviewers) lone.set(p.id, alone?.id === p.id ? (lone.get(p.id) ?? 0) + 1 : 0);
+        if (alone && lone.get(alone.id) >= 3) {
+          ending = { reason: 'dissent', round, byReviewers: true, tag: tagOf(alone) };
+          log(`${tagOf(alone)}连续 3 轮独自坚持阻断，其他评审都没有意见：以评审之间的分歧结束`);
+          break;
+        }
+      }
       // 没有评审的方案讨论：所有主笔都写「立场变化：无」就算收敛
       if (adaptive && !reviewers.length && cfg.mode !== 'brainstorm' && revised.length === activeLeads.length
         && revised.every((e) => parseStanceChange(e.text) === '无')) {
@@ -611,16 +689,39 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /**
+   * 阻断原文存档：每位评审最近一次提出【阻断】的那一轮的阻断原文。之后的轮次里这位评审不再提阻断时，记下从哪一轮起。
+   * 交给主席写主文档、判断追问，也存进 state.json。
+   */
+  run.blockerArchive = () => reviewers.map((p) => {
+    const mine = rounds.filter((x) => (x.stage === 'critique' || x.stage === 'feedback') && x.entries.some((e) => e.id === p.id))
+      .map((x) => ({ round: x.round, text: x.entries.find((e) => e.id === p.id).text }));
+    const last = [...mine].reverse().find((x) => blockerLines(x.text).length);
+    if (!last) return null;
+    const later = mine.find((x) => x.round > last.round);
+    return { id: p.id, tag: tagOf(p), round: last.round, lines: blockerLines(last.text), ...(later ? { clearedAt: later.round } : {}) };
+  }).filter(Boolean);
+
+  /** 熔断或到上限时，另发一张阻断存档卡片；正常收敛时不发（主文档里已经写了）。 */
+  run.postBlockers = async (ending) => {
+    if (!['deadlock', 'dissent', 'max'].includes(ending?.reason)) return;
+    const archive = run.blockerArchive().filter((b) => !b.clearedAt);
+    if (!archive.length) return;
+    await publisher.post({
+      speaker: cfg.chair,
+      title: '阻断存档 · 待裁决',
+      subtitle: endingText(ending),
+      body: blockersBlock(archive).replace(/^## .*\n/, ''),
+      meta: { stage: 'blockers', round: ending.round },
+    });
+  };
+
+  /**
    * 主席没写成主文档时，由程序直接发一张卡片：各主笔的最终方案、评审最后提的阻断、还没核实的问题。
    * 不经过任何模型，讨论的结果不至于整场丢掉。
    */
   run.postDocFallback = async ({ round, ending, number }) => {
     const finals = [...latest.values()].sort(byTag);
-    const blockers = reviewers.map((p) => {
-      const last = [...rounds].reverse().find((x) => (x.stage === 'critique' || x.stage === 'feedback') && x.entries.some((e) => e.id === p.id));
-      const lines = last ? blockerLines(last.entries.find((e) => e.id === p.id).text) : [];
-      return lines.length ? `**${tagOf(p)}**（第 ${last.round} 轮）\n${lines.map((l) => `- ${l.replace(/^[-*]\s*/, '')}`).join('\n')}` : null;
-    }).filter(Boolean);
+    const blockers = run.blockerArchive().map((b) => `**${b.tag}**（第 ${b.round} 轮${b.clearedAt ? `；第 ${b.clearedAt} 轮起不再提阻断` : ''}）\n${b.lines.map((l) => `- ${l.replace(/^[-*]\s*/, '')}`).join('\n')}`);
     const pending = run.pendingQuestions();
     const checked = run.facts.reduce((n, f) => n + f.questions.length, 0);
     const chair = cfg.chair.name;
@@ -694,7 +795,7 @@ function codeSpecOf(code) {
   return { auto: Boolean(code.auto), repos: code.auto ? [] : code.repos.map((r) => ({ name: r.alias, ...(r.ref ? { ref: r.ref } : {}) })) };
 }
 
-function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget }) {
+function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [] }) {
   return {
     version: STATE_VERSION,
     number: number ?? null,
@@ -711,7 +812,8 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     latest: [...latest.values()],
     rounds,
     lastRound,
-    ending: ending ? { reason: ending.reason, round: ending.round } : null,
+    ending: ending ? { reason: ending.reason, round: ending.round, ...(ending.tag ? { tag: ending.tag } : {}) } : null,
+    blockers,
     ...(budget ? { budget } : {}),
     ...(docFailed ? { docFailed: true } : {}),
     summary,
@@ -761,6 +863,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     ...(subject ? { subject: { type: subject.type, id: subject.id, title: subject.title } } : {}),
     participants: participants.map(brief),
     chair: { ...brief(cfg.chair), part: 'chair' },
+    ...(researcher?.factChecker ? { factChecker: { ...brief(researcher.factChecker), part: 'research' } } : {}),
     ...(researcher ? { research: { ...brief(researcher), part: 'research' }, code: { auto: Boolean(code.auto), groups: code.groups, repos: code.auto ? [] : code.repos.map(describeRepo) } } : {}),
   });
 
@@ -844,10 +947,12 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   // ---------- 主文档 ----------
   await run.pullInterjections();
   await run.factCheck(lastRound + 1); // 最后一轮提出的待核实问题也查掉，主席写文档时以核实结果为准
+  await run.postBlockers(ending);
+  const blockers = run.blockerArchive();
   const doc = await run.writeDoc({
     round: lastRound + 1,
     reason: '讨论结束',
-    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
+    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted, blockers })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
   if (!doc) await run.postDocFallback({ round: lastRound + 1, ending, number });
   const docs = doc?.text ? [doc] : [];
@@ -859,7 +964,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   await run.postEnd({
     number,
     title: `讨论${no} 结束`,
-    subtitle: `共 ${lastRound} 轮${ending.reason === 'converged' ? `，${run.stopRule}` : ending.reason === 'max' ? '，达到上限仍有意见' : ''} · ${stats.calls} 次模型调用${stats.failures ? `，${stats.failures} 次失败` : ''}`,
+    subtitle: `共 ${lastRound} 轮${endingSuffix(ending, run.stopRule)} · ${stats.calls} 次模型调用${stats.failures ? `，${stats.failures} 次失败` : ''}`,
     noCode: noCodeOf(cfg.mode, context),
   });
 
@@ -876,7 +981,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     context: context ? { repos: context.repos.map(describeRepo), text: context.text } : null,
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc: doc?.text ? doc : null,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget, blockers }),
   };
 }
 
@@ -928,7 +1033,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     stage: 'triage',
     round: state.lastRound,
     system: run.shared,
-    prompt: run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: hist, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length), omitted })}${chairFacts(checked)}`, { rounds: state.rounds, facts: run.facts, stage: 'triage' }),
+    prompt: run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: hist, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length), omitted, blockers: run.blockerArchive() })}${chairFacts(checked)}`, { rounds: state.rounds, facts: run.facts, stage: 'triage' }),
   });
   // 主席判断失败时不放弃这次追问：按重新讨论处理，让参与者直接回应追问
   if (!triage) log('⚠️ 主席没能判断这次追问，按重新讨论处理');
@@ -978,6 +1083,8 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     const finals = [...latest.values()].sort(byTag);
     // 有主文档就改它；还没有的旧讨论按全部记录补写一份
     const noCode = noCodeOf(state.mode, run.code ? state.context : null);
+    await run.postBlockers(it.ending);
+    const blockers = run.blockerArchive();
     const doc = await run.writeDoc(current
       ? {
         previous: current,
@@ -985,14 +1092,14 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         reason,
         prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docUpdatePrompt({
           mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, brief: briefText,
-          rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted,
+          rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted, blockers,
         })}${chairFacts(checked)}`, { rounds: rounds.filter((r) => r.round >= r0), facts: run.facts, factor }),
       }
       : {
         round: lastRound + 1,
         reason: `补写（${reason}）`,
         prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({
-          mode: state.mode, rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted,
+          mode: state.mode, rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted, blockers,
           earlier: earlierOf(state.summary, [...followUps, { question, answer: `（这次追问，第 ${r0} 轮之后的讨论记录就是它的讨论）` }]),
         })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
       });
@@ -1009,7 +1116,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     }
     await run.postEnd({
       title: `追问讨论结束 · 讨论${no}`,
-      subtitle: `追问后讨论了 ${lastRound - r0 + 1} 轮${it.ending.reason === 'converged' ? `，${run.stopRule}` : it.ending.reason === 'max' ? '，达到上限仍有意见' : ''} · ${stats.calls} 次模型调用`,
+      subtitle: `追问后讨论了 ${lastRound - r0 + 1} 轮${endingSuffix(it.ending, run.stopRule)} · ${stats.calls} 次模型调用`,
       noCode,
     });
   }
@@ -1025,6 +1132,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     followUps,
     facts: run.facts,
     budget: run.budget,
+    blockers: run.blockerArchive(),
     docs,
     ...(docFailed && !docs.length ? { docFailed: true } : { docFailed: undefined }),
     summary: docs.at(-1)?.text ?? state.summary,
@@ -1111,6 +1219,17 @@ function endingText(ending) {
   if (ending.reason === 'converged') return `第 ${ending.round} 轮提前结束（收敛）`;
   if (ending.reason === 'max') return `到上限 ${ending.round} 轮结束，评审仍有意见`;
   if (ending.reason === 'fixed') return `按固定轮数在第 ${ending.round} 轮结束`;
+  if (ending.reason === 'deadlock') return `第 ${ending.round} 轮以分歧结束：主笔连续两轮没改方案，评审仍有阻断`;
+  if (ending.reason === 'dissent') return `第 ${ending.round} 轮以评审之间的分歧结束：${ending.tag ?? '一位评审'}连续 3 轮独自坚持阻断`;
+  return '';
+}
+
+/** 结束卡片副标题里的一小段。 */
+function endingSuffix(ending, stopRule) {
+  if (ending.reason === 'converged') return `，${stopRule}`;
+  if (ending.reason === 'max') return '，达到上限仍有意见';
+  if (ending.reason === 'deadlock') return '，以分歧结束，待你裁决';
+  if (ending.reason === 'dissent') return `，${ending.tag ?? '一位评审'}独自坚持阻断，待你裁决`;
   return '';
 }
 

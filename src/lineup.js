@@ -1,4 +1,4 @@
-import { normalizeConfig, ConfigError } from './config.js';
+import { normalizeConfig, ConfigError, resolveProviderSpec } from './config.js';
 
 /**
  * 网页上每场讨论自己选阵容：用哪几个模型、各自当主笔还是评审、扮演什么角色，主席用哪个模型。
@@ -39,6 +39,14 @@ export function roleTemplates(cfg) {
   return [...all.values()].map((t) => ({ name: t.name, persona: t.persona ?? '', modes: t.modes ?? [] }));
 }
 
+/** 能读代码（当核实员）的模型：只有 claude-cli 能带只读工具。 */
+export const readsCode = (cfg, m) => ['claude-cli', 'mock'].includes(resolveProviderSpec(cfg, m.provider)?.type);
+
+/** 核实员：读代码写核实初稿，由调研员审查后才发给参与者。 */
+function factCheckerOf(m) {
+  return { id: 'factchecker', name: '核实员', role: `代码核实 · ${m.name}`, color: 'grey', ...pick(m, MODEL_ONLY) };
+}
+
 /** 模型清单：[{ id, name, provider, model, effort, color, ... }]。 */
 export function modelPool(cfg) {
   const pool = [];
@@ -70,6 +78,7 @@ export function defaultLineup(cfg, mode) {
   return {
     participants: c.participants.map((p) => ({ model: p.id, part: p.part === 'reviewer' ? 'reviewer' : 'lead', role: p.role ?? '', persona: p.persona ?? '' })),
     chair: chairModelId(c, pool) ?? pool[0]?.id ?? null,
+    factChecker: null, // 不选：调研员直接核实
   };
 }
 
@@ -115,19 +124,30 @@ export function lineupConfig(cfg, { mode, rounds, lineup }) {
     for (const k of MODEL_ONLY) delete chair[k];
     Object.assign(chair, pick(m, MODEL_ONLY));
   }
-  return normalizeConfig({ ...cfg, participants, chair, personas: {}, customLineup: true }, overrides);
+  // 核实员：只在登记了仓库（有调研员）时有意义
+  let research = cfg.research;
+  if (lineup.factChecker && Object.keys(cfg.repos ?? {}).length) {
+    const m = pool.get(lineup.factChecker);
+    if (!m) throw new ConfigError(`核实员：没有「${lineup.factChecker}」这个模型`);
+    if (!readsCode(cfg, m)) throw new ConfigError(`核实员：${m.name} 不能读代码，只能选 claude-cli 的模型`);
+    research = { ...cfg.research, factChecker: factCheckerOf(m) };
+  } else if (research?.factChecker) {
+    research = { ...research, factChecker: undefined };
+  }
+  return normalizeConfig({ ...cfg, participants, chair, personas: {}, customLineup: true, ...(research ? { research } : {}) }, overrides);
 }
 
 /** 存进 state.json 的阵容：完整的发言者定义（不含 webhook），追问时不再依赖模型清单。 */
 export function savedLineup(cfg) {
   if (!cfg.customLineup) return null;
-  return { participants: cfg.participants.map(speakerDef), chair: speakerDef(cfg.chair) };
+  return { participants: cfg.participants.map(speakerDef), chair: speakerDef(cfg.chair), ...(cfg.research?.factChecker ? { factChecker: speakerDef(cfg.research.factChecker) } : {}) };
 }
 
 /** 追问或补写主文档：讨论存了自己的阵容就用它，否则（群里和命令行的讨论）用配置。 */
 export function configForState(cfg, state) {
   if (!state?.lineup) return { ...cfg, mode: state?.mode ?? cfg.mode };
-  return normalizeConfig({ ...cfg, participants: state.lineup.participants, chair: state.lineup.chair, personas: {}, customLineup: true }, { mode: state.mode });
+  const research = cfg.research ? { ...cfg.research, factChecker: state.lineup.factChecker ?? undefined } : cfg.research;
+  return normalizeConfig({ ...cfg, participants: state.lineup.participants, chair: state.lineup.chair, personas: {}, customLineup: true, ...(research ? { research } : {}) }, { mode: state.mode });
 }
 
 function speakerDef(s) {

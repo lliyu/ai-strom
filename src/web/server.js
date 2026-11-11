@@ -3,7 +3,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeConfig, ConfigError } from '../config.js';
-import { lineupConfig, modelPool, roleTemplates, defaultLineup, MAX_SEATS } from '../lineup.js';
+import { lineupConfig, modelPool, roleTemplates, defaultLineup, MAX_SEATS, readsCode } from '../lineup.js';
 import { listStates, nextNumber, saveState, STATE_FILE, DOC_FILE } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS } from '../modes.js';
 import { RUNS, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
@@ -100,7 +100,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const own = new Map();
     const lineup = run.state?.lineup;
     const start = run.start;
-    for (const s of [...(lineup?.participants ?? []), ...(lineup?.chair ? [lineup.chair] : []), ...(start?.participants ?? []), ...(start?.chair ? [start.chair] : []), ...(start?.research ? [start.research] : [])]) {
+    for (const s of [...(lineup?.participants ?? []), ...(lineup?.chair ? [lineup.chair] : []), ...(lineup?.factChecker ? [lineup.factChecker] : []), ...(start?.participants ?? []), ...(start?.chair ? [start.chair] : []), ...(start?.research ? [start.research] : []), ...(start?.factChecker ? [start.factChecker] : [])]) {
       if (s?.id && !own.has(s.id)) own.set(s.id, s);
     }
     const table = speakers();
@@ -406,7 +406,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       maxRounds: cfg.maxRounds,
       participants: { decision: people('decision'), brainstorm: people('brainstorm'), refine: people('refine') },
       // 自选阵容：可选的模型、角色模板、各模式的默认阵容
-      models: modelPool(cfg).map((m) => ({ id: m.id, name: m.name, provider: m.provider, model: m.model ?? null, color: m.color ?? 'grey' })),
+      models: modelPool(cfg).map((m) => ({ id: m.id, name: m.name, provider: m.provider, model: m.model ?? null, color: m.color ?? 'grey', readsCode: readsCode(cfg, m) })),
       roleTemplates: roleTemplates(cfg),
       lineups: { decision: defaultLineup(cfg, 'decision'), brainstorm: defaultLineup(cfg, 'brainstorm'), refine: defaultLineup(cfg, 'refine') },
       maxSeats: MAX_SEATS,
