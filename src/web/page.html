@@ -121,6 +121,17 @@
   .form label { display: block; font-weight: 600; margin: 14px 0 6px; }
   .form input[type=text], .form select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: var(--bg); }
   .form textarea { min-height: 140px; }
+  .seats { display: grid; gap: 8px; }
+  .seat { border: 1px solid var(--line); border-left: 4px solid var(--c, var(--line)); border-radius: 8px; padding: 8px 10px; background: var(--bg); }
+  .seat .st { display: grid; grid-template-columns: minmax(120px, 1.1fr) 92px minmax(110px, 1fr) minmax(120px, 1.2fr) 30px; gap: 6px; align-items: center; }
+  .form .seat select, .form .seat input[type=text] { padding: 5px 8px; background: var(--panel); }
+  .seat textarea { min-height: 40px; height: 52px; margin-top: 6px; background: var(--panel); font-size: 13px; }
+  .seat .del { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 15px; }
+  .seat .del:hover { color: var(--err); }
+  .lnbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .lnbar select { width: auto !important; }
+  .form label .btn { font-weight: 400; font-size: 12px; padding: 1px 10px; margin-left: 8px; }
+  @media (max-width: 640px) { .seat .st { grid-template-columns: 1fr 1fr; } .seat .del { justify-self: end; } }
   .chip.lark { color: #2a7de1; border-color: #2a7de1; }
   .chip.web { color: var(--muted); }
   .post.followup-start { margin-top: 22px; }
@@ -314,33 +325,140 @@ async function openItem(type, id) {
   $('main').innerHTML = '<div class="welcome">读取中…</div>';
   let item;
   try { item = await api(`/api/novel/item?type=${type}&id=${encodeURIComponent(id)}`); } catch (e) { $('main').innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
-  const parts = (S.status?.participants?.refine || []).map((p) => `${esc(p.name)}（${esc(p.role)}${p.part === 'reviewer' ? '，评审' : ''}）`).join('、');
   const past = S.runs.filter((r) => r.mode === 'refine' && r.type === type && item.title === r.topic);
   $('main').innerHTML = `
     <div class="head"><h2>${esc(item.title)}</h2><span class="chip">${TYPE_LABEL[type]}</span></div>
-    <div class="card">
+    <div class="card form">
       <h3>这次想怎么改（可选）</h3>
       <textarea id="req" placeholder="例如：金手指太强，想加限制；开篇钩子不够抓人；第三卷之后没东西写了……不写就让模型自己找最影响质量的问题"></textarea>
-      <div class="row"><button class="btn primary" id="go">开始打磨</button><span class="hint">${parts ? `参与：${parts}` : ''}。修订版不会自动写回墨稿，要你确认。</span></div>
+      <div id="lineupBox">${lineupHtml('refine')}</div>
+      <div class="row"><button class="btn primary" id="go">开始打磨</button><span class="hint">修订版不会自动写回墨稿，要你确认。</span></div>
       ${past.length ? `<div class="hint" style="margin-top:8px">之前打磨过：${past.map((r) => `<a href="#" data-run="${r.number}">#${r.number}</a>`).join('、')}</div>` : ''}
     </div>
     <div class="card"><h3>现在的版本</h3><div class="pre">${esc(item.current)}</div></div>
     <div class="card"><details><summary>背景（定位、素材、评委意见等，模型都会看到）</summary><div class="pre" style="margin-top:8px">${esc(item.background)}</div></details></div>`;
+  bindLineup('refine', (ok) => { $('go').disabled = !ok; });
   $('go').onclick = async () => {
     $('go').disabled = true;
     try {
-      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ type, id, requirement: $('req').value }) });
+      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ type, id, requirement: $('req').value, lineup: lineupPayload('refine') }) });
       await loadRuns(); openRun(number);
     } catch (e) { toast(e.message); $('go').disabled = false; }
   };
 }
+
+// ---------- 阵容：这场讨论用哪些模型、各自当什么角色 ----------
+const LINEUP_KEY = (mode) => `ai-storm.lineup.${mode}`;
+const PART_LABEL = { lead: '主笔', reviewer: '评审' };
+const clone = (x) => JSON.parse(JSON.stringify(x));
+function defaultLineupOf(mode) { return clone(S.status?.lineups?.[mode] || { participants: [], chair: null }); }
+// 上次在这个模式下用的阵容记在本机浏览器里；模型已经从配置里删掉的就退回默认
+function lineupOf(mode) {
+  S.lineups = S.lineups || {};
+  if (S.lineups[mode]) return S.lineups[mode];
+  const ids = new Set((S.status?.models || []).map((m) => m.id));
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(LINEUP_KEY(mode)) || 'null'); } catch { /* 存不了就用默认 */ }
+  const ok = saved && Array.isArray(saved.participants) && saved.participants.length && saved.participants.every((p) => ids.has(p.model)) && (!saved.chair || ids.has(saved.chair));
+  S.lineups[mode] = ok ? saved : defaultLineupOf(mode);
+  return S.lineups[mode];
+}
+function saveLineup(mode) { try { localStorage.setItem(LINEUP_KEY(mode), JSON.stringify(S.lineups[mode])); } catch { /* 同上 */ } }
+function lineupProblem(l) {
+  const leads = l.participants.filter((p) => p.part !== 'reviewer').length;
+  if (l.participants.length < 2) return '至少要 2 位参与者';
+  if (!leads) return '至少要 1 位主笔';
+  const blank = l.participants.findIndex((p) => !String(p.role || '').trim());
+  if (blank >= 0) return `第 ${blank + 1} 位还没写角色`;
+  return '';
+}
+function seatsHtml(mode) {
+  const st = S.status || {};
+  const l = lineupOf(mode);
+  const models = st.models || [];
+  const tpls = st.roleTemplates || [];
+  const fits = tpls.filter((t) => !t.modes?.length || t.modes.includes(mode)), others = tpls.filter((t) => !fits.includes(t));
+  const tplOptions = `<option value="">套用角色模板…</option>${fits.map((t) => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('')}${others.length ? `<optgroup label="其他模式的模板">${others.map((t) => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('')}</optgroup>` : ''}`;
+  return l.participants.map((p, i) => {
+    const m = models.find((x) => x.id === p.model);
+    return `<div class="seat" data-i="${i}" style="--c:${COLORS[m?.color] || 'var(--line)'}">
+      <div class="st">
+        <select data-k="model" title="模型">${models.map((x) => `<option value="${esc(x.id)}" ${x.id === p.model ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select>
+        <select data-k="part" title="主笔出方案并多轮修订；评审只提意见">${['lead', 'reviewer'].map((k) => `<option value="${k}" ${(p.part || 'lead') === k ? 'selected' : ''}>${PART_LABEL[k]}</option>`).join('')}</select>
+        <select data-k="tpl">${tplOptions}</select>
+        <input type="text" data-k="role" value="${esc(p.role || '')}" placeholder="角色，例如 架构视角" maxlength="40">
+        <button class="del" data-k="del" title="去掉这位" ${l.participants.length <= 2 ? 'disabled' : ''}>✕</button>
+      </div>
+      <textarea data-k="persona" placeholder="角色设定（可选）：关注什么、怎么挑毛病">${esc(p.persona || '')}</textarea>
+    </div>`;
+  }).join('');
+}
+function lineupHtml(mode) {
+  const st = S.status || {};
+  const l = lineupOf(mode);
+  const chairName = mode === 'refine' ? '主编' : '主席';
+  return `<label>参与者<button class="btn" id="lnReset" type="button">恢复默认</button></label>
+    <div class="seats" id="seats">${seatsHtml(mode)}</div>
+    <div class="lnbar">
+      <button class="btn" id="lnAdd" type="button" ${l.participants.length >= (st.maxSeats || 8) ? 'disabled' : ''}>＋ 添加参与者</button>
+      <span>${chairName}（最后汇总${mode === 'refine' ? '并写修订版' : '、写主文档'}）用 <select id="lnChair">${(st.models || []).map((m) => `<option value="${esc(m.id)}" ${m.id === l.chair ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></span>
+      <span class="hint" id="lnHint"></span>
+    </div>
+    <div class="hint" style="margin-top:4px">${mode === 'brainstorm' ? '主笔发散并修订脑洞；评审只做盲审、不出脑洞。' : '主笔出方案并多轮修订；评审只提意见，不出方案。'}同一个模型可以选多次，扮演不同角色。阵容记在这台电脑的浏览器里，下次默认沿用。</div>`;
+}
+// 绑定阵容编辑；onChange 在阵容是否可用变化时调用（用来启用 / 禁用开始按钮）
+function bindLineup(mode, onChange) {
+  const l = lineupOf(mode);
+  const refresh = () => {
+    const problem = lineupProblem(l);
+    const leads = l.participants.filter((p) => p.part !== 'reviewer').length;
+    $('lnHint').innerHTML = problem ? `<span class="err">${esc(problem)}</span>` : `${leads} 位主笔${l.participants.length - leads ? `、${l.participants.length - leads} 位评审` : ''}`;
+    $('lnAdd').disabled = l.participants.length >= (S.status?.maxSeats || 8);
+    onChange?.(!problem);
+  };
+  const redraw = () => { $('seats').innerHTML = seatsHtml(mode); refresh(); };
+  const seatOf = (el) => { const box = el.closest('.seat'); return box ? Number(box.dataset.i) : -1; };
+  $('seats').addEventListener('input', (ev) => {
+    const k = ev.target.dataset.k, i = seatOf(ev.target);
+    if (i < 0 || (k !== 'role' && k !== 'persona')) return;
+    l.participants[i][k] = ev.target.value; saveLineup(mode); refresh();
+  });
+  $('seats').addEventListener('change', (ev) => {
+    const k = ev.target.dataset.k, i = seatOf(ev.target);
+    if (i < 0) return;
+    if (k === 'model' || k === 'part') { l.participants[i][k] = ev.target.value; saveLineup(mode); redraw(); }
+    if (k === 'tpl' && ev.target.value) {
+      const t = (S.status?.roleTemplates || []).find((x) => x.name === ev.target.value);
+      if (t) Object.assign(l.participants[i], { role: t.name, persona: t.persona || '' });
+      saveLineup(mode); redraw();
+    }
+  });
+  $('seats').addEventListener('click', (ev) => {
+    const b = ev.target.closest('[data-k="del"]'); if (!b) return;
+    ev.preventDefault();
+    l.participants.splice(seatOf(b), 1); saveLineup(mode); redraw();
+  });
+  $('lnAdd').onclick = () => {
+    const used = new Set(l.participants.map((p) => p.model));
+    const m = (S.status?.models || []).find((x) => !used.has(x.id)) || S.status?.models?.[0];
+    if (!m) return;
+    l.participants.push({ model: m.id, part: 'lead', role: '', persona: '' }); saveLineup(mode); redraw();
+  };
+  $('lnChair').onchange = (ev) => { l.chair = ev.target.value; saveLineup(mode); };
+  $('lnReset').onclick = () => {
+    S.lineups[mode] = defaultLineupOf(mode); saveLineup(mode);
+    const box = $('lnReset').closest('.form'); const html = lineupHtml(mode);
+    box.querySelector('#lineupBox').innerHTML = html; bindLineup(mode, onChange);
+  };
+  refresh();
+}
+const lineupPayload = (mode) => { const l = lineupOf(mode); return { participants: l.participants.map((p) => ({ model: p.model, part: p.part || 'lead', role: String(p.role || '').trim(), persona: String(p.persona || '').trim() })), chair: l.chair }; };
 
 // ---------- 新讨论 ----------
 function openForm() {
   closeStream(); S.run = null; S.sel = null; S.tab = 'runs'; renderTabs(); renderList();
   const st = S.status || {};
   const f = S.form;
-  const people = (st.participants?.[f.mode] || []).map((p) => `${esc(p.name)}（${esc(p.role)}${p.part === 'reviewer' ? '，评审' : ''}）`).join('、');
   const repoHint = [...(st.groups || []).map((g) => `${g}（组）`), ...(st.repos || [])].join('、');
   $('main').innerHTML = `
     <div class="head"><h2>新讨论</h2><span class="chip web">只在网页上，不发到群里</span></div>
@@ -353,8 +471,10 @@ function openForm() {
       <div class="hint" style="margin-top:4px">可用：${esc(repoHint) || '（还没登记仓库）'}</div>` : ''}
       <label>轮数</label>
       <select id="rounds"><option value="auto">自动：评审都没有新意见就结束（最多 ${st.maxRounds || 8} 轮）</option>${[2, 3, 4, 5, 6, 8].map((n) => `<option value="${n}" ${String(f.rounds) === String(n) ? 'selected' : ''}>固定 ${n} 轮</option>`).join('')}</select>
-      <div class="row"><button class="btn primary" id="startDiscuss">开始</button><span class="hint">${people ? `参与：${people}` : ''}</span></div>
+      <div id="lineupBox">${lineupHtml(f.mode)}</div>
+      <div class="row"><button class="btn primary" id="startDiscuss">开始</button></div>
     </div>`;
+  bindLineup(f.mode, (ok) => { $('startDiscuss').disabled = !ok; });
   const keep = () => { f.topic = $('topic').value; f.repos = $('repos')?.value ?? f.repos; f.rounds = $('rounds').value; };
   $('modeSeg').onclick = (ev) => { const b = ev.target.closest('[data-mode]'); if (!b) return; keep(); f.mode = b.dataset.mode; openForm(); };
   $('startDiscuss').onclick = async () => {
@@ -362,7 +482,7 @@ function openForm() {
     if (!f.topic.trim()) { toast('先写议题'); return; }
     $('startDiscuss').disabled = true;
     try {
-      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ mode: f.mode, topic: f.topic, repos: f.mode === 'decision' ? f.repos : '', rounds: f.rounds }) });
+      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ mode: f.mode, topic: f.topic, repos: f.mode === 'decision' ? f.repos : '', rounds: f.rounds, lineup: lineupPayload(f.mode) }) });
       S.form = { mode: f.mode };
       await loadRuns(); openRun(number);
     } catch (e) { toast(e.message, 6000); $('startDiscuss').disabled = false; }

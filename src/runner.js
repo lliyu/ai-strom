@@ -11,6 +11,7 @@ import { DEFAULT_CLAUDE_CWD } from './providers/claude-cli.js';
 import { isTrigger, DEFAULT_TRIGGERS } from './watch.js';
 import { describeRepo, resolveRepos, prepareRepos, allRepoSpecs, parseRepoSpecs } from './repos.js';
 import { createFileInbox, combineInterjections } from './inbox.js';
+import { savedLineup, configForState } from './lineup.js';
 
 /**
  * 跑一场讨论或一次追问：命令行（discuss / followup）、Lark 监听（watch）和本地网页（web）共用。
@@ -130,7 +131,9 @@ export async function runPrepared(cfg, { topic, dryRun, mock, interject, trigger
   }
   const { state, ...rest } = result;
   // state.json：会话与讨论状态，追问时接着用；超过保留期后会话会被清理
-  if (number) saveState(runDir, { ...state, dryRun, channel, ...(mock ? { mock: true } : {}) });
+  // 网页上自己选的阵容存进 state.json，追问时照原样用
+  const lineup = savedLineup(cfg);
+  if (number) saveState(runDir, { ...state, dryRun, channel, ...(lineup ? { lineup } : {}), ...(mock ? { mock: true } : {}) });
   fs.writeFileSync(path.join(runDir, 'result.json'), JSON.stringify({ number, topic, mode: cfg.mode, ...rest }, null, 2));
   log(`完成${number ? ` #${number}` : ''}。本地记录：${path.relative(process.cwd(), runDir) || runDir}`);
   return result;
@@ -147,8 +150,9 @@ export async function followUpOne(cfg, { question, number, dryRun = false, mock 
   }
   const { dir, state } = found;
   if (state.mode === 'refine' && lark !== false) throw new ConfigError(`#${state.number} 是网页上的打磨讨论，请在 ai-storm 页面上追问`);
+  if (state.lineup && lark !== false) throw new ConfigError(`#${state.number} 是网页上自选阵容的讨论，请在 ai-storm 页面上追问`);
   if (state.expired) throw new ConfigError(`讨论 #${state.number} 已超过 ${retention(cfg).retentionDays} 天，会话已清理，请重新发起讨论`);
-  const jobCfg = { ...cfg, mode: state.mode };
+  const jobCfg = configForState(cfg, state);
   const runDir = path.join(runsDir, `${stamp()}-追问#${state.number}-${slug(question)}`);
   onRunDir?.(runDir, state.number, dir);
   const { publisher, interjections, providers, onEvent } = setupRun(jobCfg, { runDir, dryRun, mock, interject, triggers, lark, extraPublishers, interjections: ownInterjections, onEvent: watcher, echo });
@@ -185,7 +189,7 @@ export async function docOne(cfg, { number, mock = false, runsDir = RUNS }) {
   log(`补写主文档 #${state.number}「${state.topic.split('\n')[0].slice(0, 30)}」：主席读全部记录写初稿，主笔核对`);
   let result;
   try {
-    result = await backfillDoc({ cfg: { ...cfg, mode: state.mode }, state, providers, publisher, log });
+    result = await backfillDoc({ cfg: configForState(cfg, state), state, providers, publisher, log });
   } catch (err) {
     throw new ConfigError(err.message);
   }

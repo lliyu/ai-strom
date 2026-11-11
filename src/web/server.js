@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normalizeConfig } from '../config.js';
+import { normalizeConfig, ConfigError } from '../config.js';
+import { lineupConfig, modelPool, roleTemplates, defaultLineup, MAX_SEATS } from '../lineup.js';
 import { listStates, nextNumber, saveState, STATE_FILE, DOC_FILE } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS } from '../modes.js';
 import { RUNS, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
@@ -94,14 +95,26 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   const channelOf = (run) => run.state?.channel ?? run.start?.channel
     ?? (modeOf(run) === 'refine' ? 'web' : (run.state?.dryRun ?? run.start?.dryRun) ? 'dry-run' : 'lark');
 
-  function postsOf(run) {
+  /** 发言者 id -> { name, color }：先看这场讨论自己记的阵容（网页上自选的阵容和配置里的不一样），再看配置。 */
+  function speakerOf(run) {
+    const own = new Map();
+    const lineup = run.state?.lineup;
+    const start = run.start;
+    for (const s of [...(lineup?.participants ?? []), ...(lineup?.chair ? [lineup.chair] : []), ...(start?.participants ?? []), ...(start?.chair ? [start.chair] : []), ...(start?.research ? [start.research] : [])]) {
+      if (s?.id && !own.has(s.id)) own.set(s.id, s);
+    }
     const table = speakers();
     const mode = modeOf(run);
+    return (id) => own.get(id) ?? table.get(`${mode}:${id}`) ?? table.get(`decision:${id}`);
+  }
+
+  function postsOf(run) {
+    const who = speakerOf(run);
     const posts = [];
     for (const [part, dir] of dirsOf(run).entries()) {
       const followUp = part > 0;
       for (const e of readJsonl(path.join(dir, 'events.jsonl'))) {
-        const sp = table.get(`${mode}:${e.speaker}`) ?? table.get(`decision:${e.speaker}`);
+        const sp = who(e.speaker);
         posts.push({
           seq: posts.length + 1,
           at: e.at,
@@ -156,11 +169,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
         if (i >= 0) open.splice(i, 1);
       }
     }
-    const table = speakers();
-    const mode = modeOf(run);
+    const who = speakerOf(run);
     return {
       status: 'running',
-      speaking: open.map((s) => ({ name: (table.get(`${mode}:${s.speaker}`) ?? table.get(`decision:${s.speaker}`))?.name ?? s.speaker, stage: STAGE_LABELS[s.stage] ?? s.stage, round: s.round, at: s.at })),
+      speaking: open.map((s) => ({ name: who(s.speaker)?.name ?? s.speaker, stage: STAGE_LABELS[s.stage] ?? s.stage, round: s.round, at: s.at })),
     };
   }
 
@@ -245,9 +257,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const common = { runsDir, echo, mock, interject: true };
     try {
       if (job.kind === 'refine') {
-        await runner.runPrepared(cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
+        await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
       } else if (job.kind === 'discuss') {
-        await runner.runOne(cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, number: job.number, repos: job.repos });
+        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, number: job.number, repos: job.repos });
       } else {
         // 群里的讨论在网页上追问：照样发到群里（dry-run 的讨论打印到终端）
         await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number });
@@ -270,8 +282,19 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
 
   // ---------- 操作 ----------
 
-  async function startRefine({ type, id, requirement = '' }) {
+  /** 页面上选的阵容 -> 这场讨论的配置；不传阵容用配置里的默认阵容。写错了直接 400，不排队。 */
+  function jobConfig(mode, rounds, lineup) {
+    try {
+      return lineupConfig(cfg, { mode, ...(rounds !== undefined ? { rounds } : {}), lineup });
+    } catch (err) {
+      if (err instanceof ConfigError) throw httpError(400, err.message.replace(/^配置有误：\n- /, '阵容有误：').replace(/\n- /g, '；'));
+      throw err;
+    }
+  }
+
+  async function startRefine({ type, id, requirement = '', lineup }) {
     if (!SUBJECT_LABELS[type] || !id) throw httpError(400, '需要 type（idea / premise / outline）和 id');
+    const jobCfg = jobConfig('refine', undefined, lineup);
     const item = await novel.get(type, id);
     const number = nextNumber(runsDir);
     const subject = {
@@ -287,13 +310,13 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     };
     const topic = String(requirement).slice(0, 4000);
     pending.set(number, { mode: 'refine', topic, subject });
-    enqueue({ kind: 'refine', number, subject, topic });
+    enqueue({ kind: 'refine', number, subject, topic, cfg: jobCfg });
     log(`网页：#${number} 打磨${SUBJECT_LABELS[type]}「${item.title}」排队`);
     return { number };
   }
 
   /** 网页上发起方案讨论或脑洞风暴：只在网页上，不发到群里。 */
-  function startDiscussion({ mode, topic, repos, rounds }) {
+  function startDiscussion({ mode, topic, repos, rounds, lineup }) {
     if (mode !== 'decision' && mode !== 'brainstorm') throw httpError(400, 'mode 只能是 decision 或 brainstorm');
     const text = String(topic ?? '').trim();
     if (!text) throw httpError(400, `${mode === 'brainstorm' ? '题目' : '议题'}不能为空`);
@@ -302,6 +325,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       r = Number(rounds);
       if (!Number.isInteger(r) || r < 2 || r > 12) throw httpError(400, '轮数要是 2 到 12 的整数，或者自动');
     } else if (rounds === 'auto') r = 'auto';
+    const jobCfg = jobConfig(mode, r, lineup);
     // 仓库：不写 = 方案讨论自动定位；「无」= 不读代码；否则是别名列表。先校验，写错了不排队
     let repoSpecs;
     const repoText = String(repos ?? '').trim();
@@ -316,7 +340,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     }
     const number = nextNumber(runsDir);
     pending.set(number, { mode, topic: text.slice(0, 8000) });
-    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), repos: repoSpecs, rounds: r });
+    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), repos: repoSpecs, rounds: r, cfg: jobCfg });
     log(`网页：#${number} ${MODE_LABELS[mode]}排队`);
     return { number };
   }
@@ -380,6 +404,11 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       groups,
       maxRounds: cfg.maxRounds,
       participants: { decision: people('decision'), brainstorm: people('brainstorm'), refine: people('refine') },
+      // 自选阵容：可选的模型、角色模板、各模式的默认阵容
+      models: modelPool(cfg).map((m) => ({ id: m.id, name: m.name, provider: m.provider, model: m.model ?? null, color: m.color ?? 'grey' })),
+      roleTemplates: roleTemplates(cfg),
+      lineups: { decision: defaultLineup(cfg, 'decision'), brainstorm: defaultLineup(cfg, 'brainstorm'), refine: defaultLineup(cfg, 'refine') },
+      maxSeats: MAX_SEATS,
     };
   }
 

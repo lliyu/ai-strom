@@ -85,8 +85,8 @@ export function listStates(runsDir) {
 export function findState(runsDir, number, { dryRun } = {}) {
   const all = listStates(runsDir);
   if (number == null) {
-    // 「最近一场」只在群里的讨论里找：网页上的打磨（refine）和 mock 演练不算
-    const candidates = all.filter((s) => s.state.mode !== 'refine' && !s.state.mock);
+    // 「最近一场」只在群里的讨论里找：网页上的打磨（refine）、网页上自选阵容的讨论和 mock 演练不算
+    const candidates = all.filter((s) => s.state.mode !== 'refine' && !s.state.lineup && !s.state.mock);
     const same = dryRun === undefined ? candidates : candidates.filter((s) => Boolean(s.state.dryRun) === Boolean(dryRun));
     if (!same.length) throw new Error(`还没有可以追问的${dryRun ? ' dry-run ' : ''}讨论`);
     return same[0];

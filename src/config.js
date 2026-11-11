@@ -101,6 +101,22 @@ export function normalizeConfig(raw, overrides = {}) {
   if (Array.isArray(cfg.participants) && leadCount === 0) errors.push('至少需要 1 位主笔（part 为 lead 或不填）');
   if (reviewerCount && cfg.rounds < 2) errors.push('配置了评审时 rounds 至少为 2，否则评审没有发言机会');
 
+  // models：只给网页阵容用的额外模型（不在群里发言，不需要 webhook）
+  cfg.models ??= [];
+  if (!Array.isArray(cfg.models)) errors.push('models 需要是数组');
+  else {
+    for (const m of cfg.models) {
+      const where = `models 里的 ${m?.id ?? '(未命名)'}`;
+      if (!m?.id) errors.push(`${where}：缺少 id`);
+      // 自选阵容里的发言者 id 本来就取自模型清单，只在配置里固定的参与者之间查重
+      else if (!cfg.customLineup && ids.has(m.id)) errors.push(`${where}：id 和发言者重复`);
+      if (!m?.provider) errors.push(`${where}：缺少 provider`);
+      else if (!resolveProviderSpec(cfg, m.provider)) errors.push(`${where}：providers 里没有 ${m.provider}`);
+      if (m?.color !== undefined && !CARD_COLORS.includes(m.color)) errors.push(`${where}：color 只能是 ${CARD_COLORS.join(', ')}`);
+    }
+  }
+  if (cfg.roleTemplates !== undefined && !Array.isArray(cfg.roleTemplates)) errors.push('roleTemplates 需要是数组：[{ name, persona, modes }]');
+
   applyModePersonas(cfg, errors);
   normalizeRepos(cfg, errors);
 
