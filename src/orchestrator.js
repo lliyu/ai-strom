@@ -12,8 +12,11 @@ import {
 } from './modes.js';
 import { describeRepo } from './repos.js';
 import { estimateCost, priceFor } from './pricing.js';
+import { fitHistory, budgetChars, CHAIR_SHARE } from './budget.js';
 
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+/** 学每字 tokens 数时，提示词至少这么长。 */
+export const MIN_RATIO_CHARS = 2000;
 const PLAN_MARKER_LINE = PLAN_MARKER;
 export const STATE_VERSION = 1;
 
@@ -71,7 +74,7 @@ const who = (list) => list.map((p) => `${p.name} · ${p.role}`).join(' / ');
  * 会话：每位参与者一条会话（sessions），整场讨论接着聊，模型记得自己说过的话；
  * 每轮只发新内容。主席和调研员不用会话：主席只在汇总时拿到完整记录，调研员开场调研和中途核实都是一次性调用。
  */
-function createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts = [] }) {
+function createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts = [], budget = {} }) {
   const emit = (e) => {
     try {
       onEvent(e);
@@ -143,6 +146,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   const retryDelayMs = cfg.retryDelayMs ?? 5000;
+  // 主席输入预算用：各模型的上下文窗口（provider:model）、各 provider 每字多少 tokens。随 state.json 保存，追问时接着用
+  run.budget = { windows: { ...(budget.windows ?? {}) }, tokenRatios: { ...(budget.tokenRatios ?? {}) } };
   run.occupancy = new Map(); // 参与者 id -> 最近一次的上下文占用 { tokens, kind, pct }
 
   /**
@@ -168,10 +173,18 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     const started = Date.now();
     emit({ type: 'call_started', speaker: speaker.id, stage, round, promptChars: prompt.length + (system?.length ?? 0), ...(retry ? { retry } : {}) });
     try {
+      const firstTurn = !session || !session.turns.length;
       const res = await provider.complete({ model: speaker.model, system, prompt, effort: speaker.effort, temperature: speaker.temperature, ...callOptions, ...(session ? { session } : {}) });
       if (session) session.turns.push({ prompt, reply: res.text });
       const window = speaker.contextWindow ?? res.contextWindow ?? null;
       res.occupancy = occupancyOf(res, { window, last: session?.contextTokens });
+      if (window) run.budget.windows[`${speaker.provider}:${speaker.model ?? ''}`] = window;
+      // 每字 tokens 数只从会话第一条（或无会话）、单回合的调用学：这时输入 tokens 正好对应这次的系统提示词加提示词
+      const chars = prompt.length + (system?.length ?? 0);
+      // 太短的提示词里 CLI 自带的固定开销占比大，算出来偏高，不用
+      if (firstTurn && res.occupancy.kind === 'exact' && res.occupancy.tokens > 0 && chars >= MIN_RATIO_CHARS) {
+        run.budget.tokenRatios[speaker.provider] = Math.round((res.occupancy.tokens / chars) * 1000) / 1000;
+      }
       if (session) session.contextTokens = res.occupancy.tokens;
       if (tags.has(speaker.id)) run.occupancy.set(speaker.id, res.occupancy);
       if (res.truncated) log(`⚠️ ${speaker.name} 的输出到了长度上限，被截断了`);
@@ -316,6 +329,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   const asked = new Set(run.facts.flatMap((f) => f.questions.map(normQ)));
   let pendingQuestions = [];
   run.pendingQuestions = () => [...pendingQuestions];
+  // 核实连续失败 2 次（每次已含一次临时故障重试），下一批条数减半，直到 1 条；成功后恢复
+  let factFailures = 0;
+  let factBatch = null;
   /**
    * 收集上次核实之后参与者列出的「待核实的事实」，交给调研员查代码回答。
    * 有新结果时返回 true：这一轮不提前结束，主笔要先按核实结果修订。
@@ -332,7 +348,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     factCursor = rounds.length;
     pendingQuestions = [];
     if (!factChecking() || !fresh.length) return false;
-    const max = research.factCheckMaxQuestions ?? 8;
+    const full = research.factCheckMaxQuestions ?? 8;
+    const max = factBatch ?? full;
     const questions = fresh.slice(0, max);
     pendingQuestions = fresh.slice(max);
     if (pendingQuestions.length) log(`待核实的问题有 ${fresh.length} 个，这次先查 ${max} 个，其余留到下一轮`);
@@ -346,10 +363,17 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       subtitle: `第 ${round} 轮 · 代码核实 · ${questions.length} 个问题`,
     });
     if (!answer) {
-      log('代码核实失败，这些问题下一轮再试');
+      factFailures += 1;
+      if (factFailures >= 2 && max > 1) {
+        factBatch = Math.max(1, Math.ceil(max / 2));
+        factFailures = 0;
+        log(`代码核实连续失败，下一次只查 ${factBatch} 个问题`);
+      } else log('代码核实失败，这些问题下一轮再试');
       pendingQuestions = [...questions, ...pendingQuestions];
       return false;
     }
+    factFailures = 0;
+    factBatch = null;
     for (const q of questions) asked.add(normQ(q));
     run.facts.push({ round, questions, answer });
     emit({ type: 'fact_checked', round, questions: questions.length });
@@ -481,6 +505,25 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /**
+   * 按主席的输入预算拼提示词。build({ rounds, facts, omitted }) 返回完整提示词；
+   * 必须保留的内容由 build 自己放（不受预算限制，超出也照发），讨论记录和核实结果按预算从新到旧装填。
+   * factor：预算倍数，主席第一次失败后重写时传 0.5。
+   */
+  run.fitChair = (build, { rounds: history = [], facts: checked = [], factor = 1, stage = 'doc' } = {}) => {
+    const chair = cfg.chair;
+    const window = chair.contextWindow ?? run.budget.windows[`${chair.provider}:${chair.model ?? ''}`];
+    const total = budgetChars({ window, share: CHAIR_SHARE, factor, tokensPerChar: run.budget.tokenRatios[chair.provider] });
+    const fixed = build({ rounds: [], facts: [], omitted: '' }).length + (run.shared?.length ?? 0);
+    const fit = fitHistory({ rounds: history, facts: checked, budgetChars: total - fixed });
+    const over = fixed > total;
+    if (fit.stats.trimmed || over) {
+      log(`${chair.name}输入预算 ${total} 字（窗口${window ? ` ${window}` : '未知，按默认估'} tokens × ${CHAIR_SHARE * factor}）：${over ? `必须保留的内容 ${fixed} 字已超出预算，照发；` : ''}讨论记录 ${fit.stats.rounds} 轮里缩略 ${fit.stats.compactRounds}、省略 ${fit.stats.droppedRounds}，核实 ${fit.stats.facts} 次里缩略 ${fit.stats.compactFacts}、省略 ${fit.stats.droppedFacts}`);
+    }
+    emit({ type: 'chair_budget', stage, budgetChars: total, fixedChars: fixed, factor, overBudget: over, ...fit.stats });
+    return build({ rounds: fit.rounds, facts: fit.facts, omitted: fit.note });
+  };
+
+  /**
    * 主文档：主席写（或更新）→ 主笔在各自的会话里核对 → 有意见时主席按意见修改 → 在讨论里发一条短消息。
    * prompt 是 docPrompt 或 docUpdatePrompt；previous 是上一版（没有时为 null）。
    * 返回新的一版 { version, at, reason, text, note, attachments, check }；不需要修改时返回 { unchanged: true }；写失败返回 null。
@@ -495,7 +538,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     for (let attempt = 0; attempt < 2 && !parsed; attempt += 1) {
       if (attempt) log('主席重写一次主文档');
       session = convo ? { id: randomUUID(), turns: [], seen: 0 } : null;
-      raw = await write(`${docSystem(cfg.mode)}\n\n${prompt}`);
+      // prompt 是函数时按预算拼：重写那次预算减半，讨论记录缩略得更多
+      const text = typeof prompt === 'function' ? prompt(attempt ? 0.5 : 1) : prompt;
+      raw = await write(`${docSystem(cfg.mode)}\n\n${text}`);
       if (raw == null) continue;
       try {
         parsed = parseDoc(raw);
@@ -649,7 +694,7 @@ function codeSpecOf(code) {
   return { auto: Boolean(code.auto), repos: code.auto ? [] : code.repos.map((r) => ({ name: r.alias, ...(r.ref ? { ref: r.ref } : {}) })) };
 }
 
-function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false }) {
+function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget }) {
   return {
     version: STATE_VERSION,
     number: number ?? null,
@@ -667,6 +712,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     rounds,
     lastRound,
     ending: ending ? { reason: ending.reason, round: ending.round } : null,
+    ...(budget ? { budget } : {}),
     ...(docFailed ? { docFailed: true } : {}),
     summary,
     docs,
@@ -801,7 +847,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const doc = await run.writeDoc({
     round: lastRound + 1,
     reason: '讨论结束',
-    prompt: `${docPrompt({ mode: cfg.mode, rounds, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context) })}${chairFacts(run.facts)}`,
+    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
   if (!doc) await run.postDocFallback({ round: lastRound + 1, ending, number });
   const docs = doc?.text ? [doc] : [];
@@ -830,7 +876,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     context: context ? { repos: context.repos.map(describeRepo), text: context.text } : null,
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc: doc?.text ? doc : null,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget }),
   };
 }
 
@@ -851,7 +897,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   const sessions = new Map(Object.entries(state.sessions).map(([id, s]) => [id, { ...s, turns: [...s.turns], seen: 0 }]));
   const latest = new Map(state.latest.map((e) => [e.id, e]));
   const rounds = [...state.rounds];
-  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [] });
+  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget });
   const { leads, participants, stats, emit, heard, ideasPerAgent } = run;
   run.shared = state.shared; // 和原讨论完全一样，缓存还能命中
   // 原讨论带了代码背景时，调用方会重新准备代码目录：追问中照样能查代码、核实事实
@@ -882,7 +928,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     stage: 'triage',
     round: state.lastRound,
     system: run.shared,
-    prompt: `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: state.rounds, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length) })}${chairFacts(run.facts)}`,
+    prompt: run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: hist, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length), omitted })}${chairFacts(checked)}`, { rounds: state.rounds, facts: run.facts, stage: 'triage' }),
   });
   // 主席判断失败时不放弃这次追问：按重新讨论处理，让参与者直接回应追问
   if (!triage) log('⚠️ 主席没能判断这次追问，按重新讨论处理');
@@ -931,23 +977,24 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     await run.factCheck(lastRound + 1);
     const finals = [...latest.values()].sort(byTag);
     // 有主文档就改它；还没有的旧讨论按全部记录补写一份
+    const noCode = noCodeOf(state.mode, run.code ? state.context : null);
     const doc = await run.writeDoc(current
       ? {
         previous: current,
         round: lastRound + 1,
         reason,
-        prompt: `${docUpdatePrompt({
+        prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docUpdatePrompt({
           mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, brief: briefText,
-          rounds: rounds.filter((r) => r.round >= r0), finals, interjections: heard, ending: it.ending, noCode: noCodeOf(state.mode, run.code ? state.context : null),
-        })}${chairFacts(run.facts)}`,
+          rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted,
+        })}${chairFacts(checked)}`, { rounds: rounds.filter((r) => r.round >= r0), facts: run.facts, factor }),
       }
       : {
         round: lastRound + 1,
         reason: `补写（${reason}）`,
-        prompt: `${docPrompt({
-          mode: state.mode, rounds, finals, interjections: heard, ending: it.ending, noCode: noCodeOf(state.mode, run.code ? state.context : null),
+        prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({
+          mode: state.mode, rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted,
           earlier: earlierOf(state.summary, [...followUps, { question, answer: `（这次追问，第 ${r0} 轮之后的讨论记录就是它的讨论）` }]),
-        })}${chairFacts(run.facts)}`,
+        })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
       });
     if (doc?.text) docs.push(doc);
     else if (!doc) {
@@ -963,7 +1010,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     await run.postEnd({
       title: `追问讨论结束 · 讨论${no}`,
       subtitle: `追问后讨论了 ${lastRound - r0 + 1} 轮${it.ending.reason === 'converged' ? `，${run.stopRule}` : it.ending.reason === 'max' ? '，达到上限仍有意见' : ''} · ${stats.calls} 次模型调用`,
-      noCode: noCodeOf(state.mode, run.code ? state.context : null),
+      noCode,
     });
   }
 
@@ -977,6 +1024,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     lastRound,
     followUps,
     facts: run.facts,
+    budget: run.budget,
     docs,
     ...(docFailed && !docs.length ? { docFailed: true } : { docFailed: undefined }),
     summary: docs.at(-1)?.text ?? state.summary,
@@ -1006,12 +1054,12 @@ export async function backfillDoc({ cfg, state, providers, publisher, log = () =
   const sessions = new Map(Object.entries(state.sessions).map(([id, s]) => [id, { ...s, turns: [...s.turns], seen: 0 }]));
   const latest = new Map(state.latest.map((e) => [e.id, e]));
   const rounds = [...state.rounds];
-  const run = createRun({ cfg: { ...cfg, mode: state.mode }, providers, publisher, interjections: null, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [] });
+  const run = createRun({ cfg: { ...cfg, mode: state.mode }, providers, publisher, interjections: null, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget });
   run.shared = state.shared;
   const doc = await run.writeDoc({
     round: state.lastRound + 1,
     reason: '补写',
-    prompt: `${docPrompt({ mode: state.mode, rounds, finals: [...latest.values()].sort(byTag), earlier: earlierOf(state.summary, state.followUps) })}${chairFacts(run.facts)}`,
+    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), earlier: earlierOf(state.summary, state.followUps), omitted })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
   if (!doc?.text) throw new Error('主文档没写成');
   return {

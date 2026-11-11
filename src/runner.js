@@ -12,6 +12,7 @@ import { isTrigger, DEFAULT_TRIGGERS } from './watch.js';
 import { describeRepo, resolveRepos, prepareRepos, allRepoSpecs, parseRepoSpecs } from './repos.js';
 import { createFileInbox, combineInterjections } from './inbox.js';
 import { savedLineup, configForState } from './lineup.js';
+import { budgetFromUsage } from './budget.js';
 
 /**
  * 跑一场讨论或一次追问：命令行（discuss / followup）、Lark 监听（watch）和本地网页（web）共用。
@@ -148,7 +149,8 @@ export async function followUpOne(cfg, { question, number, dryRun = false, mock 
   } catch (err) {
     throw new ConfigError(err.message); // 找不到讨论：只提示，不打印调用栈
   }
-  const { dir, state } = found;
+  const { dir } = found;
+  const state = withBudget(found.state, dir);
   if (state.mode === 'refine' && lark !== false) throw new ConfigError(`#${state.number} 是网页上的打磨讨论，请在 ai-storm 页面上追问`);
   if (state.lineup && lark !== false) throw new ConfigError(`#${state.number} 是网页上自选阵容的讨论，请在 ai-storm 页面上追问`);
   if (state.expired) throw new ConfigError(`讨论 #${state.number} 已超过 ${retention(cfg).retentionDays} 天，会话已清理，请重新发起讨论`);
@@ -183,7 +185,8 @@ export async function docOne(cfg, { number, mock = false, runsDir = RUNS }) {
   } catch (err) {
     throw new ConfigError(err.message);
   }
-  const { dir, state } = found;
+  const { dir } = found;
+  const state = withBudget(found.state, dir);
   const providers = createProviderRegistry(cfg, { forceMock: mock });
   const publisher = combinePublishers([createConsolePublisher({ full: false })]);
   log(`补写主文档 #${state.number}「${state.topic.split('\n')[0].slice(0, 30)}」：主席读全部记录写初稿，主笔核对`);
@@ -198,6 +201,23 @@ export async function docOne(cfg, { number, mock = false, runsDir = RUNS }) {
   const extra = Object.keys(doc.attachments).length;
   log(`完成：第 ${doc.version} 版，${doc.text.length} 字${extra ? `，附录 ${extra} 份` : ''}。${stats.calls} 次模型调用${stats.costUsd ? `，约 $${stats.costUsd.toFixed(2)}` : ''}。文件：${path.join(dir, '主文档.md')}`);
   return result;
+}
+
+/** 旧讨论的 state.json 里没有主席输入预算的数据时，从它的 usage.jsonl 推出来。 */
+export function withBudget(state, dir) {
+  if (state.budget) return state;
+  try {
+    const rows = fs.readFileSync(path.join(dir, 'usage.jsonl'), 'utf8').split('\n').filter(Boolean).flatMap((l) => {
+      try {
+        return [JSON.parse(l)];
+      } catch {
+        return [];
+      }
+    });
+    return { ...state, budget: budgetFromUsage(rows) };
+  } catch {
+    return state;
+  }
 }
 
 /**

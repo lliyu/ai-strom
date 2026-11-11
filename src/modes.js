@@ -565,6 +565,11 @@ function finalsBlock(finals, title = '各主笔的最终方案') {
   return `## ${title}（匿名，讨论记录里的修订轮只写了变化，完整方案以这里为准）\n${finals.map((e) => `### ${e.tag ?? `方案 ${e.label}`}\n${e.plan ?? e.text}`).join('\n\n')}`;
 }
 
+/** 主席输入按预算缩略或省略了较早的讨论记录、核实结果时的说明。 */
+function omittedBlock(omitted) {
+  return omitted ? `## 篇幅说明\n${omitted}` : '';
+}
+
 /** 本场没有读代码：涉及代码现状的说法都是参与者的推测。 */
 function noCodeBlock(noCode) {
   return noCode ? '## 代码上下文\n本场无代码：讨论前没有读代码，讨论中也没有核实代码事实。参与者关于代码现状的说法都是推测，主文档里涉及代码现状的结论要标为「未核实」，并在开头注明「本场无代码」。' : '';
@@ -702,13 +707,14 @@ function followUpHistory(followUps = []) {
   return `## 之前的追问\n${followUps.map((f, i) => `### 追问 ${i + 1}：${f.question}\n${f.handling === 'discuss' ? '（重新讨论过）' : ''}\n${f.answer ?? ''}`).join('\n\n')}`;
 }
 
-export function triagePrompt({ rounds, finals, summary, question, followUps, isDoc = false }) {
+export function triagePrompt({ rounds, finals, summary, question, followUps, isDoc = false, omitted = '' }) {
   const history = rounds
     .map((r) => `### 第 ${r.round} 轮（${STAGE_LABELS[r.stage]}）\n\n${labeled(r.entries).replace(/^### /gm, '#### ')}`)
     .join('\n\n');
   return join(
     `【阶段：${STAGE_LABELS.triage}】`,
-    `## 讨论记录（匿名）\n${history}`,
+    omittedBlock(omitted),
+    history ? `## 讨论记录（匿名）\n${history}` : '',
     finalsBlock(finals, '各主笔目前的方案'),
     summary ? `## ${isDoc ? '现在的主文档（讨论结论，之前追问的结论已经合进去）' : '你上次的汇总'}\n${summary}` : '',
     followUpHistory(followUps),
@@ -881,10 +887,11 @@ function attachmentsBlock(attachments) {
 /**
  * 初稿：讨论结束时写。补写旧讨论时 earlier 带上原来的汇总和追问记录。
  */
-export function docPrompt({ mode, rounds, finals, interjections, ending, earlier, noCode = false }) {
+export function docPrompt({ mode, rounds, finals, interjections, ending, earlier, noCode = false, omitted = '' }) {
   const hasCritique = rounds?.some((r) => r.stage === 'critique');
   return join(
     `【阶段：${STAGE_LABELS.doc}】`,
+    omittedBlock(omitted),
     historyBlock(rounds),
     mode === 'brainstorm'
       ? (finals?.length ? `## 各方最终版脑洞（匿名）\n${labeled(finals)}` : '')
@@ -903,7 +910,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
 /**
  * 追问之后更新主文档：直接回答的给回答，重新讨论的给追问之后的讨论记录。
  */
-export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false }) {
+export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '' }) {
   return join(
     `【阶段：更新${STAGE_LABELS.doc}】`,
     `## 现在的主文档（第 ${version} 版）\n${doc}`,
@@ -913,6 +920,7 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
       ? `## 你对追问的回答（主席判断讨论记录足以回答，没有重新讨论）\n${answer}`
       : join(
         brief ? `## 你给参与者的说明\n${brief}` : '',
+        omittedBlock(omitted),
         historyBlock(rounds).replace('## 讨论记录（匿名）', '## 追问之后的讨论（匿名）'),
         mode === 'brainstorm' ? (finals?.length ? `## 各方最新的脑洞（匿名）\n${labeled(finals)}` : '') : finalsBlock(finals, '各主笔目前的方案'),
         endingBlock(ending),
