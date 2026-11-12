@@ -429,6 +429,7 @@ export function sharedSystem({ mode, topic, context, subject, dataContext, mater
       topicBlock(topic, mode),
       materialBlock(material),
       memory,
+      contextBlock(context),
     );
   }
   if (mode === 'refine') {

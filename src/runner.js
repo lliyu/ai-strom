@@ -103,11 +103,11 @@ export async function runOne(cfg, { repos, ...opts }) {
 }
 
 /**
- * 指定了仓库就读这些；写「无」不读；没写时（方案讨论）把全部登记的仓库交给调研员按议题定位。
+ * 指定了仓库就读这些；写「无」不读；没写时（方案讨论、快问）把全部登记的仓库交给调研员按内容定位，不涉及代码就不带。
  */
 export function prepareCode(cfg, repos) {
   if (repos === undefined || repos === null) {
-    const auto = cfg.mode === 'decision' && cfg.research?.auto !== false && Object.keys(cfg.repos).length > 0;
+    const auto = (cfg.mode === 'decision' || cfg.mode === 'quick') && cfg.research?.auto !== false && Object.keys(cfg.repos).length > 0;
     if (!auto) return null;
     const code = prepareRepos(resolveRepos(cfg, allRepoSpecs(cfg)), { skipMissing: true });
     for (const p of code.skipped) log(`⚠️ 登记的目录不存在，跳过：${p}`);

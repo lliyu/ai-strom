@@ -242,3 +242,50 @@ test('auto：调研员先定位仓库；判断无关时不带代码讨论', asyn
   await runDiscussion({ cfg, topic: '团队周会改到周四？', providers: none.registry, publisher: createMemoryPublisher(), code: auto });
   assert.ok(none.calls.slice(1).every((c) => !/背景资料/.test(c.system + c.prompt)));
 });
+
+// ---------- 快问读代码 ----------
+
+const quickCfg = () => normalizeConfig(base({ ...registry, mode: 'quick', participants: [
+  { id: 'a', name: 'A', provider: 'fake', part: 'lead' },
+  { id: 'c', name: 'C', provider: 'fake', part: 'reviewer' },
+] }));
+
+test('快问指定了仓库：调研员先读代码，背景资料进共用提示词，结果里记下代码上下文', async () => {
+  const { calls, registry: providers } = recording();
+  const publisher = createMemoryPublisher();
+  const res = await runDiscussion({ cfg: quickCfg(), topic: '价格缓存要不要加', providers, publisher, rng: () => 0, code });
+  assert.deepEqual(calls.map((c) => c.who).slice(0, 3), ['调研员', 'A', 'C']);
+  assert.equal(calls.length, 4, '调研、回答、挑刺、定稿');
+  assert.match(calls[0].prompt, /## 问题\n价格缓存要不要加/);
+  for (const c of calls.slice(1)) assert.match(c.system, /## 背景资料[\s\S]*fission:Price\.java:42/);
+  assert.match(publisher.posts[0].body, /共 4 次模型调用[\s\S]*代码上下文[\s\S]*fission（价格）/);
+  assert.match(res.state.context.text, /一句话现状/);
+  assert.deepEqual(res.state.code.repos.map((r) => r.name ?? r.alias ?? r), ['fission']);
+});
+
+test('快问没指定仓库：调研员判断不涉及代码时只回「无相关代码」，不带代码接着回答', async () => {
+  const calls = [];
+  const provider = {
+    async complete(opts) {
+      const who = whoOf(opts);
+      calls.push({ who, ...opts });
+      return { text: who === '调研员' ? '无相关代码' : `发言-${calls.length}`, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const publisher = createMemoryPublisher();
+  const res = await runDiscussion({ cfg: quickCfg(), topic: '周末去杭州还是苏州', providers: { get: () => provider }, publisher, rng: () => 0, code: { ...code, auto: true } });
+  assert.match(calls[0].prompt, /已登记的仓库（议题没有指定仓库/);
+  assert.ok(publisher.posts.some((p) => p.meta?.stage === 'nocode'));
+  assert.ok(calls.slice(1).every((c) => !/## 背景资料/.test(c.system)));
+  assert.equal(res.state.context, null);
+});
+
+test('快问的调研失败不影响回答：记一行日志，不带代码接着跑', async () => {
+  const { calls, registry: providers } = recording({ failResearch: true });
+  const logs = [];
+  const res = await runDiscussion({ cfg: quickCfg(), topic: 't', providers, publisher: createMemoryPublisher(), rng: () => 0, code, log: (m) => logs.push(m) });
+  assert.deepEqual(calls.map((c) => c.who).slice(1, 3), ['A', 'C']);
+  assert.equal(calls.length, 4);
+  assert.ok(logs.some((l) => /代码调研失败，不带代码接着回答/.test(l)));
+  assert.equal(res.ending.reason, 'answered');
+});

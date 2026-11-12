@@ -313,6 +313,39 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     return { ...fixed, text };
   };
 
+  /**
+   * 调研员读代码，整理成背景资料（方案讨论开场、快问回答前）。auto：没指定仓库，调研员从登记的仓库里按内容定位，
+   * 判断不涉及代码时只回「无相关代码」，发一张「本场无代码」卡片、返回 null。
+   * required：读失败时整场不开始（方案讨论）；否则记一行日志，不带代码接着跑（快问）。
+   */
+  run.codeResearch = async ({ topic, code, knowledgeOn = false, required = true }) => {
+    const researcher = cfg.research;
+    const text = await run.speak(researcher, {
+      stage: 'research',
+      round: 0,
+      system: researchSystem(),
+      prompt: [researchPrompt({ topic, mode: cfg.mode, repos: code.repos, docs: code.docs, maxChars: researcher.maxChars, auto: code.auto }), knowledgeOn ? run.data.knowledge.block : ''].filter(Boolean).join('\n\n'),
+      callOptions: { tools: researcher.tools, addDirs: [...code.dirs, ...(knowledgeOn ? run.data.knowledge.dirs : [])], maxBudgetUsd: researcher.maxBudgetUsd, timeoutMs: researcher.timeoutMs },
+      subtitle: code.auto ? '背景资料 · 按内容定位仓库' : `背景资料 · 读了 ${code.repos.map((r) => r.alias).join('、')}`,
+    });
+    if (!text) {
+      if (required) throw new Error('代码调研失败，讨论没有开始');
+      log('⚠️ 代码调研失败，不带代码接着回答');
+      return null;
+    }
+    const cap = Math.round(researcher.maxChars * 1.5);
+    if (code.auto && /^\s*无相关代码/.test(text)) {
+      log('调研员判断内容不涉及登记的仓库，不带代码');
+      await publisher.post({ speaker: cfg.chair, title: '本场无代码', subtitle: '代码上下文', body: '调研员判断内容不涉及登记的仓库。参与者不能查代码，也不会核实代码事实；涉及代码现状的说法都按未核实处理。', meta: { stage: 'nocode' } });
+      return null;
+    }
+    return {
+      auto: Boolean(code.auto),
+      repos: code.repos,
+      text: text.length > cap ? `${text.slice(0, cap)}\n\n（资料过长，后面的部分已截断）` : text,
+    };
+  };
+
   /** 哪些发言要做写入时检查：评审（结论行、阻断）、主笔修订（立场变化）、快问和改稿的挑刺（阻断）。 */
   run.checkOf = (stage) => {
     if (!cfg.items) return null;
@@ -1253,7 +1286,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
  * @param {number} [opts.number]     讨论编号，显示在卡片上，追问时用
  */
 export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data, material, memory, setting }) {
-  if (cfg.mode === 'quick' || cfg.mode === 'redraft') return runQuick({ cfg, topic, providers, publisher, log, rng, onEvent, number, data, material, memory, setting });
+  if (cfg.mode === 'quick' || cfg.mode === 'redraft') return runQuick({ cfg, topic, providers, publisher, log, rng, onEvent, number, data, material, memory, setting, code: cfg.mode === 'quick' ? code : null });
   if (cfg.mode === 'refine' && !subject) throw new Error('打磨模式需要打磨对象（subject）');
   const tags = assignTags(cfg.participants, rng);
   const sessions = new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
@@ -1320,29 +1353,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   });
 
   // ---------- 讨论前：调研员读代码 ----------
-  let context = null;
-  if (researcher) {
-    const text = await run.speak(researcher, {
-      stage: 'research',
-      round: 0,
-      system: researchSystem(),
-      prompt: [researchPrompt({ topic, mode: cfg.mode, repos: code.repos, docs: code.docs, maxChars: researcher.maxChars, auto: code.auto }), knowledgeOn ? run.data.knowledge.block : ''].filter(Boolean).join('\n\n'),
-      callOptions: { tools: researcher.tools, addDirs: [...code.dirs, ...(knowledgeOn ? run.data.knowledge.dirs : [])], maxBudgetUsd: researcher.maxBudgetUsd, timeoutMs: researcher.timeoutMs },
-      subtitle: code.auto ? '背景资料 · 按议题定位仓库' : `背景资料 · 读了 ${code.repos.map((r) => r.alias).join('、')}`,
-    });
-    if (!text) throw new Error('代码调研失败，讨论没有开始');
-    const cap = Math.round(researcher.maxChars * 1.5);
-    if (code.auto && /^\s*无相关代码/.test(text)) {
-      log('调研员判断议题不涉及登记的仓库，不带代码讨论');
-      await publisher.post({ speaker: cfg.chair, title: '本场无代码', subtitle: '代码上下文', body: '调研员判断议题不涉及登记的仓库。参与者不能查代码，也不会核实代码事实；涉及代码现状的说法都按未核实处理。', meta: { stage: 'nocode' } });
-    } else {
-      context = {
-        auto: Boolean(code.auto),
-        repos: code.repos,
-        text: text.length > cap ? `${text.slice(0, cap)}\n\n（资料过长，后面的部分已截断）` : text,
-      };
-    }
-  }
+  let context = researcher ? await run.codeResearch({ topic, code, knowledgeOn }) : null;
 
   // ---------- 本场无代码：联网搜集资料（网页阵容选了核实员时） ----------
   const webEnabled = cfg.mode === 'decision' && !context && Boolean(cfg.research?.factChecker);
@@ -1428,7 +1439,7 @@ const memoryOut = (memory) => (memory?.domains?.length ? { domains: memory.domai
  * 不反问、不核实、不查代码；网页上选了知识来源时，索引写进提示词，能读本机文件的模型（claude-cli）可以打开正文。
  * 产出和方案讨论一样存成主文档的版本和讨论状态，结束原因记为「直接回答」：结论页、追问、升级为讨论共用一条管线。
  */
-export async function runQuick({ cfg, topic, providers, publisher, log = () => {}, rng = Math.random, onEvent = () => {}, number, data, material, memory, setting }) {
+export async function runQuick({ cfg, topic, providers, publisher, log = () => {}, rng = Math.random, onEvent = () => {}, number, data, material, memory, setting, code = null }) {
   const redraft = cfg.mode === 'redraft';
   const kind = redraft ? '改稿' : '快问';
   const tags = assignTags(cfg.participants, rng);
@@ -1443,6 +1454,8 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
   if (redraft && !String(material ?? '').trim()) throw new Error('改稿需要章节原文');
   const no = number ? ` #${number}` : '';
   const sources = run.data?.knowledge?.sources ?? [];
+  // 快问可以带代码：指定了仓库就读这些，没指定时调研员按问题定位（不涉及代码就不带）
+  const researcher = code && cfg.research ? cfg.research : null;
 
   emit({
     type: 'run_started',
@@ -1458,6 +1471,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
     participants: participants.map(brief),
     chair: { ...brief(cfg.chair), part: 'chair' },
     ...(run.data ? { data: { tools: 0, knowledge: sources } } : {}),
+    ...(researcher ? { research: { ...brief(researcher), part: 'research' }, code: { auto: Boolean(code.auto), groups: code.groups, repos: code.auto ? [] : code.repos.map(describeRepo) } } : {}),
   });
   await publisher.post({
     speaker: cfg.chair,
@@ -1470,14 +1484,16 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
       '',
       redraft
         ? `**流程**：${answerer.name}先改，${critic.name}对照原文挑刺，最后由${answerer.name}定稿：修改说明加完整的修改稿，共 3 次模型调用。结果只在页面上，自己复制回去，不写回墨稿。`
-        : `**流程**：${answerer.name}先回答，${critic.name}挑刺，最后由${answerer.name}定稿成一份短文档（回答、你可能没考虑到的、需要你补充的、下一步），共 3 次模型调用。不会停下来反问：缺的信息写在结果里，用追问补充。`,
+        : `**流程**：${researcher ? `${researcher.name ?? '调研员'}先${code.auto ? '判断问题涉及哪些登记的仓库、读相关代码（不涉及就跳过）' : '读下面的仓库'}，整理成背景资料，然后` : ''}${answerer.name}先回答，${critic.name}挑刺，最后由${answerer.name}定稿成一份短文档（回答、你可能没考虑到的、需要你补充的、下一步），共 ${researcher ? 4 : 3} 次模型调用。不会停下来反问：缺的信息写在结果里，用追问补充。`,
+      researcher && !code.auto ? `**代码上下文**：\n${code.repos.map((r) => `- ${describeRepo(r)}`).join('\n')}` : null,
       memoryLine(memory),
       sources.length ? `**知识来源**：${sources.join('、')}（索引写进提示词；${participants.filter((p) => run.readsFiles(p)).map((p) => p.name).join('、') || '没有模型'}能打开正文）` : null,
       `**内容去向**：${redraft ? '章节和设定' : '问题和材料'}会发给这两位模型所在的服务（${[...new Set(participants.map((p) => p.provider))].join('、')}），不发到群里。`,
     ].filter((l) => l !== null).join('\n'),
   });
 
-  run.shared = sharedSystem({ mode: cfg.mode, topic, material, memory: memory?.block, setting });
+  const context = researcher ? await run.codeResearch({ topic: material ? `${topic}\n\n（另附材料 ${material.length} 字，见下方）` : topic, code, knowledgeOn: Boolean(run.data?.knowledge?.dirs?.length), required: false }) : null;
+  run.shared = sharedSystem({ mode: cfg.mode, topic, material, memory: memory?.block, setting, context });
   const say = async (p, stage, task) => {
     const k = run.knowledgeFor(p);
     const session = convo ? sessions.get(p.id) : null;
@@ -1531,7 +1547,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
 
   const labels = Object.fromEntries([...tags].map(([id, t]) => [id, t.tag]));
   emit({ type: 'run_finished', stats, labels, roundsUsed: 1, ending: ending.reason });
-  const state = exportState({ number, topic, cfg, tags, shared: run.shared, context: null, code: null, facts: [], sessions, latest, rounds, lastRound: 1, summary, docs, ending, docFailed: !docs.length, budget: run.budget, blockers: [], interjections: [], data: run.data?.selection, material, memory: memoryOut(memory) });
+  const state = exportState({ number, topic, cfg, tags, shared: run.shared, context, code: context ? code : null, facts: [], sessions, latest, rounds, lastRound: 1, summary, docs, ending, docFailed: !docs.length, budget: run.budget, blockers: [], interjections: [], data: run.data?.selection, material, memory: memoryOut(memory) });
   return {
     labels,
     rounds,

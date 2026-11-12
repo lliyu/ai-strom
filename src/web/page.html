@@ -247,7 +247,7 @@ const MODE_SHORT = { decision: '方案', brainstorm: '脑洞', refine: '打磨',
 // 新建页的档位：快问、小会（方案讨论的轻量版）、方案讨论、脑洞风暴
 const TIERS = [['quick', '快问'], ['meeting', '小会'], ['decision', '方案讨论'], ['brainstorm', '脑洞风暴'], ['redraft', '改稿']];
 const TIER_HINT = {
-  quick: '一位回答、一位挑刺、回答的一方定稿，3 次模型调用，通常一两分钟。缺的信息写在结果里，用追问补充；不够深可以「升级为讨论」。',
+  quick: '一位回答、一位挑刺、回答的一方定稿，3 次模型调用，通常一两分钟。问题涉及登记的代码仓库时，先由调研员读相关代码（多一次调用、多几分钟）。缺的信息写在结果里，用追问补充；不够深可以「升级为讨论」。',
   meeting: '两位主笔、一位评审，最多 3 轮，评审都没有新意见就提前结束。',
   decision: '完整的方案讨论：可以读代码、查数据、核实事实，多轮评审直到收敛。',
   brainstorm: '主笔发散脑洞，评审盲审，多轮修订后主编挑选。',
@@ -639,8 +639,8 @@ function openForm() {
   const what = tier === 'brainstorm' ? '题目' : tier === 'quick' ? '问题' : tier === 'redraft' ? '这次想怎么改（可选）' : '议题';
   const smax = st.settingMax || 20000;
   const adv = [
-    mode === 'decision' ? `<label>代码仓库</label>
-      <input type="text" id="repos" value="${esc(f.repos || '')}" placeholder="不写：调研员按议题自己定位；写「无」：不读代码；或者写别名，逗号分隔，@ 后写分支">
+    mode === 'decision' || tier === 'quick' ? `<label>代码仓库</label>
+      <input type="text" id="repos" value="${esc(f.repos || '')}" placeholder="不写：调研员按${tier === 'quick' ? '问题' : '议题'}判断涉及哪些仓库再读（不涉及就不读）；写「无」：不读代码；或者写别名，逗号分隔，@ 后写分支">
       <div class="hint" style="margin-top:4px">可用：${esc(repoHint) || '（还没登记仓库）'}</div>` : '',
     mode === 'decision' || tier === 'quick' ? dataHtml(st, f, tier === 'quick') : '',
     tier === 'decision' || tier === 'brainstorm' ? `<label>轮数</label>
@@ -660,7 +660,7 @@ function openForm() {
       ${tier === 'redraft' ? `<label>设定与上下文（可选）<span class="hint" id="setCount" style="font-weight:400;margin-left:8px"></span></label>
       <textarea id="setting" style="min-height:70px" placeholder="人物、世界观、前情提要……用来判断改得对不对，不在修改范围内。最多 ${smax} 字。">${esc(f.setting || '')}</textarea>` : ''}
       ${memoryPickHtml(tier, f)}
-      <details class="adv" style="margin-top:12px" ${f.advOpen ? 'open' : ''}><summary>高级选项${tier === 'quick' ? '：知识来源、阵容' : tier === 'redraft' ? '：阵容' : mode === 'decision' ? '：仓库、数据与知识、阵容' : '：轮数、阵容'}</summary>${adv}</details>
+      <details class="adv" style="margin-top:12px" ${f.advOpen ? 'open' : ''}><summary>高级选项${tier === 'quick' ? '：仓库、知识来源、阵容' : tier === 'redraft' ? '：阵容' : mode === 'decision' ? '：仓库、数据与知识、阵容' : '：轮数、阵容'}</summary>${adv}</details>
       <div class="row"><button class="btn primary" id="startDiscuss">开始</button></div>
     </div>`;
   bindLineup(tier, (ok) => { $('startDiscuss').disabled = !ok; });
@@ -684,7 +684,7 @@ function openForm() {
     $('startDiscuss').disabled = true;
     try {
       const data = mode === 'decision' || tier === 'quick' ? { tools: tier !== 'quick' && Boolean(f.dataTools), knowledge: f.knowledge || [] } : undefined;
-      const body = { mode, ...(tier === 'meeting' ? { tier: 'meeting' } : {}), topic: f.topic, material: f.material, ...(tier === 'redraft' ? { setting: f.setting || '' } : {}), memory: S.status?.memory ? f.memory || [] : [], repos: mode === 'decision' ? f.repos : '', rounds: tier === 'decision' || tier === 'brainstorm' ? f.rounds : undefined, lineup: lineupPayload(tier), data, ...(tier !== 'brainstorm' && f.items !== undefined ? { items: f.items } : {}) };
+      const body = { mode, ...(tier === 'meeting' ? { tier: 'meeting' } : {}), topic: f.topic, material: f.material, ...(tier === 'redraft' ? { setting: f.setting || '' } : {}), memory: S.status?.memory ? f.memory || [] : [], repos: mode === 'decision' || tier === 'quick' ? f.repos : '', rounds: tier === 'decision' || tier === 'brainstorm' ? f.rounds : undefined, lineup: lineupPayload(tier), data, ...(tier !== 'brainstorm' && f.items !== undefined ? { items: f.items } : {}) };
       const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify(body) });
       S.form = { tier, ...(f.memoryTouched ? { memory: f.memory, memoryTouched: true } : {}) };
       await loadRuns(); openRun(number);

@@ -500,7 +500,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const jobCfg = jobConfig(mode, r, seats, base);
     // 仓库：不写 = 方案讨论自动定位；「无」= 不读代码；否则是别名列表。先校验，写错了不排队
     let repoSpecs;
-    const repoText = light ? '无' : String(repos ?? '').trim(); // 快问、改稿不读代码
+    const repoText = mode === 'redraft' ? '无' : String(repos ?? '').trim(); // 改稿不读代码；快问和方案讨论一样，不写就由调研员按内容定位
     if (repoText) {
       try {
         const specs = parseRepoSpecs(repoText);
