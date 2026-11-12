@@ -6,7 +6,7 @@ import { normalizeConfig, ConfigError } from '../config.js';
 import { lineupConfig, modelPool, roleTemplates, defaultLineup, tierLineup, MAX_SEATS, readsCode } from '../lineup.js';
 import { nextNumber, saveState, removeSessionFiles } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX, SETTING_MAX } from '../modes.js';
-import { groupKeys, critiqueDigest, blockerSummary, docSections, itemDigest } from './digest.js';
+import { groupKeys, critiqueDigest, blockerSummary, docSections, itemDigest, issueTracking } from './digest.js';
 import { listMemory, appendEntries, deleteEntry, isDomain, memoCandidates, ENTRY_MAX_CHARS } from '../memory.js';
 import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
 import { claudeSessionFile, DEFAULT_CLAUDE_CWD } from '../providers/claude-cli.js';
@@ -314,6 +314,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       // 读取时派生：结束状态、阻断区块、主文档切段（每份文档最新一版）
       outcome: outcomeOf(run),
       blockers: blockersOf(run, posts),
+      // 问题追踪：按编号串出的每个问题的经过（第三期，没有编号的讨论为 null）
+      issues: issueTracking(posts),
       docSections: sectionsOf(run, mode),
     };
   }

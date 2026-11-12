@@ -8,7 +8,7 @@ import {
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
   docSystem, docPrompt, docUpdatePrompt, docRewritePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead, docTitle, docNoOf,
   limitsFor, splitReply, overLimit, compressPrompt, replyIssues, fixReplyPrompt, rewriteDrift, stripEvidence, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
-  lineStartBlockers, isPendingBlocker, blockerStatusText, blockerEntryText,
+  lineStartBlockers, isPendingBlocker, blockerStatusText, blockerEntryText, assignIssueIds, trackIssues, reviewerNoOf,
   parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
   webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
   dataAskLine, webAlsoLine, evidenceBlock, toolCallsBlock, dataPlanPrompt, parseDataPlan, dataCheckPrompt, dataReviewPrompt,
@@ -346,6 +346,26 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     };
   };
 
+  /** 问题追踪（第三期）：条目化打开的方案讨论和打磨里，评审的【阻断】【建议】由程序编号，主笔按编号回应。 */
+  run.tracking = Boolean(cfg.items) && (cfg.mode === 'decision' || cfg.mode === 'refine');
+  /** 评审和主笔修订的发布版本，按发生顺序，给问题追踪用。 */
+  run.issueSpeeches = () => rounds.flatMap((x) => (x.stage === 'critique' || x.stage === 'review'
+    ? x.entries.map((e) => ({ stage: x.stage, round: x.round, tag: e.tag, text: e.text })) : []));
+  /** 给评审的「你提过、还没解决的问题」：最近一次发言仍在提的【阻断】。不追踪时返回 null。 */
+  run.ownIssuesFor = (p) => {
+    if (!run.tracking) return null;
+    return trackIssues(run.issueSpeeches()).issues.filter((x) => x.owner === tagOf(p) && x.status === 'current' && x.level === '阻断');
+  };
+  /** 发布前给评审发言写编号：只动正文里的【阻断】【建议】，记一条 issue_ids 事件（沿用、新分配、剥掉的个数）。 */
+  run.numberIssues = (speaker, text, round) => {
+    const own = reviewerNoOf(tagOf(speaker));
+    if (!own) return text;
+    const used = new Set(trackIssues(run.issueSpeeches()).issues.filter((x) => x.owner === tagOf(speaker)).map((x) => x.id));
+    const r = assignIssueIds(text, { own, used });
+    emit({ type: 'issue_ids', speaker: speaker.id, round, kept: r.kept.length, assigned: r.assigned.length, stripped: r.stripped });
+    return r.text;
+  };
+
   /** 哪些发言要做写入时检查：评审（结论行、阻断）、主笔修订（立场变化）、快问和改稿的挑刺（阻断）。 */
   run.checkOf = (stage) => {
     if (!cfg.items) return null;
@@ -368,6 +388,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       // 条目化开着、这类发言要检查格式时：合并检查、最多重写一次（代替单纯的压缩重写）
       const checking = cfg.items && check;
       if (checking) res = await run.checkReply(speaker, res, { stage, round, system, callOptions, session, limit, check });
+      // 编号在写入检查（和重写）之后、发布之前写上：库里、讨论记录、群卡片和主笔看到的是同一份带编号的文本
+      if (run.tracking && stage === 'critique' && res.text) res = { ...res, text: run.numberIssues(speaker, res.text, round) };
       const over = !checking && limit ? overLimit(cfg.items ? stripEvidence(res.text) : res.text, limit) : null;
       if (over) {
         log(`${speaker.name} 超出字数上限（${over}），要求压缩重写`);
@@ -751,7 +773,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: capLines(lineStartBlockers(e.text)) })).filter((x) => x.lines.length);
         const resolved = run.blockerHistory().resolved;
         const critiques = reviewers.length
-          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items }))
+          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items, ownIssues: run.ownIssuesFor(p) }))
           : [];
         markScoped(critiques);
         if (adaptive && reviewers.length && !newInterjections && reviewersDone(critiques)) {
@@ -768,6 +790,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           mode: cfg.mode,
           limits,
           items: cfg.items,
+          tracking: run.tracking,
         }));
       }
       // 「无变化」：沿用上一版完整方案；没写这个标记、发言失败或写了别的内容，都算有变化

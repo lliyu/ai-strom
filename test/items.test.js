@@ -194,7 +194,7 @@ test('重写保护：重写后结论变了、阻断变少了，发布第一次�
   const check = events.find((e) => e.type === 'reply_check' && e.stage === 'critique');
   assert.equal(check.result, 'kept-original');
   assert.match(check.drift, /评审结论/);
-  assert.match(pub.posts.find((p) => p.meta?.stage === 'critique').body, /【阻断】会超扣 ｜影响：亏钱/);
+  assert.match(pub.posts.find((p) => p.meta?.stage === 'critique').body, /【阻断】Q1-1 会超扣 ｜影响：亏钱/, '发布的是原文，编号在之后写上');
 });
 
 test('开关关着：不做格式检查，提示词不带条目格式', async () => {

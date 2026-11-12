@@ -67,11 +67,14 @@ function mockItems(stage, prompt) {
   const verdict = /评审结论：继续讨论/.test(prompt);
   if (stage.includes('评审意见')) {
     const blocking = round <= 2;
+    // 问题追踪开着时：对上一轮其他评审的阻断补充一条表态（编号照抄提示词里的）
+    const peer = /对其他评审的阻断\*\*」下面/.test(prompt) ? /### 评审 \d+\n- 【阻断】(Q\d+-\d+)/.exec(prompt)?.[1] : null;
     return [
       blocking ? '**要点**：方案 A 还有 1 条阻断，预算会超扣（mock）' : '**要点**：没有阻断了，只剩一条建议（mock）',
       '**方案 A**',
       blocking ? '- 【阻断】并发扣减时预算会超扣（mock） ｜改法：扣减时加行锁 ｜依据：推断 ｜影响：活动亏钱' : '',
       '- 【建议】补一个超扣告警（mock） ｜改法：扣减后比对余额',
+      peer ? `**对其他评审的阻断**\n- 【补充】${peer} ｜依据：推断` : '',
       verdict ? `评审结论：${blocking ? '继续讨论' : '没有意见了'}` : '',
     ].filter(Boolean).join('\n');
   }
@@ -80,7 +83,11 @@ function mockItems(stage, prompt) {
       '**要点**：采纳阻断，扣减改成加锁（mock）',
       '**改了什么**',
       '- 【改】不加锁 → 扣减时加行锁 ｜依据：推断',
-      /对评审意见的回应/.test(prompt) ? '**对评审意见的回应**\n- 【采纳】评审 1 的「并发扣减时预算会超扣」 ｜改法：扣减时加行锁' : '',
+      /对评审意见的回应/.test(prompt)
+        ? (/「- 【采纳】Q1-3 ｜改法：…」/.test(prompt)
+          ? `**对评审意见的回应**\n${[...new Set([...prompt.matchAll(/【阻断】(Q\d+-\d+)/g)].map((m) => m[1]))].map((id) => `- 【采纳】${id} ｜改法：扣减时加行锁`).join('\n')}`
+          : '**对评审意见的回应**\n- 【采纳】评审 1 的「并发扣减时预算会超扣」 ｜改法：扣减时加行锁')
+        : '',
       '**立场变化**：小幅，加了锁（mock）',
       '',
       '【完整方案】',

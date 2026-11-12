@@ -189,7 +189,12 @@ export function isBlockerLine(line) {
 // 依据不计入字数上限（压缩时最容易被删的就是它）；写入时检查格式，不合格合并重写一次，并防止立场漂移。
 
 /** 条目的级别：评审、修订、代码核实、核对主文档各用各的。 */
-export const ITEM_LEVELS = ['阻断', '建议', '改', '采纳', '不采纳', '确认', '推翻', '查不到', '漏', '错', '不清'];
+export const ITEM_LEVELS = ['阻断', '建议', '改', '采纳', '不采纳', '不同意', '补充', '确认', '推翻', '查不到', '漏', '错', '不清'];
+/**
+ * 问题编号（第三期）：「Q评审号-序号」，例如 Q1-3 是评审 1 整场的第 3 个问题。写在【级别】之后。
+ * 【阻断】【建议】上的是这个问题自己的编号；【采纳】【不采纳】【不同意】【补充】上的是引用。
+ */
+const ISSUE_ID = /^(?:\*\*)?\s*(Q(\d+)-(\d+))\b\s*(?:\*\*)?\s*[:：]?\s*/u;
 const ITEM_HEAD = new RegExp(`^(?:\\s|[-*+•]\\s|\\d+[.、)）]\\s*|\\*\\*|__)*[【\\[]\\s*(${ITEM_LEVELS.join('|')})\\s*[】\\]]\\s*(?:\\*\\*)?\\s*`, 'u');
 /** 标签段：只在「｜」后面紧跟已知标签时才切，正文里别的竖线不切。 */
 const ITEM_LABELS = { 改法: 'fix', 解决: 'fix', 怎么改: 'fix', 依据: 'evidence', 影响: 'impact', 后果: 'impact' };
@@ -216,7 +221,8 @@ export function parseItemLine(line) {
   if (!m) return null;
   const level = m[1];
   const [headRaw, ...segs] = String(line).slice(m[0].length).split(ITEM_SPLIT);
-  const item = { level, head: clean(headRaw), fix: null, evidence: null, impact: null, legacy: false };
+  const idm = ISSUE_ID.exec(headRaw.trimStart());
+  const item = { level, head: clean(idm ? headRaw.trimStart().slice(idm[0].length) : headRaw), fix: null, evidence: null, impact: null, legacy: false, ...(idm ? { id: idm[1] } : {}) };
   for (const s of segs) {
     const sm = ITEM_SEGMENT.exec(s.trim());
     if (!sm) continue;
@@ -240,9 +246,134 @@ export function parseItemLine(line) {
     item.corrected = true;
     item.head = clean(item.head.replace(/^[【\[]\s*已更正\s*[】\]]/, ''));
   }
-  if (!item.head) return null;
+  if (!item.head && !item.id) return null;
   item.evidenceKind = evidenceKind(item.evidence);
   return item;
+}
+
+// ---------- 问题编号与跨轮追踪（第三期，条目化打开的方案讨论和打磨） ----------
+
+/** 评审代号里的序号：「评审 2」→ 2。 */
+export const reviewerNoOf = (tag) => Number(/评审\s*(\d+)/.exec(String(tag ?? ''))?.[1]) || null;
+const issueOwner = (id) => Number(/^Q(\d+)-/.exec(id)?.[1]);
+const issueSeq = (id) => Number(/^Q\d+-(\d+)$/.exec(id)?.[1]);
+
+/** 要点之后、【完整方案】之前的行号范围（编号只写在这一段，和页面解析条目的范围一致）。 */
+function bodyRange(lines) {
+  let end = lines.findIndex((l) => PLAN_LINE.test(l));
+  if (end < 0) end = lines.length;
+  let start = 0;
+  const at = lines.slice(0, 3).findIndex((l) => BRIEF_HEAD.test(l));
+  if (at >= 0) {
+    start = at + 1;
+    while (start < end && !(BOLD_HEAD.test(lines[start]) || /^\s*#{1,6}\s/.test(lines[start]))) start += 1;
+  }
+  return [start, end];
+}
+
+/**
+ * 给一条评审发言的【阻断】【建议】写上编号（发布前由程序做，模型不自己编号）。
+ * 评审写了自己的、之前出现过的、这条发言里第一次出现的编号就保留（仍坚持的旧问题）；
+ * 别人的、不存在的、重复的编号剥掉，和没写编号的一样按新问题从「已有最大序号 + 1」起分配。
+ * own：评审序号；used：这位评审之前发言里出现过的编号。返回 { text, kept, assigned, stripped: [{ id, reason }] }。
+ */
+export function assignIssueIds(text, { own, used = new Set() }) {
+  const lines = String(text ?? '').split('\n');
+  const [start, end] = bodyRange(lines);
+  let next = Math.max(0, ...[...used].filter((id) => issueOwner(id) === own).map(issueSeq)) + 1;
+  const seen = new Set();
+  const out = { kept: [], assigned: [], stripped: [] };
+  let fence = false;
+  for (let i = start; i < end; i += 1) {
+    if (/^\s*(```|~~~)/.test(lines[i])) {
+      fence = !fence;
+      continue;
+    }
+    if (fence) continue;
+    const item = parseItemLine(lines[i]);
+    if (!item || (item.level !== '阻断' && item.level !== '建议')) continue;
+    if (item.id && issueOwner(item.id) === own && used.has(item.id) && !seen.has(item.id)) {
+      seen.add(item.id);
+      out.kept.push(item.id);
+      continue;
+    }
+    if (item.id) out.stripped.push({ id: item.id, reason: issueOwner(item.id) !== own ? '别人的编号' : seen.has(item.id) ? '重复' : '不存在' });
+    const id = `Q${own}-${next}`;
+    next += 1;
+    const m = ITEM_HEAD.exec(lines[i]);
+    const prefix = lines[i].slice(0, m.index + m[0].length).replace(/\s+$/, '');
+    let rest = lines[i].slice(m.index + m[0].length).trimStart();
+    const idm = ISSUE_ID.exec(rest);
+    if (idm) rest = rest.slice(idm[0].length);
+    lines[i] = `${prefix}${id} ${rest}`;
+    seen.add(id);
+    out.assigned.push(id);
+  }
+  return { text: lines.join('\n'), ...out };
+}
+
+/**
+ * 按编号把问题串成时间线。speeches：按发生顺序的评审（critique）和主笔修订（review）发言 [{ stage, round, tag, body }]，
+ * body 是要点之后的正文。返回 { issues: [...], invalid: [...] }，没有任何编号时 issues 为空。
+ * 每个问题：id、owner（评审代号）、level（最近一次的级别）、head、section、raised（首次提出的轮次）、
+ * mentions（原评审提到它的轮次）、responses（主笔称采纳 / 不采纳）、stances（其他评审不同意 / 补充）、
+ * status：current（原评审最近一次发言仍在提）/ dropped（原评审之后发言没再提，after 写之前主笔的处理：accepted / rejected / unanswered）。
+ * invalid：引用了不存在、或不是原评审自己的编号。
+ */
+export function trackIssues(speeches) {
+  const issues = new Map();
+  const invalid = [];
+  const critiques = new Map(); // 评审序号 → 发言序号列表
+  speeches.forEach((s, n) => {
+    const items = parseItems(s.body ?? splitReply(s.text).detail);
+    if (s.stage === 'critique') {
+      const own = reviewerNoOf(s.tag);
+      if (!critiques.has(own)) critiques.set(own, []);
+      critiques.get(own).push(n);
+      for (const it of items) {
+        if (!it.id) continue;
+        if (it.level === '阻断' || it.level === '建议') {
+          if (issueOwner(it.id) !== own) {
+            invalid.push({ id: it.id, round: s.round, tag: s.tag, kind: it.level });
+            continue;
+          }
+          const issue = issues.get(it.id) ?? { id: it.id, owner: s.tag, raised: s.round, mentions: [], responses: [], stances: [] };
+          issue.level = it.level;
+          issue.head = it.head;
+          issue.section = it.section ?? issue.section ?? null;
+          issue.mentions.push({ n, round: s.round, level: it.level, head: it.head });
+          issues.set(it.id, issue);
+        } else if (it.level === '不同意' || it.level === '补充') {
+          if (issues.has(it.id)) issues.get(it.id).stances.push({ n, round: s.round, tag: s.tag, kind: it.level, note: it.evidence ?? it.head ?? null });
+          else invalid.push({ id: it.id, round: s.round, tag: s.tag, kind: it.level });
+        }
+      }
+    } else if (s.stage === 'review') {
+      for (const it of items) {
+        if (!it.id || (it.level !== '采纳' && it.level !== '不采纳')) continue;
+        if (issues.has(it.id)) issues.get(it.id).responses.push({ n, round: s.round, tag: s.tag, kind: it.level, note: it.fix ?? it.evidence ?? it.head ?? null });
+        else invalid.push({ id: it.id, round: s.round, tag: s.tag, kind: it.level });
+      }
+    }
+  });
+  const list = [...issues.values()].map((x) => {
+    const last = x.mentions.at(-1);
+    const later = (critiques.get(issueOwner(x.id)) ?? []).filter((n) => n > last.n);
+    const after = x.responses.filter((r) => r.n > last.n);
+    const handled = after.length ? (after.some((r) => r.kind === '不采纳') ? 'rejected' : 'accepted') : 'unanswered';
+    const strip = ({ n, ...rest }) => rest;
+    return {
+      ...x,
+      mentions: x.mentions.map(strip),
+      responses: x.responses.map(strip),
+      stances: x.stances.map(strip),
+      lastRound: last.round,
+      handled,
+      latestResponses: after.map(strip),
+      status: later.length ? 'dropped' : 'current',
+    };
+  });
+  return { issues: list, invalid };
 }
 
 /** 一段发言里的全部条目：[{ level, head, fix, evidence, impact, evidenceKind, legacy, section }]；section 是所在的加粗小节标题。代码块里的不算。 */
@@ -828,13 +959,31 @@ function planned(entries) {
  * 评审互见：上一轮其他评审提的【阻断】原文。只贴那几行，不贴整段意见；
  * 评审只对不同意的、或能补充证据的条目表态，同意的不用重复。
  */
-export function peersBlock(peers = []) {
+export function peersBlock(peers = [], { tracking = false } = {}) {
   if (!peers.length) return '';
   return [
     '## 上一轮其他评审提的阻断（原文，匿名）',
     ...peers.map((x) => `### ${x.tag}\n${x.lines.join('\n')}`),
     '',
-    '对这些阻断，你只需对不同意的、或能补充证据的条目表态，每条一行：「对评审 N 的『……』：不同意 / 补充：理由或证据」。同意的不用重复，也不用逐条回应。主笔对这些阻断的回应在方案的修订说明里。',
+    tracking
+      ? '对这些阻断，你只需对不同意的、或能补充证据的条目表态：在单独一行加粗的「**对其他评审的阻断**」下面，每条一行「- 【不同意】编号 ｜依据：…」或「- 【补充】编号 ｜依据：…」，编号照抄上面的（例如 Q2-1）。同意的不用写，也不要把别人的问题当成自己的【阻断】再提一遍。主笔对这些阻断的回应在方案的修订说明里。'
+      : '对这些阻断，你只需对不同意的、或能补充证据的条目表态，每条一行：「对评审 N 的『……』：不同意 / 补充：理由或证据」。同意的不用重复，也不用逐条回应。主笔对这些阻断的回应在方案的修订说明里。',
+  ].join('\n');
+}
+
+/**
+ * 你提过、还没解决的问题（第三期）：这位评审最近一次发言里仍在提的【阻断】，附上主笔之后怎么处理的。
+ * 清单由程序从发布的版本生成：会话里存的是模型的原始回答，没有编号，也可能不是发布的那一版。
+ */
+export function ownIssuesBlock(issues = []) {
+  const handled = (x) => (x.latestResponses?.length
+    ? x.latestResponses.map((r) => `${r.tag}${r.kind === '采纳' ? '称采纳' : `不采纳${r.note ? `：${r.note}` : ''}`}`).join('；')
+    : '主笔未回应');
+  return [
+    '## 你提过、还没解决的问题（以这张清单为准，不以会话里的旧发言为准）',
+    issues.length ? issues.map((x) => `- ${x.id}【${x.level}】${x.head}${x.section ? `（${x.section}）` : ''} · 主笔：${handled(x)}`).join('\n') : '（没有）',
+    '',
+    '问题编号由程序写。新问题不要写编号。仍然坚持上面某个问题时，在级别后面写它的原编号，例如「- 【阻断】Q1-3 ……」，改法和依据可以更新；主笔称采纳、你核对后认为确实改好了，就不用再提。不要把其他评审的编号写在你的【阻断】【建议】上。',
   ].join('\n');
 }
 
@@ -855,13 +1004,15 @@ export function resolvedBlock(resolved = []) {
 }
 
 /** 评审：不出自己的方案，只给主笔的方案挑问题，并分级。 */
-export function critiquePrompt({ topic, round, proposals, peers = [], resolved = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false }) {
+export function critiquePrompt({ topic, round, proposals, peers = [], resolved = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false, ownIssues = null }) {
+  const tracking = items && ownIssues !== null;
   const refine = mode === 'refine';
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.critique}】`,
     scopeBlock(scope, { once: convo }),
     `## 待评审的${refine ? '修改' : ''}方案（匿名）\n${planned(proposals)}`,
-    peersBlock(peers),
+    tracking && (ownIssues.length || round > 2) ? ownIssuesBlock(ownIssues) : '',
+    peersBlock(peers, { tracking }),
     resolvedBlock(resolved),
     interjectionBlock(interjections),
     [
@@ -876,14 +1027,14 @@ export function critiquePrompt({ topic, round, proposals, peers = [], resolved =
       `按下面的结构${limits ? `，全文不超过 ${limits.critique} 字${items ? '（依据不计）' : ''}` : ''}：`,
       items ? `${briefLine('还有几条阻断级问题、最要紧的是哪条')}。要点里只用文字说，不写【阻断】【建议】这类标记` : briefLine('还有几条阻断级问题、最要紧的是哪条'),
       items
-        ? `然后按方案代号分组：每组单独一行加粗的方案代号（例如「**方案 A**」），下面是条目，条目不要直接接在要点后面。没有新问题的方案在代号下写「无新问题」。\n${itemFormat({ levels: '【阻断】【建议】', need: '- 【阻断】必须写改法和依据。' })}`
+        ? `然后按方案代号分组：每组单独一行加粗的方案代号（例如「**方案 A**」），下面是条目，条目不要直接接在要点后面。没有新问题的方案在代号下写「无新问题」。\n${itemFormat({ levels: '【阻断】【建议】', need: `- 【阻断】必须写改法和依据。${tracking ? '\n- 问题编号由程序在发布前写上，新问题不要自己编号；仍坚持的旧问题写原编号（见上面的清单）。' : ''}` })}`
         : '然后按方案代号分组，每个问题一行：「【阻断】问题 → 后果 → 怎么改」。没有新问题的方案写「无新问题」。',
       askVerdict ? verdictInstruction(round, mode, { graded: true }) : '',
     ].filter(Boolean).join('\n'),
   );
 }
 
-export function reviewPrompt({ topic, round, own, others, critiques = [], interjections, context, convo = false, mode, limits = limitsFor(mode), items = false }) {
+export function reviewPrompt({ topic, round, own, others, critiques = [], interjections, context, convo = false, mode, limits = limitsFor(mode), items = false, tracking = false }) {
   const hasOthers = others.length > 0;
   const plan = mode === 'refine' ? '修改方案' : '方案';
   return join(
@@ -900,7 +1051,9 @@ export function reviewPrompt({ topic, round, own, others, critiques = [], interj
         ? '**改了什么**（每条一行：「- 【改】原来… → 现在… ｜依据：…」；依据只写代码坐标「仓库别名:路径:行号」、「第 N 轮核实第 K 条」、资料或「推断」，不计入字数；没改写「无变化」）'
         : '**改了什么**（每条一行：「原来… → 现在… · 原因」；没改写「无变化」）',
       critiques.length
-        ? (items
+        ? (items && tracking
+          ? '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，按问题编号每条一行：「- 【采纳】Q1-3 ｜改法：…」或「- 【不采纳】Q1-3 ｜依据：…」，编号照抄评审意见里的；不采纳必须带依据）'
+          : items
           ? '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「- 【采纳】评审 N 的「问题开头几个字」 ｜改法：…」或「- 【不采纳】评审 N 的「…」 ｜依据：…」；不采纳必须带依据）'
           : '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「采纳」或「不采纳：理由」）')
         : '',

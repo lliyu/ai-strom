@@ -195,6 +195,12 @@
   .unv { font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 4px; padding: 0 4px; margin-left: 4px; white-space: nowrap; }
   .cp { font-size: 11px; border: 1px solid var(--line); background: none; border-radius: 4px; color: var(--muted); cursor: pointer; padding: 0 5px; margin-left: 4px; }
   .mism { font-size: 12px; color: var(--warn); margin-top: 4px; }
+  /* 第三期：问题编号和时间线 */
+  .qid { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; white-space: nowrap; flex: none; }
+  .iss { margin-top: 8px; } .iss .ih { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+  .iss .tl { font-size: 12px; color: var(--muted); margin: 2px 0 0 4px; }
+  .ist { font-size: 11px; border-radius: 999px; padding: 0 7px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .ist.cur { border-color: var(--err); color: var(--err); }
   /* 只看阻断：只留有行首阻断的发言和阻断条目，折叠的轮也展开 */
   .only-block .post:not(.has-blocker), .only-block .divider, .only-block .grp:not(:has(.has-blocker)) { display: none; }
   .only-block .grp.closed > .gb { display: block; } .only-block .grp.closed > .gh .caret::before { content: '▾'; }
@@ -817,7 +823,7 @@ function evidenceHtml(it) {
 }
 function itemHtml(it) {
   const lv = `<span class="lvb ${LV_BAD.has(it.level) ? 'bad' : LV_GOOD.has(it.level) ? 'good' : ''}">${esc(it.level)}${it.corrected ? '·已更正' : ''}</span>`;
-  const head = `${lv}<span>${inline(it.head)}${it.evidenceKind === 'guess' ? '<span class="unv">推断</span>' : ''}</span>`;
+  const head = `${lv}${it.id ? `<span class="qid">${esc(it.id)}</span>` : ''}<span>${inline(it.head)}${it.evidenceKind === 'guess' ? '<span class="unv">推断</span>' : ''}</span>`;
   const parts = [it.fix && `<div><b>改法</b>${inline(it.fix)}</div>`, evidenceHtml(it), it.impact && `<div><b>影响</b>${inline(it.impact)}</div>`].filter(Boolean);
   return parts.length
     ? `<details class="it lv-${esc(it.level)}"><summary>${head}</summary><div class="ib">${parts.join('')}</div></details>`
@@ -1084,6 +1090,36 @@ function blockerMarkdown(b, rows, title) {
   }
   return out.join('\n');
 }
+// ---------- 问题追踪：每个编号一条时间线。措辞保持中性：「称采纳」「没再提」，不写「已解除」 ----------
+const ISSUE_AFTER = { accepted: '称采纳后没再提', rejected: '不采纳后没再提', unanswered: '未回应后没再提' };
+function issueStatus(x) {
+  if (x.status === 'dropped') return `<span class="ist">${ISSUE_AFTER[x.handled]}</span>`;
+  return `<span class="ist cur">仍在提${x.handled === 'unanswered' ? ' · 主笔未回应' : x.handled === 'rejected' ? ' · 主笔不采纳' : ' · 主笔称采纳，待评审确认'}</span>`;
+}
+function issueTimeline(x) {
+  const ev = [
+    ...x.mentions.map((m, i) => ({ round: m.round, rank: 0, text: `第 ${m.round} 轮 ${esc(x.owner)} ${i === 0 ? `提出${x.section ? `（${esc(x.section)}）` : ''}` : `仍坚持${m.level !== x.mentions[i - 1].level ? `（改为${esc(m.level)}）` : ''}`}` })),
+    ...x.stances.map((s) => ({ round: s.round, rank: 1, text: `第 ${s.round} 轮 ${esc(s.tag)} ${s.kind}${s.note ? `：${inline(s.note)}` : ''}` })),
+    ...x.responses.map((r) => ({ round: r.round, rank: 2, text: `${esc(r.tag)} ${r.kind === '采纳' ? '称采纳' : '不采纳'}${r.note ? `：${inline(r.note)}` : ''}` })),
+  ].sort((a, b) => a.round - b.round || a.rank - b.rank);
+  if (x.status === 'dropped') ev.push({ text: `${esc(x.owner)} 之后没再提` });
+  return ev.map((e) => e.text).join(' → ');
+}
+function issueRow(x) {
+  return `<div class="iss"><div class="ih"><span class="qid">${esc(x.id)}</span><span class="lvb ${x.level === '阻断' ? 'bad' : ''}">${esc(x.level)}</span><span>${inline(x.head || '')}</span>${issueStatus(x)}</div><div class="tl">${issueTimeline(x)}</div></div>`;
+}
+function issuesBoxHtml(t) {
+  if (!t?.issues?.length) return '';
+  const order = (a, b) => (a.status === b.status ? 0 : a.status === 'current' ? -1 : 1);
+  const blocks = t.issues.filter((x) => x.level === '阻断').sort(order);
+  const sugg = t.issues.filter((x) => x.level !== '阻断').sort(order);
+  const cur = blocks.filter((x) => x.status === 'current').length;
+  return `<div class="card" id="issueBox"><h3>问题追踪<span class="hint">阻断 ${blocks.length} 个，评审最近一次仍在提 ${cur} 个；建议 ${sugg.length} 个</span></h3>
+    ${blocks.length ? blocks.map(issueRow).join('') : '<div class="hint">没有编号的阻断。</div>'}
+    ${sugg.length ? `<details style="margin-top:8px"><summary>建议（${sugg.length}）</summary>${sugg.map(issueRow).join('')}</details>` : ''}
+    ${t.invalid?.length ? `<div class="hint" style="margin-top:8px">引用无效：${t.invalid.map((v) => `${esc(v.tag)} 第 ${v.round} 轮的【${esc(v.kind)}】${esc(v.id)}`).join('；')}（编号不存在，或沿用了别人的编号）</div>` : ''}
+    <div class="hint" style="margin-top:6px">「称采纳」是主笔自己说的，程序不核对方案是否真的改了；「没再提」不代表已经解决。</div></div>`;
+}
 function blockerBoxHtml(b, o) {
   if (!b) return '';
   const title = b.beforeVerdict ? '裁决前评审仍提的阻断' : '评审最后仍提的阻断';
@@ -1138,7 +1174,7 @@ async function saveMemo(btn) {
 function conclHtml(r, status) {
   const live = status === 'running' || status === 'queued';
   const secs = r.docSections || [];
-  if (!secs.length) return `<div class="card hint">${live ? '讨论结束后生成。' : '这场讨论没有主文档。'}</div>${live ? '' : blockerBoxHtml(r.blockers, r.outcome)}`;
+  if (!secs.length) return `<div class="card hint">${live ? '讨论结束后生成。' : '这场讨论没有主文档。'}</div>${live ? '' : blockerBoxHtml(r.blockers, r.outcome)}${issuesBoxHtml(r.issues)}`;
   // 一场讨论可以有几份文档：和「文档」页共用选中的那份，默认最近改过的
   const docs = r.docs || [];
   const nos = secs.map((s) => s.docNo);
@@ -1152,6 +1188,7 @@ function conclHtml(r, status) {
       ${r.outcome?.followUpStatus === 'failed' ? '<div class="warn" style="color:var(--warn)">最近一次追问没有完成，结束原因取的是前一次。</div>' : ''}
       ${typeof r.outcome?.facts === 'number' ? `<div class="hint">讨论中核实了 ${r.outcome.facts} 个问题。</div>` : ''}</div>
     ${blockerBoxHtml(r.blockers, r.outcome)}
+    ${issuesBoxHtml(r.issues)}
     <div class="row"><button class="btn" data-sub="doc">看全文（第 ${s.version} 版）</button></div>`;
   if (s.failed && r.mode === 'quick') return `${head}<div class="banner warn">未能提取结论，下面显示全文。</div><div class="card">${md(doc?.text || '')}</div><div class="row"><button class="btn primary" data-upgrade="1">升级为讨论</button></div>`;
   if (s.failed && r.mode !== 'redraft') return `${head}<div class="banner warn">未能提取结论（主文档里缺少：${esc((s.missing || []).map((k) => ({ points: '要点', decisions: '要拍板的事', next: '下一步' }[k] || k)).join('、') || '大纲')}），下面显示全文。</div><div class="card">${md(doc?.text || '')}</div>${tail}`;

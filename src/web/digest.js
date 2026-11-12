@@ -1,4 +1,4 @@
-import { isBlockerLine, parseVerdict, parseItems, parseItemLine, lineStartBlockers } from '../modes.js';
+import { isBlockerLine, parseVerdict, parseItems, parseItemLine, lineStartBlockers, trackIssues } from '../modes.js';
 
 /**
  * 网页读取时派生的结构化信息：发言分组、评审结论与阻断、主文档切段、阻断区块。
@@ -137,6 +137,19 @@ export function itemDigest({ stage, brief, body, error }) {
     if (said !== null && items.length && said !== bodyBlockers) out.itemsMismatch = { brief: said, body: bodyBlockers };
   }
   return out;
+}
+
+// ---------- 问题追踪（第三期）：按编号把问题串成时间线 ----------
+
+/**
+ * 全场（含各次追问）的评审和主笔修订，按编号串出每个问题的经过。posts 已按显示顺序排好。
+ * 没有任何编号（旧讨论、没开条目化）时返回 null，页面照旧按评审显示阻断。
+ */
+export function issueTracking(posts) {
+  const speeches = posts.filter((p) => (p.stage === 'critique' || p.stage === 'review') && !p.error)
+    .map((p) => ({ stage: p.stage, round: p.round, tag: p.tag, body: p.body ?? '' }));
+  const t = trackIssues(speeches);
+  return t.issues.length || t.invalid.length ? t : null;
 }
 
 // ---------- 主文档切段 ----------
