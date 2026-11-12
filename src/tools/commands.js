@@ -4,6 +4,7 @@ import { loadCommandTools } from './manifest.js';
 import { runCommandTool } from './run.js';
 import { mcpSetup, allowedToolsNote, ROOT } from './index.js';
 import { createProviderRegistry } from '../providers/index.js';
+import { inspectKnowledge, knowledgeSetup } from '../knowledge.js';
 
 /** node src/cli.js tools：列出命令行工具（含跳过的）和登记的 MCP 服务。 */
 export function listTools(cfg) {
@@ -62,6 +63,16 @@ export async function callTool(cfg, id, pairs) {
   return out.ok ? 0 : 1;
 }
 
+/** node src/cli.js knowledge：列出知识来源、索引和文档数。 */
+export function listKnowledge(cfg) {
+  for (const s of inspectKnowledge(cfg.knowledge)) {
+    console.log(`${s.exists ? '✅' : '❌'} ${s.name}${s.description ? `：${s.description}` : ''}\n   ${s.path}${s.exists ? `（${s.docs} 篇 Markdown）` : '（目录不存在）'}`);
+    if (!s.exists) continue;
+    for (const i of s.indexes) console.log(`   ${i.exists ? '索引' : '❌ 缺索引'} ${i.file}${i.exists ? `（${i.chars} 字）` : ''}`);
+  }
+  return 0;
+}
+
 /**
  * node src/cli.js tools try "<问题>" [--model sonnet]：让模型带着全部数据工具回答一个问题，
  * 端到端检查网关、MCP 服务和登录态。调用记录写在 runs/.tools/。
@@ -79,10 +90,14 @@ export async function tryTools(cfg, question, { model } = {}) {
     ?? Object.entries(cfg.providers).find(([, p]) => p.type === 'claude-cli')?.[0]
     ?? 'claude-cli';
   const provider = createProviderRegistry(cfg).get(providerName);
-  const system = '你在用数据工具回答问题。只用放行的工具，不要编造数据；查不到或工具报错时如实说明，并写出你用的查询条件。';
-  const prompt = `${allowedToolsNote(setup)}\n\n**问题**\n${question}`;
-  console.log(`放行 ${setup.allowed.length} 个工具，模型 ${model ?? '默认'}，调用记录：${path.relative(process.cwd(), logFile)}\n`);
-  const res = await provider.complete({ model, system, prompt, mcp: setup, timeoutMs: (cfg.dataTools.timeoutSec + 300) * 1000 });
+  const know = knowledgeSetup(cfg.knowledge);
+  const system = '你在用数据工具和业务知识回答问题。只用放行的工具，不要编造数据；查不到或工具报错时如实说明，并写出你用的查询条件。';
+  const prompt = [allowedToolsNote(setup), know.block, `**问题**\n${question}`].filter(Boolean).join('\n\n');
+  console.log(`放行 ${setup.allowed.length} 个工具，知识来源 ${know.sources.join('、') || '无'}，模型 ${model ?? '默认'}，调用记录：${path.relative(process.cwd(), logFile)}\n`);
+  const res = await provider.complete({
+    model, system, prompt, mcp: setup, timeoutMs: (cfg.dataTools.timeoutSec + 300) * 1000,
+    ...(know.dirs.length ? { tools: ['Read', 'Grep', 'Glob'], addDirs: know.dirs } : {}),
+  });
   console.log(res.text);
   console.log(`\n工具调用 ${res.toolCalls?.length ?? 0} 次：`);
   for (const c of res.toolCalls ?? []) {

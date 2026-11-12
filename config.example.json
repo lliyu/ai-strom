@@ -155,6 +155,13 @@
       ]
     }
   },
+  "knowledge": {
+    "hotel": {
+      "path": "/path/to/insight/domains/hotel",
+      "index": ["knowledge/INDEX.md", "playbooks/INDEX.md"],
+      "description": "领域知识与排查 Playbook（只读）"
+    }
+  },
   "dataTools": {
     "dir": "local/tools",
     "timeoutSec": 120,

@@ -71,6 +71,7 @@
 | `models` | 可选，只给网页阵容用的额外模型：`id`、`name`、`provider`、`model`、`effort`、`color`、`contextWindow`。不在群里发言，不需要 `webhook`，见[选阵容](#选阵容) |
 | `roleTemplates` | 可选，网页上的角色模板：`[{ name, persona, modes }]`，追加到内置模板后面，同名的覆盖内置的；`modes` 不写表示所有模式都列在前面 |
 | `providers` | 模型接入方式，见下文 |
+| `knowledge` | 可选，知识来源：`{ 名字: { path, index, description } }`；`local`（`local/knowledge`）总会带上，见[知识来源](#知识来源) |
 | `dataTools` | 可选，查数据用的工具：`dir`（命令行工具目录，默认 `local/tools`）、`timeoutSec`、`maxOutputChars`、`mcpServers`（现成的 MCP 服务，各带 `allow`），见[数据工具](#数据工具) |
 | `lark.interjection` | 插话读取：`enabled`、`chatId`（oc_ 开头）、`allowFrom`（只收这些 open_id 的消息，留空表示群里所有人） |
 
@@ -247,6 +248,34 @@ node src/cli.js tools try "列出 dbx 里的数据库连接" --model sonnet  # �
 ```
 
 `tools try` 的调用记录在 `runs/.tools/`。MCP 服务要登录的（例如靠 cookie 的 `headersHelper`），登录过期时服务连不上，`tools try` 会如实报告；先刷新登录再试。
+
+## 知识来源
+
+给调研员、核实员读的业务知识（Markdown 目录），和数据工具一起用：先从知识里知道该查哪张表、时间列是什么时区、某类问题怎么排查，再去查实时数据。
+
+- **登记**：`config.json` 的 `knowledge`，可以有多个来源，例如 insight 的 hotel 领域知识：
+
+  ```json
+  "knowledge": {
+    "hotel": {
+      "path": "/path/to/insight/domains/hotel",
+      "index": ["knowledge/INDEX.md", "playbooks/INDEX.md", "business-index.md"],
+      "description": "insight 的 hotel 领域知识与排查 Playbook（只读，由 insight 维护）"
+    }
+  }
+  ```
+
+  `path` 可以是绝对路径、`~/` 或相对 ai-storm 目录；`index` 是索引文件（相对 `path`），默认 `["INDEX.md"]`。
+- **local 来源**：`local/knowledge`（不进仓库）固定登记为 `local`，放不适合进 insight 的内容：跨领域的、个人整理的、还在验证的、讨论里查实的结论。约定：`INDEX.md` 每篇一行（文档、讲什么、什么时候看），文档按 `_template.md` 写 frontmatter（`title`、`summary`、`status`、`updated`、`evidence`）。目前只手工维护。
+- **怎么交给模型**：各来源的索引写进提示词（每个索引最多 12000 字，超出的部分提示用 Read 打开），目录用 `--add-dir` 放行，模型按需用 Read / Grep / Glob 打开具体文档。ai-storm 只读这些目录，从不写入其他来源。
+- **读法写在提示词里**：先看索引；引用写「来源名:相对路径」；知识和代码、实时数据不一致时以实时证据为准，并写明不一致；不同来源冲突时两边都列出来，不替人挑一边。
+
+```bash
+node src/cli.js knowledge          # 各来源的目录、索引、文档数
+node src/cli.js tools try "hotel 订单表的时间列是什么时区" --model sonnet   # 带着知识和数据工具回答
+```
+
+> 目前完成了登记、索引和读法，`tools try` 已经带上知识。接入讨论流程（核实员、调研员查证时带知识，网页上选来源）在下一批。
 
 ## 主文档
 
@@ -467,7 +496,7 @@ lark-cli im +chat-search --query "<群名>" --as user
 
 | 路径 | 内容 |
 |---|---|
-| `src/cli.js` | 命令行入口：`discuss`、`followup`、`check`、`send-test`、`watch`、`repos`、`web`、`tools` |
+| `src/cli.js` | 命令行入口：`discuss`、`followup`、`check`、`send-test`、`watch`、`repos`、`web`、`tools`、`knowledge` |
 | `src/runner.js` | 跑一场讨论或追问：命令行、群监听和网页共用 |
 | `src/budget.js` | 主席输入预算：按预算从新到旧装填讨论记录和核实结果 |
 | `src/lineup.js` | 网页上的自选阵容：模型清单、角色模板、按阵容生成配置、存进 state 供追问 |
@@ -477,6 +506,7 @@ lark-cli im +chat-search --query "<群名>" --as user
 | `src/orchestrator.js` | 讨论编排：匿名代号、轮次、失败处理、主文档（写、核对、追问后更新、补写）与代号对照 |
 | `src/modes.js` | 三种模式的阶段和提示词，修订版解析 |
 | `src/repos.js` | 代码上下文：仓库别名解析、分支快照导出 |
+| `src/knowledge.js` | 知识来源：登记、索引、写进提示词的读法与冲突规则 |
 | `src/tools/` | 数据工具：清单 `manifest.js`、执行 `run.js`、MCP 网关 `gateway.js`、配置与放行名单 `index.js`、命令 `commands.js` |
 | `local/` | 本机的数据工具和知识库，不进仓库 |
 | `src/pricing.js` | 接口不返回费用时按配置价格估算 |

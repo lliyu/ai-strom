@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { normalizeDataTools } from './tools/index.js';
+import { normalizeKnowledge } from './knowledge.js';
 
 export const CARD_COLORS = [
   'blue', 'wathet', 'turquoise', 'green', 'yellow', 'orange',
@@ -123,6 +124,7 @@ export function normalizeConfig(raw, overrides = {}) {
   applyModePersonas(cfg, errors);
   normalizeRepos(cfg, errors);
   normalizeDataTools(cfg, errors);
+  normalizeKnowledge(cfg, errors);
 
   // 打磨（refine）用的墨稿接口与本地网页
   cfg.novel = { baseUrl: 'http://127.0.0.1:3000', timeoutMs: 60000, ...(cfg.novel ?? {}) };
