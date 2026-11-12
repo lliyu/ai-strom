@@ -71,6 +71,7 @@
 | `models` | 可选，只给网页阵容用的额外模型：`id`、`name`、`provider`、`model`、`effort`、`color`、`contextWindow`。不在群里发言，不需要 `webhook`，见[选阵容](#选阵容) |
 | `roleTemplates` | 可选，网页上的角色模板：`[{ name, persona, modes }]`，追加到内置模板后面，同名的覆盖内置的；`modes` 不写表示所有模式都列在前面 |
 | `providers` | 模型接入方式，见下文 |
+| `dataTools` | 可选，查数据用的工具：`dir`（命令行工具目录，默认 `local/tools`）、`timeoutSec`、`maxOutputChars`、`mcpServers`（现成的 MCP 服务，各带 `allow`），见[数据工具](#数据工具) |
 | `lark.interjection` | 插话读取：`enabled`、`chatId`（oc_ 开头）、`allowFrom`（只收这些 open_id 的消息，留空表示群里所有人） |
 
 卡片标题颜色可选：`blue wathet turquoise green yellow orange red carmine violet purple indigo grey`。
@@ -190,6 +191,62 @@ node src/cli.js repos        # 列出登记的仓库和组，以及各仓库当�
 搜索关键词不带公司内部的系统名、服务名、项目代号、内部数据和人名（搜不到，也不该外发），这一条写在主席、核实员和调研员的提示词里。属于公司内部信息的问题，核实员直接回答「公开资料回答不了」。联网资料不算代码：主文档里仍然注明「本场无代码」。
 
 工具名和字数上限可以在 `research.webTools`（默认 `["WebSearch", "WebFetch"]`）和 `research.webMaxChars`（默认 8000）里改。claude CLI 在 `--restricted` 模式下默认去掉 WebFetch，程序用 `--tools` 显式写上它。
+
+## 数据工具
+
+给调研员和核实员查日志、数据库、监控用的工具。主笔、评审和主席不直接用工具，只看到审查后的结论。
+
+> 目前完成了工具层：登记、只读边界、调用记录，以及命令行里的列出、试调和端到端检查。接入讨论流程（主席判断要不要查数据、核实员查、调研员审查）在后续批次。
+
+工具有两种来源：
+
+- **命令行工具**：放在 `local/tools/`（整个 `local/` 不进仓库）。`tools.json` 登记工具，脚本放在同一目录，用什么语言写都行。程序起一个本地 MCP 网关（`src/tools/gateway.js`）把它们交给 claude CLI；调研员仍然不开 Bash，只能执行登记过的命令、填登记过的参数。
+- **现成的 MCP 服务**：登记在 `config.json` 的 `dataTools.mcpServers`，写法和 Claude Code 的 `mcpServers` 一样（支持 `headersHelper`），另加 `allow` 列出允许调用的工具名，只放只读的。
+
+`tools.json` 的一条：
+
+```json
+{
+  "id": "room-stock",
+  "description": "查某家酒店某天的房量；有酒店 id 和日期时用",
+  "effect": "read",
+  "command": ["node", "room-stock.js"],
+  "params": [
+    { "name": "hotel-id", "required": true, "description": "酒店 id" },
+    { "name": "date", "description": "日期，默认今天" },
+    { "name": "env", "enum": ["prod", "test"] }
+  ],
+  "timeoutSec": 60
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 小写字母、数字、横线；模型看到的工具名是 `mcp__storm__<id>` |
+| `description` | 做什么、什么时候用，模型据此选工具 |
+| `effect` | 只有 `read` 会开放给模型，其他值（如 `write`、`external`）跳过并在 `tools` 命令里列出 |
+| `command` | 程序和固定参数，在工具目录里执行，不经过 shell。相对路径的程序（`./x.sh`）按工具目录解析 |
+| `params` | `name`（不带 `--`）、`type`（`string` 默认 / `number` / `boolean`）、`required`、`enum`、`description`。调用时一律写成 `--name=value`，所以值以 `--` 开头也不会变成另一个开关；`boolean` 为 true 时只传 `--name` |
+| `timeoutSec` / `maxOutputChars` | 单个工具的超时和返回给模型的输出上限，默认取 `dataTools.timeoutSec`（120）和 `dataTools.maxOutputChars`（20000） |
+
+脚本的输出约定（推荐）：stdout 是数据；stderr **第一行写实际执行的查询**（补全后的条件），**最后一行写结果摘要**，例如 `{"rows":100,"limit_reached":true}`；退出码 0 是完成，其他是失败。网关把 stdout（超出上限时在行尾截断）、退出码和 stderr 的首行、末行一起交给模型，截断、失败、超时都写明，免得把不完整的结果当成完整的。
+
+**只读边界**：
+- 命令行工具只开放 `effect: "read"` 的；参数只认登记过的。
+- MCP 服务只放行 `allow` 里的工具。claude CLI 在 `--restricted --strict-mcp-config` 下运行，只加载这些服务；服务的其他工具模型能看到，但调用会被拒（记在 `permission_denials`）。
+- 不开 Bash，读代码的工具照旧只能读登记的目录。
+
+**调用记录**：命令行工具每次调用（参数、退出码、耗时、输出长度、是否截断、stderr 首末行）由网关写进 JSONL；带 MCP 的调用改用 `stream-json` 输出，程序从里面取出全部工具调用（含被拒的），放在返回值的 `toolCalls`。
+
+命令：
+
+```bash
+node src/cli.js tools                                   # 列出命令行工具（含跳过的及原因）和登记的 MCP 服务
+node src/cli.js tools call time-convert at="2026-11-11 08:30:00"   # 不经过模型直接执行，看返回给模型的内容
+node src/cli.js tools try "列出 dbx 里的数据库连接" --model sonnet  # 模型带着全部工具回答，端到端检查网关、服务和登录态
+```
+
+`tools try` 的调用记录在 `runs/.tools/`。MCP 服务要登录的（例如靠 cookie 的 `headersHelper`），登录过期时服务连不上，`tools try` 会如实报告；先刷新登录再试。
 
 ## 主文档
 
@@ -410,7 +467,7 @@ lark-cli im +chat-search --query "<群名>" --as user
 
 | 路径 | 内容 |
 |---|---|
-| `src/cli.js` | 命令行入口：`discuss`、`followup`、`check`、`send-test`、`watch`、`repos`、`web` |
+| `src/cli.js` | 命令行入口：`discuss`、`followup`、`check`、`send-test`、`watch`、`repos`、`web`、`tools` |
 | `src/runner.js` | 跑一场讨论或追问：命令行、群监听和网页共用 |
 | `src/budget.js` | 主席输入预算：按预算从新到旧装填讨论记录和核实结果 |
 | `src/lineup.js` | 网页上的自选阵容：模型清单、角色模板、按阵容生成配置、存进 state 供追问 |
@@ -420,6 +477,8 @@ lark-cli im +chat-search --query "<群名>" --as user
 | `src/orchestrator.js` | 讨论编排：匿名代号、轮次、失败处理、主文档（写、核对、追问后更新、补写）与代号对照 |
 | `src/modes.js` | 三种模式的阶段和提示词，修订版解析 |
 | `src/repos.js` | 代码上下文：仓库别名解析、分支快照导出 |
+| `src/tools/` | 数据工具：清单 `manifest.js`、执行 `run.js`、MCP 网关 `gateway.js`、配置与放行名单 `index.js`、命令 `commands.js` |
+| `local/` | 本机的数据工具和知识库，不进仓库 |
 | `src/pricing.js` | 接口不返回费用时按配置价格估算 |
 | `src/state.js` | 讨论编号、state.json、主文档.md、按保留期清理会话 |
 | `src/watch.js` | 群指令解析与监听循环 |

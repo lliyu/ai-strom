@@ -4,3 +4,6 @@ node_modules/
 config.json
 # 每次讨论的本地记录
 runs/
+
+# 本机的数据工具与知识库（不进仓库）
+local/

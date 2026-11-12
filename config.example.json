@@ -155,6 +155,25 @@
       ]
     }
   },
+  "dataTools": {
+    "dir": "local/tools",
+    "timeoutSec": 120,
+    "maxOutputChars": 20000,
+    "mcpServers": {
+      "logs": {
+        "type": "http",
+        "url": "https://logs.example.com/mcp",
+        "headersHelper": "/path/to/headers-helper logs",
+        "allow": ["list_services", "query_logs"]
+      },
+      "monitor": {
+        "command": "python",
+        "args": ["-m", "monitor_mcp.server"],
+        "cwd": "/path/to/monitor",
+        "allow": ["get_service_api_stats"]
+      }
+    }
+  },
   "research": {
     "provider": "claude-cli",
     "model": "opus",

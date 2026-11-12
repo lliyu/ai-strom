@@ -15,6 +15,9 @@ import path from 'node:path';
  * 讨论结束几天后追问也能接上；过了保留期由 state.js 的 expireOldSessions 删除。
  * 不传 session 时不保存会话（调研员、主席）。
  *
+ * 数据工具：传 mcp（{ config: { mcpServers }, allowed: [工具全名] }）时用 --mcp-config 只加载这些 MCP 服务，
+ * 放行名单之外的工具调用一律被拒。这时改用 stream-json 输出，把每次工具调用记进返回值的 toolCalls。
+ *
  * 费用：续接会话时 total_cost_usd 是会话累计值，见 callCost。
  */
 /** CLI 报出的服务端临时故障：API 5xx、529 过载、连接中断。这类错误重试一次通常就好。 */
@@ -38,19 +41,22 @@ export function createClaudeCliProvider(spec, { spawnImpl = spawn } = {}) {
   return {
     name: spec.name ?? 'claude-cli',
     cwd,
-    async complete({ model, system, prompt, effort, tools, addDirs, maxBudgetUsd, timeoutMs: callTimeoutMs, session }) {
+    async complete({ model, system, prompt, effort, tools, addDirs, mcp, maxBudgetUsd, timeoutMs: callTimeoutMs, session }) {
+      const withMcp = Boolean(mcp?.allowed?.length);
       const args = [
         '-p',
-        '--output-format', 'json',
+        ...(withMcp ? ['--output-format', 'stream-json', '--verbose'] : ['--output-format', 'json']),
         '--strict-mcp-config',
       ];
+      if (withMcp) args.push('--mcp-config', JSON.stringify(mcp.config));
       if (session?.id) {
         args.push(...(session.turns?.length ? ['--resume', session.id] : ['--session-id', session.id]));
       } else {
         args.push('--no-session-persistence');
       }
-      if (tools?.length) {
-        args.push('--restricted', '--tools', tools.join(','), '--allowedTools', tools.join(','));
+      if (tools?.length || withMcp) {
+        const allowed = [...(tools ?? []), ...(withMcp ? mcp.allowed : [])];
+        args.push('--restricted', '--tools', (tools ?? []).join(','), '--allowedTools', allowed.join(','));
         for (const d of addDirs ?? []) args.push('--add-dir', d);
       } else {
         args.push('--tools', '');
@@ -65,7 +71,7 @@ export function createClaudeCliProvider(spec, { spawnImpl = spawn } = {}) {
       const limit = callTimeoutMs ?? timeoutMs;
       const { stdout, stderr, code, timedOut } = await run(spawnImpl, bin, args, prompt, { cwd, timeoutMs: limit });
       if (timedOut) throw retryable(new Error(`claude CLI 超时（${Math.round(limit / 1000)}s）`));
-      const parsed = parseResult(stdout);
+      const parsed = withMcp ? parseStream(stdout) : parseResult(stdout);
       if (!parsed) {
         const err = new Error(`claude CLI 退出码 ${code}，输出无法解析：${(stderr || stdout).slice(0, 500)}`);
         throw TRANSIENT.test(stderr || stdout) ? retryable(err) : err;
@@ -94,6 +100,7 @@ export function createClaudeCliProvider(spec, { spawnImpl = spawn } = {}) {
         contextWindow: mu?.[1]?.contextWindow ?? spec.contextWindow,
         costUsd: callCost(parsed.total_cost_usd, session),
         turns: parsed.num_turns,
+        ...(withMcp ? { toolCalls: parsed.toolCalls } : {}),
       };
     },
   };
@@ -127,6 +134,37 @@ function parseResult(stdout) {
   } catch {
     return null;
   }
+}
+
+/**
+ * stream-json：每行一个事件。最后的 result 事件和 json 格式的结果一样；另外从 assistant 消息里取 tool_use，
+ * 从 user 消息里取对应的 tool_result，配成工具调用记录（被拒的调用 is_error 为 true，且出现在 permission_denials）。
+ */
+export function parseStream(stdout) {
+  const calls = new Map();
+  let result = null;
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.type === 'result') result = e;
+    const content = Array.isArray(e.message?.content) ? e.message.content : [];
+    for (const b of content) {
+      if (e.type === 'assistant' && b.type === 'tool_use') calls.set(b.id, { name: b.name, input: b.input });
+      if (e.type === 'user' && b.type === 'tool_result' && calls.has(b.tool_use_id)) {
+        const text = typeof b.content === 'string' ? b.content : (b.content ?? []).map((x) => x.text ?? '').join('');
+        Object.assign(calls.get(b.tool_use_id), { isError: b.is_error === true, resultChars: text.length });
+      }
+    }
+  }
+  if (!result) return null;
+  const denied = new Set((result.permission_denials ?? []).map((d) => d.tool_use_id));
+  const toolCalls = [...calls.entries()].map(([id, c]) => ({ ...c, ...(denied.has(id) ? { denied: true } : {}) }));
+  return { ...result, toolCalls };
 }
 
 function run(spawnImpl, bin, args, input, { cwd, timeoutMs }) {

@@ -12,6 +12,7 @@ import { RUNS, log, cleanupSessions, runOne, followUpOne, docOne } from './runne
 import { buildCardWithinLimit } from './lark/card.js';
 import { sendCard } from './lark/webhook.js';
 import { watchLoop, acquireLock, isTrigger, DEFAULT_TRIGGERS } from './watch.js';
+import { listTools, callTool, tryTools } from './tools/commands.js';
 import { parseRepoSpecs, resolveRepos, prepareRepos, availableRepos, describeRepo, allRepoSpecs } from './repos.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -28,6 +29,9 @@ const HELP = `ai-storm：多个模型分角色讨论，每个模型用自己的 
   node src/cli.js followup [--run 12] "<问题>"   追问一场讨论（默认最近一场）：主席判断直接回答还是重新讨论
   node src/cli.js doc <编号> [--mock]          给还没有主文档的旧讨论补写一份（主席写、主笔核对；不发群）
   node src/cli.js web [--port 8790] [--mock]   本地网页：看全部讨论、插话、追问；发起方案讨论 / 脑洞风暴（不发群）和作品打磨
+  node src/cli.js tools                        列出数据工具：local/tools 里的命令行工具和登记的 MCP 服务
+  node src/cli.js tools call <工具> 参数=值 …   不经过模型直接执行一个命令行工具，看它返回给模型的内容
+  node src/cli.js tools try "<问题>" [--model sonnet]  让模型带着全部数据工具回答一个问题，端到端检查
 
 选项：
   --config <文件>     配置文件，默认 ./config.json
@@ -59,6 +63,7 @@ async function main(argv) {
       repos: { type: 'string' },
       run: { type: 'string' },
       port: { type: 'string' },
+      model: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -84,6 +89,20 @@ async function main(argv) {
     case 'watch': return watch(rawCfg, cfg, values);
     case 'repos': return listRepos(cfg);
     case 'web': return web(cfg, values);
+    case 'tools': {
+      const [sub, ...args] = rest;
+      if (!sub || sub === 'list') return listTools(cfg);
+      if (sub === 'call') return callTool(cfg, args[0], args.slice(1));
+      if (sub === 'try') {
+        if (!args.join(' ').trim()) {
+          console.error('缺少问题：tools try "<问题>"');
+          return 2;
+        }
+        return tryTools(cfg, args.join(' '), { model: values.model });
+      }
+      console.error(`未知的 tools 子命令 ${sub}：list | call | try`);
+      return 2;
+    }
     case 'followup': {
       const question = rest.join(' ');
       if (!question.trim()) {
