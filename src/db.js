@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS executions (
   legacy_dir  TEXT UNIQUE  -- 从旧版 runs/ 目录导入的运行：原目录名
 );
 CREATE INDEX IF NOT EXISTS executions_number ON executions(number);
+-- 断点续跑：job 是发起参数（排队时就存，进程退出后能重新排队、重新跑）；data 是讨论进行中最近一次存的断点
+-- （会话、讨论记录、方案、核实结果、熔断计数……），讨论正常结束后整行删掉
+CREATE TABLE IF NOT EXISTS checkpoints (
+  number      INTEGER PRIMARY KEY REFERENCES discussions(number) ON DELETE CASCADE,
+  job         TEXT,
+  exec_id     INTEGER,
+  post_id     INTEGER,
+  at          TEXT,
+  data        TEXT
+);
 CREATE TABLE IF NOT EXISTS posts (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
   exec_id  INTEGER NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
@@ -245,6 +255,38 @@ export function openStore(file) {
 
     execution(id) {
       return execRow(q('SELECT * FROM executions WHERE id = ?').get(id));
+    },
+
+    /** 续跑：把中断的那次运行重新标成进行中，发言接着记在它名下（页面上不另起一段）。 */
+    reopenExecution(id, { pid = process.pid } = {}) {
+      q("UPDATE executions SET status = 'running', pid = ?, finished_at = NULL, error = NULL WHERE id = ?").run(pid, id);
+    },
+
+    // ---------- 断点续跑 ----------
+
+    /** 发起参数：排队时存，开始前进程退出了也能重新排队。 */
+    saveJob(number, job) {
+      q(`INSERT INTO checkpoints (number, job) VALUES (?, ?) ON CONFLICT(number) DO UPDATE SET job = excluded.job`).run(Number(number), json(job));
+    },
+
+    /** 存断点：这次运行（execId）进行到哪里；postId 是存断点时最后一条发言，之后的发言续跑时作废。 */
+    saveCheckpoint(number, execId, data) {
+      const postId = q('SELECT MAX(id) AS id FROM posts WHERE exec_id = ?').get(execId)?.id ?? null;
+      q(`INSERT INTO checkpoints (number, exec_id, post_id, at, data) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(number) DO UPDATE SET exec_id = excluded.exec_id, post_id = excluded.post_id, at = excluded.at, data = excluded.data`)
+        .run(Number(number), execId, postId, now(), json(data));
+    },
+
+    /** { number, job, execId, postId, at, data } 或 null。 */
+    checkpoint(number) {
+      const r = q('SELECT * FROM checkpoints WHERE number = ?').get(Number(number));
+      return r ? { number: r.number, job: parse(r.job), execId: r.exec_id, postId: r.post_id, at: r.at, data: parse(r.data) } : null;
+    },
+
+    /** 讨论正常结束：断点没用了。keepJob：保留发起参数（例如快问失败后还要「重新跑」）。 */
+    clearCheckpoint(number, { keepJob = false } = {}) {
+      if (keepJob) q('UPDATE checkpoints SET exec_id = NULL, post_id = NULL, at = NULL, data = NULL WHERE number = ?').run(Number(number));
+      else q('DELETE FROM checkpoints WHERE number = ?').run(Number(number));
     },
 
     /**

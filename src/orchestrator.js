@@ -500,6 +500,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   const asked = new Set(run.facts.flatMap((f) => f.questions.map(normQ)));
   let pendingQuestions = [];
   run.pendingQuestions = () => [...pendingQuestions];
+  /** 续跑：断点里还没核实的问题接着排上。 */
+  run.restorePending = (qs = []) => { pendingQuestions = [...qs]; };
   // 核实连续失败 2 次（每次已含一次临时故障重试），下一批条数减半，直到 1 条；成功后恢复
   let factFailures = 0;
   let factBatch = null;
@@ -717,7 +719,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * scope：追问原文，交给评审作为本次讨论范围（主笔已经在回应追问时看过）。
    * 会话模式下每位评审成功收到一次后就不再重复；非会话模式每轮都要带上。
    */
-  run.iterate = async ({ from, to, adaptive, scope }) => {
+  run.iterate = async ({ from, to, adaptive, scope, loop = null, onRound = null }) => {
     run.verdictAsked = adaptive;
     let lastRound = from - 1;
     const scoped = new Set(); // 已经在会话里收到讨论范围的评审
@@ -726,15 +728,15 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       if (scope) for (const e of entries) if (reviewerIds.has(e.id)) scoped.add(e.id);
     };
     let ending = { reason: adaptive ? 'max' : 'fixed', round: to, byReviewers: reviewers.length > 0 };
-    let answered = heard.length; // 主笔已经回应过的插话条数
+    let answered = loop?.answered ?? heard.length; // 主笔已经回应过的插话条数（续跑时从断点恢复）
     const converge = (round) => {
       ending = { reason: 'converged', round, byReviewers: reviewers.length > 0 };
       log(`第 ${round} 轮${run.stopRule}，提前结束`);
     };
     // 熔断只看确定性信号：主笔的「无变化」标记、评审有没有【阻断】、评审结论
     const breakers = adaptive && graded && reviewers.length > 0;
-    let stuck = 0; // 连续几轮：主笔全部「无变化」，评审仍有阻断
-    const lone = new Map(); // 评审 id -> 连续几轮独自坚持阻断（其他评审都没有意见）
+    let stuck = loop?.stuck ?? 0; // 连续几轮：主笔全部「无变化」，评审仍有阻断
+    const lone = new Map(Object.entries(loop?.lone ?? {})); // 评审 id -> 连续几轮独自坚持阻断（其他评审都没有意见）
 
     for (let round = from; round <= to; round += 1) {
       await run.pullInterjections();
@@ -840,6 +842,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         converge(round);
         break;
       }
+      // 这一轮完整跑完：存断点（进程中断后从下一轮续跑）
+      await onRound?.(round, { stuck, lone: Object.fromEntries(lone), answered });
     }
     return { lastRound, ending };
   };
@@ -1324,17 +1328,47 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
  * @param {object} [opts.code]       prepareRepos 的结果：有值时先由调研员读代码，整理背景资料给所有人
  * @param {number} [opts.number]     讨论编号，显示在卡片上，追问时用
  */
-export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data, material, memory, setting }) {
+/**
+ * 方案讨论、脑洞风暴、作品打磨。onCheckpoint：开场调研后、每一轮跑完、轮次结束后各存一次断点（讨论状态 + 熔断计数等），
+ * 进程中断后 resume 传入最近的断点，从那里接着跑：已经存下的会话、方案、讨论记录、核实结果原样恢复，断点之后没跑完的那一步重跑。
+ */
+export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data, material, memory, setting, resume = null, onCheckpoint = null }) {
   if (cfg.mode === 'quick' || cfg.mode === 'redraft') return runQuick({ cfg, topic, providers, publisher, log, rng, onEvent, number, data, material, memory, setting, code: cfg.mode === 'quick' ? code : null });
   if (cfg.mode === 'refine' && !subject) throw new Error('打磨模式需要打磨对象（subject）');
-  const tags = assignTags(cfg.participants, rng);
-  const sessions = new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
-  const latest = new Map(); // 主笔 id -> 最新一版方案
-  const rounds = [];        // [{ round, stage, entries: [{ id, label, tag, text }] }]
-  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, data: cfg.mode === 'decision' ? data : null });
+  const tags = resume ? new Map(Object.entries(resume.tags)) : assignTags(cfg.participants, rng);
+  const sessions = resume
+    ? new Map(Object.entries(resume.sessions).map(([id, s]) => [id, { ...s, turns: [...s.turns] }]))
+    : new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
+  const latest = new Map(resume ? resume.latest.map((e) => [e.id, e]) : []); // 主笔 id -> 最新一版方案
+  const rounds = resume ? [...resume.rounds] : []; // [{ round, stage, entries: [{ id, label, tag, text }] }]
+  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: resume?.facts ?? [], budget: resume?.budget ?? {}, data: cfg.mode === 'decision' ? data : null });
   const { leads, reviewers, participants, stats, emit, heard, tagOf, convo, ideasPerAgent } = run;
   const dataOn = Boolean(run.data?.mcp && cfg.research);
   const knowledgeOn = Boolean(run.data?.knowledge?.dirs?.length);
+  const adaptive = Boolean(cfg.adaptive) && (reviewers.length > 0 || cfg.mode === 'decision');
+  const no = number ? ` #${number}` : '';
+  let context = resume?.context ?? null;
+  let dataContext = resume?.dataContext ?? null;
+
+  /** 存断点：失败只记日志，不影响讨论。 */
+  const checkpoint = async (phase, extra = {}) => {
+    if (!onCheckpoint) return;
+    try {
+      await onCheckpoint({
+        ...exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound: extra.round ?? extra.lastRound ?? 0, subject, budget: run.budget, interjections: heard, data: run.data?.selection, dataContext, material, memory: memoryOut(memory) }),
+        phase,
+        ...extra,
+        web: Boolean(run.web),
+        stats: { ...stats },
+        pendingQuestions: run.pendingQuestions(),
+        inbox: interjections?.position?.() ?? null,
+      });
+    } catch (err) {
+      log(`⚠️ 存断点失败：${err.message}`);
+    }
+  };
+
+  if (resume) return continueDiscussion();
 
   const researcher = code ? cfg.research : null;
   emit({
@@ -1355,7 +1389,6 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     ...(run.data ? { data: { tools: dataOn ? run.data.mcp.allowed.length : 0, knowledge: run.data.knowledge?.sources ?? [] } } : {}),
   });
 
-  const adaptive = Boolean(cfg.adaptive) && (reviewers.length > 0 || cfg.mode === 'decision');
   const until = adaptive ? `，直到${run.stopRule}（最多 ${cfg.rounds} 轮）` : '';
   const more = adaptive ? '每轮' : `${cfg.rounds - 1} 轮`;
   const refine = cfg.mode === 'refine';
@@ -1367,7 +1400,6 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     : reviewers.length
       ? `第 1 轮主笔独立出方案，之后${more}「评审提意见 → 主笔互评修订」${until}，最后主席汇总`
       : `第 1 轮独立方案，之后${more}匿名互评与修订${until}，最后主席汇总`;
-  const no = number ? ` #${number}` : '';
 
   await publisher.post({
     speaker: cfg.chair,
@@ -1392,22 +1424,48 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   });
 
   // ---------- 讨论前：调研员读代码 ----------
-  let context = researcher ? await run.codeResearch({ topic, code, knowledgeOn }) : null;
+  context = researcher ? await run.codeResearch({ topic, code, knowledgeOn }) : null;
 
   // ---------- 本场无代码：联网搜集资料（网页阵容选了核实员时） ----------
   const webEnabled = cfg.mode === 'decision' && !context && Boolean(cfg.research?.factChecker);
   if (webEnabled) context = await run.webResearch({ topic });
 
   // ---------- 实时数据：网页上选了数据工具时，主席判断要不要先查 ----------
-  const dataContext = dataOn ? await run.dataResearch({ topic }) : null;
+  dataContext = dataOn ? await run.dataResearch({ topic }) : null;
 
   // 议题和背景资料整场不变，所有人共用同一份系统提示词，后面的调用都能命中缓存
   run.shared = sharedSystem({ mode: cfg.mode, topic, context, subject, dataContext, material, memory: memory?.block });
   // 调研员确认涉及代码后，讨论中才能查代码、核实事实；本场无代码时可以联网核实
   if (context && !context.web) run.code = code;
   run.web = webEnabled;
+  await checkpoint('opened');
+  return continueDiscussion();
+
+  /** 第 1 轮之后的部分；续跑时从断点所在的阶段接着跑。 */
+  async function continueDiscussion() {
+  const refine = cfg.mode === 'refine';
+  const phase = resume?.phase ?? 'opened';
+  if (resume) {
+    Object.assign(stats, resume.stats ?? {});
+    heard.push(...(resume.interjections ?? []));
+    run.restorePending(resume.pendingQuestions ?? []);
+    run.shared = resume.shared;
+    if (context && !context.web) run.code = code;
+    run.web = Boolean(resume.web);
+    const where = phase === 'opened' ? '开场之后，从第 1 轮' : phase === 'round' ? `第 ${resume.round} 轮之后，从第 ${resume.round + 1} 轮` : `第 ${resume.lastRound} 轮讨论结束后，从写主文档`;
+    emit({ type: 'run_resumed', phase, round: resume.round ?? resume.lastRound ?? 0 });
+    log(`续跑${no}：断点在${where}接着跑`);
+    await publisher.post({
+      speaker: cfg.chair,
+      title: `▶️ 续跑${no}`,
+      subtitle: `断点在${where}接着跑`,
+      body: '上次跑这场讨论的进程中断了。从最近一次存的断点接着跑：之前的会话、方案、讨论记录和核实结果都已恢复。断点之后、中断之前发出的发言作废（页面上标灰），以续跑后的为准。',
+      meta: { stage: 'resume', round: resume.round ?? resume.lastRound ?? 0, ...(resume.postId ? { discardAfter: resume.postId } : {}) },
+    });
+  }
 
   // ---------- 第 1 轮：主笔出方案 ----------
+  if (phase === 'opened') {
   await run.pullInterjections();
   const first = await run.runStage(leads, 1, cfg.mode === 'brainstorm' ? 'diverge' : refine ? 'diagnose' : 'propose', (p) => (cfg.mode === 'brainstorm'
     ? divergePrompt({ ideasPerAgent, interjections: run.ijFor(p), ownTag: convo ? tagOf(p) : undefined })
@@ -1417,9 +1475,20 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     throw new Error(`第 1 轮只有 ${first.length} 位主笔成功发言，讨论无法继续`);
   }
   for (const e of first) latest.set(e.id, e);
+  await checkpoint('round', { round: 1, loop: { stuck: 0, lone: {}, answered: heard.length } });
+  }
 
   // ---------- 后续轮次 ----------
-  const iterated = cfg.rounds >= 2 ? await run.iterate({ from: 2, to: cfg.rounds, adaptive }) : { lastRound: 1, ending: { reason: 'fixed', round: 1 } };
+  let iterated;
+  if (phase === 'iterated') iterated = { lastRound: resume.lastRound, ending: resume.ending };
+  else {
+    const from = phase === 'round' ? resume.round + 1 : 2;
+    const onRound = (round, loop) => checkpoint('round', { round, loop });
+    iterated = cfg.rounds >= 2
+      ? await run.iterate({ from, to: cfg.rounds, adaptive, loop: phase === 'round' ? resume.loop : null, onRound })
+      : { lastRound: 1, ending: { reason: 'fixed', round: 1 } };
+    await checkpoint('iterated', { lastRound: iterated.lastRound, ending: iterated.ending });
+  }
   const { lastRound, ending } = iterated;
 
   // ---------- 主文档 ----------
@@ -1463,6 +1532,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     docs,
     state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !docs.length, budget: run.budget, blockers, interjections: heard, data: run.data?.selection, dataContext, material, memory: memoryOut(memory) }),
   };
+  }
 }
 
 /** 开场卡片里的一行：这次带了哪些记忆（域、档案字数、结论条数）。 */
@@ -2063,7 +2133,8 @@ function noCodeOf(mode, context) {
 function contextOut(context) {
   if (!context) return null;
   if (context.web) return { web: true, text: context.text, questions: context.questions, ...(context.review ? { review: context.review } : {}) };
-  return { auto: Boolean(context.auto), repos: context.repos.map(describeRepo), text: context.text };
+  // 续跑时拿到的是断点里存的（仓库已经是说明文字），原样返回
+  return { auto: Boolean(context.auto), repos: context.repos.map((r) => (typeof r === 'string' ? r : describeRepo(r))), text: context.text };
 }
 
 /**

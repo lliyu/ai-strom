@@ -250,7 +250,7 @@ async function web(cfg, values) {
   log(`墨稿接口：${cfg.novel.baseUrl}${values.mock ? '（mock：不调用模型）' : ''}。Ctrl+C 停止。`);
   await new Promise((resolve) => {
     const stop = () => {
-      if (!app.idle()) log('还有打磨在进行，现在退出会中断它（再按一次 Ctrl+C 强制退出）');
+      if (!app.idle()) log('还有讨论在进行，现在退出会中断它（再按一次 Ctrl+C 强制退出；方案讨论、脑洞风暴和打磨之后可以在页面上从断点续跑）');
       server.close(resolve);
       process.once('SIGINT', () => process.exit(130));
       if (app.idle()) resolve();

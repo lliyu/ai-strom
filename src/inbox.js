@@ -9,9 +9,11 @@ export function appendInbox(store, execId, { sender, text }) {
   return item;
 }
 
-export function createStoreInbox(store, execId) {
-  let seen = 0;
+export function createStoreInbox(store, execId, { seen: from = 0 } = {}) {
+  let seen = from;
   return {
+    /** 读到哪一条了（存断点用：续跑时从这里接着读，之前已经交给模型的不再重复）。 */
+    position: () => seen,
     async poll() {
       const rows = store.interjections(execId, seen);
       if (rows.length) seen = rows.at(-1).id;
@@ -30,6 +32,7 @@ export function combineInterjections(sources) {
   const list = sources.filter(Boolean);
   if (list.length <= 1) return list[0];
   return {
+    position: () => list.map((s) => s.position?.()).find((v) => v !== undefined),
     async poll() {
       const out = [];
       let error = null;

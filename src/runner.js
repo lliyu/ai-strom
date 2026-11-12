@@ -11,6 +11,7 @@ import { isTrigger, DEFAULT_TRIGGERS } from './watch.js';
 import { describeRepo, resolveRepos, prepareRepos, allRepoSpecs, parseRepoSpecs } from './repos.js';
 import { createStoreInbox, combineInterjections } from './inbox.js';
 import { savedLineup, configForState } from './lineup.js';
+import { normalizeConfig } from './config.js';
 import { prepareData } from './tools/index.js';
 import { knowledgeSetup } from './knowledge.js';
 import { budgetFromUsage } from './budget.js';
@@ -46,7 +47,7 @@ export function cleanupSessions(cfg, store = storeOf(cfg)) {
 }
 
 /** 讨论和追问共用：记录库、Lark/终端发布、插话读取、用量事件。 */
-function setupRun(cfg, { store, execId, number, dryRun, mock, interject, triggers, echo = true, lark: toLark = true, extraPublishers = [], interjections: ownInterjections, onEvent: watcher }) {
+function setupRun(cfg, { store, execId, number, dryRun, mock, interject, triggers, echo = true, lark: toLark = true, extraPublishers = [], interjections: ownInterjections, onEvent: watcher, inboxFrom = 0, larkSince = null }) {
   const list = [createStorePublisher(store, execId), ...extraPublishers];
   if (!toLark) {
     if (echo) list.push(createConsolePublisher({ full: false }));
@@ -69,12 +70,12 @@ function setupRun(cfg, { store, execId, number, dryRun, mock, interject, trigger
     interjections = createInterjectionReader({
       chatId: ij.chatId,
       allowFrom: ij.allowFrom,
-      since: new Date(),
+      since: larkSince ? new Date(larkSince) : new Date(),
       ignore: (text) => isTrigger(text, triggers ?? cfg.lark.watch?.triggers ?? DEFAULT_TRIGGERS),
     });
   }
   // 网页上的插话：不管这场讨论在哪个进程里跑，都从记录库里这次运行的插话读
-  if (interject) interjections = combineInterjections([interjections, createStoreInbox(store, execId)]);
+  if (interject) interjections = combineInterjections([interjections, createStoreInbox(store, execId, { seen: inboxFrom })]);
   const channel = toLark ? (dryRun ? 'dry-run' : 'lark') : 'web';
 
   const providers = createProviderRegistry(cfg, { forceMock: mock });
@@ -137,21 +138,81 @@ export async function runPrepared(cfg, { topic, dryRun, mock, interject, trigger
   if (memory?.domains.length) log(`记忆：${memory.domains.map((d) => `${d.label}（档案 ${d.profileChars} 字，结论 ${d.entries} 条）`).join('、')}`);
   else if (memoryDomains?.length) log('⚠️ 选了记忆，但这些域里还没有内容，这场不带记忆');
 
+  // 断点：方案讨论、脑洞风暴、打磨每跑完一步存一次，进程中断后可以从这里续跑（快问、改稿太短，不存）
+  const lineup = savedLineup(cfg);
+  const onCheckpoint = number && !['quick', 'redraft'].includes(cfg.mode)
+    ? (data) => store.saveCheckpoint(number, execId, { ...data, ...resumeInfo(cfg, { lineup, channel, dryRun, mock }) })
+    : null;
   let result;
   try {
-    result = await runDiscussion({ cfg, topic, providers, publisher, interjections, log, onEvent, code, number, subject, data, material, setting, memory });
+    result = await runDiscussion({ cfg, topic, providers, publisher, interjections, log, onEvent, code, number, subject, data, material, setting, memory, onCheckpoint });
   } catch (err) {
     onEvent({ type: 'run_failed', error: err.message.slice(0, 500) });
     throw err;
   }
+  return finishDiscussion(store, { result, number, execId, cfg, topic, lineup, channel, dryRun, mock });
+}
+
+/** 续跑要用的配置：阵容、轮数、条目化开关、发到哪里。 */
+function resumeInfo(cfg, { lineup, channel, dryRun, mock }) {
+  return {
+    resumeCfg: { mode: cfg.mode, rounds: cfg.adaptive ? 'auto' : cfg.rounds, maxRounds: cfg.maxRounds, items: Boolean(cfg.items) },
+    ...(lineup ? { lineup } : {}),
+    channel,
+    ...(dryRun ? { dryRun: true } : {}),
+    ...(mock ? { mock: true } : {}),
+  };
+}
+
+/** 讨论正常结束：存讨论状态、标记运行完成、删掉断点。 */
+function finishDiscussion(store, { result, number, execId, cfg, topic, lineup, channel, dryRun, mock }) {
   const { state, ...rest } = result;
   // 讨论状态（会话、主文档……）存进记录库，追问时接着用；超过保留期后会话会被清理
   // 网页上自己选的阵容也存进状态，追问时照原样用
-  const lineup = savedLineup(cfg);
   if (number) saveState(store, { ...state, dryRun, channel, ...(lineup ? { lineup } : {}), ...(mock ? { mock: true } : {}) });
   store.finishExecution(execId, { result: { number, topic, mode: cfg.mode, ...rest } });
+  if (number) store.clearCheckpoint(number);
   log(`完成${number ? ` #${number}` : ''}。记录在 ${recordWhere(store, number)}`);
   return result;
+}
+
+/**
+ * 断点续跑：从记录库里最近一次存的断点接着跑这场讨论。发言接着记在中断的那次运行名下；
+ * 群里发起的讨论续跑的发言照样发到群里。讨论正常结束后存讨论状态、删掉断点。
+ */
+export async function resumeOne(cfg, { number, store = storeOf(cfg), mock: forceMock = false, echo, onExecution, onEvent: watcher, extraPublishers }) {
+  const cp = store.checkpoint(number);
+  if (!cp?.data) throw new ConfigError(`#${number} 没有可以续跑的断点`);
+  if (store.discussion(number)?.state) throw new ConfigError(`#${number} 已经正常结束，不用续跑`);
+  const d = cp.data;
+  const base = configForState(cfg, { lineup: d.lineup, mode: d.resumeCfg.mode });
+  const jobCfg = normalizeConfig({ ...base, maxRounds: d.resumeCfg.maxRounds, items: d.resumeCfg.items }, { mode: d.resumeCfg.mode, rounds: d.resumeCfg.rounds });
+  const execId = cp.execId;
+  store.reopenExecution(execId);
+  onExecution?.(execId, number);
+  const lark = d.channel === 'lark';
+  const mock = forceMock || Boolean(d.mock);
+  const { publisher, interjections, providers, onEvent, channel } = guard(store, execId, () => setupRun(jobCfg, {
+    store, execId, number, dryRun: Boolean(d.dryRun), mock, interject: true, lark, extraPublishers, onEvent: watcher, echo,
+    inboxFrom: d.inbox ?? 0, larkSince: cp.at,
+  }));
+  const code = codeForFollowUp(jobCfg, d);
+  const data = dataFor(jobCfg, d.data, { store, execId });
+  log(`续跑 #${number}「${String(d.topic ?? '').split('\n')[0].slice(0, 30)}」：断点在${d.phase === 'round' ? `第 ${d.round} 轮之后` : d.phase === 'iterated' ? '轮次结束之后' : '开场之后'}`);
+  const onCheckpoint = (data) => store.saveCheckpoint(number, execId, { ...data, ...resumeInfo(jobCfg, { lineup: d.lineup, channel, dryRun: d.dryRun, mock: d.mock }) });
+  let result;
+  try {
+    result = await runDiscussion({
+      cfg: jobCfg, topic: d.topic, providers, publisher, interjections, log, onEvent, code, number, subject: d.subject, data,
+      material: d.material, memory: d.memory, resume: { ...d, postId: cp.postId }, onCheckpoint,
+    });
+  } catch (err) {
+    onEvent({ type: 'run_failed', error: err.message.slice(0, 500) });
+    throw err;
+  } finally {
+    code?.cleanup();
+  }
+  return finishDiscussion(store, { result, number, execId, cfg: jobCfg, topic: d.topic, lineup: d.lineup, channel, dryRun: d.dryRun, mock: d.mock });
 }
 
 /** 运行开始前（建发布者等）就出错时，把这次运行标成失败，免得页面上一直显示进行中。 */

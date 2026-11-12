@@ -8,7 +8,7 @@ import { nextNumber, saveState, removeSessionFiles } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX, SETTING_MAX } from '../modes.js';
 import { groupKeys, critiqueDigest, blockerSummary, docSections, itemDigest, issueTracking } from './digest.js';
 import { listMemory, appendEntries, deleteEntry, isDomain, memoCandidates, ENTRY_MAX_CHARS } from '../memory.js';
-import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
+import { RUNS, storeOf, runOne, runPrepared, followUpOne, resumeOne, log as defaultLog } from '../runner.js';
 import { claudeSessionFile, DEFAULT_CLAUDE_CWD } from '../providers/claude-cli.js';
 import { parseRepoSpecs, resolveRepos, availableRepos } from '../repos.js';
 import { appendInbox } from '../inbox.js';
@@ -35,7 +35,7 @@ const MODE_LABELS = { decision: '方案讨论', brainstorm: '脑洞风暴', refi
 const MEETING_MAX_ROUNDS = 3;
 
 /** runsDir：Lark 监听进程的运行文件所在目录（.watch.state.json）。store：记录库，默认按配置打开。 */
-export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock = false, store = storeOf(cfg), runsDir = RUNS, log = defaultLog, echo = true, pollMs = 1000, runner = { runOne, runPrepared, followUpOne } } = {}) {
+export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock = false, store = storeOf(cfg), runsDir = RUNS, log = defaultLog, echo = true, pollMs = 1000, runner = { runOne, runPrepared, followUpOne, resumeOne } } = {}) {
   const queue = [];
   let current = null;
   const failures = new Map(); // 网页跑的讨论在开始运行之前就失败了：编号 -> 错误
@@ -123,6 +123,12 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       if (p.stage === 'critique') Object.assign(p, critiqueDigest(p));
       Object.assign(p, itemDigest(p));
       return p;
+    });
+    // 续跑：断点之后、中断之前发出的发言作废（续跑卡片的 discardAfter 是断点时的最后一条发言）
+    rows.forEach(({ e }, i) => {
+      const after = e.meta?.stage === 'resume' ? e.meta.discardAfter : undefined;
+      if (after === undefined) return;
+      for (let j = 0; j < i; j += 1) if (rows[j].e.exec_id === e.exec_id && rows[j].e.id > after && !posts[j].discarded) posts[j].discarded = true;
     });
     groupKeys(posts).forEach((g, i) => Object.assign(posts[i], g));
     return posts;
@@ -267,6 +273,43 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       .sort((x, y) => y.number - x.number);
   }
 
+  /**
+   * 中断（进程退出或出错）之后能怎么接着跑：
+   * resume 从断点续跑（方案讨论、脑洞风暴、打磨，有断点、还没正常结束）；requeue 排队时进程退出、根本没开始，用原来的参数重新排队；
+   * rerun 用原来的参数另起一场（快问、改稿，或者还没存下断点就断了）；refollow 追问中断，用同一个问题再追问一次。
+   */
+  function recoveryOf(number, run, progress) {
+    if (progress.status !== 'failed' || busyWith(number)) return null;
+    const exec = latestExec(run);
+    if (exec && exec.kind === 'followup') return run.state ? { action: 'refollow', question: exec.topic ?? '' } : null;
+    if (run.state) return null;
+    const cp = store.checkpoint(number);
+    if (cp?.data) {
+      const d = cp.data;
+      return { action: 'resume', where: d.phase === 'round' ? `第 ${d.round} 轮之后` : d.phase === 'iterated' ? '轮次结束之后（重写主文档）' : '开场之后', at: cp.at };
+    }
+    if (!cp?.job) return null;
+    return exec ? { action: 'rerun' } : { action: 'requeue' };
+  }
+
+  /** 按中断后的处理方式接着跑。返回 { number }（重新跑会是新的编号）。 */
+  async function recover(number, action) {
+    const run = findRun(number);
+    if (!run) throw httpError(404, `没有 #${number} 这场讨论`);
+    const r = recoveryOf(number, run, progressOf(number, run));
+    if (!r || r.action !== action) throw httpError(409, `#${number} 现在不能${{ resume: '续跑', requeue: '重新排队', rerun: '重新跑', refollow: '重新追问' }[action] ?? action}`);
+    if (action === 'refollow') return followUp(number, r.question);
+    if (action === 'resume') {
+      enqueue({ kind: 'resume', number });
+      log(`网页：#${number} 续跑排队`);
+      return { number };
+    }
+    const job = store.checkpoint(number).job;
+    failures.delete(number);
+    if (job.kind === 'refine') return startRefine({ ...job.params, ...(action === 'requeue' ? { number } : {}) });
+    return startDiscussion({ ...job.params, ...(action === 'requeue' ? { number } : {}) });
+  }
+
   function runDetail(number) {
     const run = findRun(number);
     if (!run) throw httpError(404, `没有 #${number} 这场讨论`);
@@ -276,7 +319,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const progress = progressOf(number, run);
     const lastDiscuss = [...(state?.followUps ?? [])].reverse().find((f) => f.handling === 'discuss');
     const posts = postsOf(run);
-    logUnknown(run, posts);
+    const live = posts.filter((p) => !p.discarded); // 作废的发言不算进阻断、问题追踪
+    logUnknown(run, live);
     return {
       number,
       mode,
@@ -313,9 +357,11 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       posts,
       // 读取时派生：结束状态、阻断区块、主文档切段（每份文档最新一版）
       outcome: outcomeOf(run),
-      blockers: blockersOf(run, posts),
+      blockers: blockersOf(run, live),
       // 问题追踪：按编号串出的每个问题的经过（第三期，没有编号的讨论为 null）
-      issues: issueTracking(posts),
+      issues: issueTracking(live),
+      // 中断后怎么接着跑：续跑 / 重新跑 / 重新排队 / 重新追问（没有中断时为 null）
+      recovery: recoveryOf(number, run, progress),
       docSections: sectionsOf(run, mode),
     };
   }
@@ -376,6 +422,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     try {
       if (job.kind === 'refine') {
         await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject, memory: job.memory });
+      } else if (job.kind === 'resume') {
+        await runner.resumeOne(cfg, { ...common, number: job.number });
       } else if (job.kind === 'discuss') {
         await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, material: job.material, setting: job.setting, memory: job.memory, number: job.number, repos: job.repos, data: job.data });
       } else {
@@ -410,12 +458,13 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     }
   }
 
-  async function startRefine({ type, id, requirement = '', lineup, memory }) {
+  async function startRefine({ type, id, requirement = '', lineup, memory, number: reuse }) {
     if (!SUBJECT_LABELS[type] || !id) throw httpError(400, '需要 type（idea / premise / outline）和 id');
     const mem = memoryPick(memory);
     const jobCfg = jobConfig('refine', undefined, lineup);
     const item = await novel.get(type, id);
-    const number = nextNumber(store, { mode: 'refine', topic: String(requirement).slice(0, 4000), channel: 'web', info: { subject: { type: item.type, id: item.id, title: item.title } } });
+    const number = reuse ?? nextNumber(store, { mode: 'refine', topic: String(requirement).slice(0, 4000), channel: 'web', info: { subject: { type: item.type, id: item.id, title: item.title } } });
+    store.saveJob(number, { kind: 'refine', params: { type, id, requirement, lineup, memory } });
     const subject = {
       type: item.type,
       id: item.id,
@@ -474,7 +523,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return mem;
   }
 
-  function startDiscussion({ mode, tier, topic, material, setting, memory, repos, rounds, lineup, data, items }) {
+  function startDiscussion(params) {
+    const { mode, tier, topic, material, setting, memory, repos, rounds, lineup, data, items, number: reuse } = params;
     if (!['decision', 'brainstorm', 'quick', 'redraft'].includes(mode)) throw httpError(400, 'mode 只能是 quick、redraft、decision 或 brainstorm');
     const light = mode === 'quick' || mode === 'redraft'; // 两位、一轮
     if (tier !== undefined && tier !== null && tier !== '' && !(tier === 'meeting' && mode === 'decision')) throw httpError(400, 'tier 只能是 meeting（方案讨论的小会）');
@@ -515,7 +565,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const picked = mode === 'redraft' ? undefined : dataSelection(mode, data);
     // 改稿没写要求时，列表标题用原文第一行（排队时就要能显示）
     const info = { ...(meeting ? { tier: 'meeting' } : {}), ...(mode === 'redraft' && !text ? { material: mat.split('\n')[0].slice(0, 80) } : {}) };
-    const number = nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web', ...(Object.keys(info).length ? { info } : {}) });
+    const number = reuse ?? nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web', ...(Object.keys(info).length ? { info } : {}) });
+    // 发起参数存下来：排队时进程退出了能重新排队，快问、改稿失败了能重新跑
+    const { number: _n, ...saved } = params;
+    store.saveJob(number, { kind: 'discuss', params: saved });
     enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), material: mat || undefined, setting: set || undefined, memory: mem.length ? mem : undefined, repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
     log(`网页：#${number} ${meeting ? '小会' : MODE_LABELS[mode]}排队`);
     return { number };
@@ -622,7 +675,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   async function route(req, res, url) {
     const exp = /^\/api\/runs\/(\d+)\/docs\/(\d+)\.md$/.exec(url.pathname);
     if (req.method === 'GET' && exp) return exportDoc(res, Number(exp[1]), Number(exp[2]));
-    const m = /^\/api\/runs\/(\d+)(?:\/(events|interject|followup|apply|archive|delete))?$/.exec(url.pathname);
+    const m = /^\/api\/runs\/(\d+)(?:\/(events|interject|followup|recover|apply|archive|delete))?$/.exec(url.pathname);
     if (req.method === 'GET' && url.pathname === '/') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(fs.readFileSync(PAGE));
@@ -650,6 +703,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       const b = await body(req);
       return json(res, followUp(number, b.question, b.context), 202);
     }
+    if (req.method === 'POST' && m[2] === 'recover') return json(res, await recover(number, (await body(req)).action), 202);
     if (req.method === 'POST' && m[2] === 'apply') return json(res, await apply(number, (await body(req)).revisionAt));
     if (req.method === 'POST' && m[2] === 'archive') return json(res, archive(number, (await body(req)).archived));
     if (req.method === 'POST' && m[2] === 'delete') return json(res, remove(number));

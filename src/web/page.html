@@ -195,6 +195,8 @@
   .unv { font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 4px; padding: 0 4px; margin-left: 4px; white-space: nowrap; }
   .cp { font-size: 11px; border: 1px solid var(--line); background: none; border-radius: 4px; color: var(--muted); cursor: pointer; padding: 0 5px; margin-left: 4px; }
   .mism { font-size: 12px; color: var(--warn); margin-top: 4px; }
+  /* 续跑：断点之后、中断之前的发言作废 */
+  .post.void { opacity: .5; } .post.void::before { content: '中断前未完成，已作废（以续跑后的为准）'; display: block; font-size: 12px; color: var(--warn); margin-bottom: 4px; }
   /* 第三期：问题编号和时间线 */
   .qid { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; white-space: nowrap; flex: none; }
   .iss { margin-top: 8px; } .iss .ih { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
@@ -840,7 +842,7 @@ function itemsHtml(p) {
   const mism = p.itemsMismatch ? `<div class="mism">要点与条目不一致：要点说 ${p.itemsMismatch.brief} 条阻断，正文有 ${p.itemsMismatch.body} 条行首阻断（以正文为准）</div>` : '';
   return `<div class="itl">${rows}</div>${mism}`;
 }
-function postClass(p) { return `post ${p.error ? 'error' : ''} ${p.bodyBlockers || p.blockerLines?.length ? 'has-blocker' : ''}`; }
+function postClass(p) { return `post ${p.error ? 'error' : ''} ${p.discarded ? 'void' : ''} ${!p.discarded && (p.bodyBlockers || p.blockerLines?.length) ? 'has-blocker' : ''}`; }
 
 function postHtml(p) {
   const color = COLORS[p.speaker?.color] || 'var(--line)';
@@ -1033,6 +1035,25 @@ function blockerJump() {
   $('blockerBox')?.scrollIntoView({ block: 'start' });
 }
 
+// 中断后接着跑：续跑（从断点）/ 重新排队 / 重新跑（另起一场）/ 重新追问（同一个问题）
+const RECOVER_LABEL = { resume: '从断点续跑', requeue: '重新排队', rerun: '用原来的内容重新跑', refollow: '重新追问' };
+function recoveryHtml(r) {
+  if (!r) return '';
+  const hint = r.action === 'resume' ? `断点在${esc(r.where)}，之前的会话和讨论记录都会恢复`
+    : r.action === 'rerun' ? '另起一场新的讨论，问题和材料照原样'
+    : r.action === 'refollow' ? `再问一次：${esc(String(r.question || '').split('\n')[0].slice(0, 40))}`
+    : '排队时网页重启了，这场还没开始';
+  return ` <button class="btn primary" data-recover="${r.action}" style="margin-left:8px">${RECOVER_LABEL[r.action]}</button><span class="hint" style="margin-left:6px">${hint}</span>`;
+}
+async function recover(action) {
+  try {
+    const out = await api(`/api/runs/${S.run.number}/recover`, { method: 'POST', body: JSON.stringify({ action }) });
+    toast(action === 'rerun' ? `已另起 #${out.number}` : '已排队');
+    await loadRuns();
+    openRun(action === 'rerun' ? out.number : S.run.number);
+  } catch (e) { toast(e.message, 6000); }
+}
+
 function renderProgress() {
   renderStat();
   const box = $('progress'); if (!box || !S.run) return;
@@ -1041,7 +1062,7 @@ function renderProgress() {
   const who = (p.speaking || []).map((s) => `${esc(s.name)} 在写${s.round && !['汇总', '修订版', '追问判断'].includes(s.stage) ? `第 ${s.round} 轮` : ''}${esc(s.stage)}（${ago(s.at)}）`).join('；');
   const line = queued ? `排队中${p.queuedAhead ? `，前面还有 ${p.queuedAhead} 场` : ''}…`
     : running ? (who || '准备中…')
-    : p.status === 'failed' ? `<span class="err">失败：${esc(p.error || '')}</span>` : '';
+    : p.status === 'failed' ? `<span class="err">失败：${esc(p.error || '')}</span>${recoveryHtml(S.run.recovery)}` : '';
   const canTalk = running;
   const canAsk = !running && !queued && S.run.canFollowUp;
   const lark = S.run.channel === 'lark';
@@ -1357,7 +1378,7 @@ function carryOn(tier) {
 
 // ---------- 事件 ----------
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],[data-upgrade],[data-mem],[data-memdel],[data-memsave],[data-draftview],[data-copydraft],[data-carry],[data-copycoord],[data-copyblk],.more');
+  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],[data-upgrade],[data-mem],[data-memdel],[data-memsave],[data-draftview],[data-copydraft],[data-carry],[data-copycoord],[data-copyblk],[data-recover],.more');
   if (!t) return;
   if (t.matches('.more')) { const post = t.closest('.post'); post.classList.remove('fold'); t.remove(); return; }
   ev.preventDefault();
@@ -1368,6 +1389,7 @@ document.addEventListener('click', (ev) => {
   if (t.dataset.draftview) { S.draftView = t.dataset.draftview; renderRun(); return; }
   if (t.dataset.copydraft) { copyText(S.draftText || '').then(() => toast('修改稿已复制')).catch(() => toast('复制失败，切到「修改稿全文」手动选中复制')); return; }
   if (t.dataset.carry) { carryOn(t.dataset.carry); return; }
+  if (t.dataset.recover) { t.disabled = true; recover(t.dataset.recover); return; }
   if (t.dataset.copycoord) { copyText(t.dataset.copycoord).then(() => toast('坐标已复制')).catch(() => toast('复制失败')); return; }
   if (t.dataset.copyblk) { copyText(S.blockerMd || '').then(() => toast('阻断已复制为 Markdown')).catch(() => toast('复制失败')); return; }
   if (t.dataset.memdel) {
