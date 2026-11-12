@@ -1,14 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import http from 'node:http';
 import { normalizeConfig } from '../src/config.js';
 import { createWebApp, startWebServer, docMarkdown, docFileName } from '../src/web/server.js';
 import { createStoreInbox, combineInterjections, appendInbox } from '../src/inbox.js';
 import { openStore } from '../src/db.js';
-import { migrateRuns } from '../src/migrate.js';
 
 const cfg = normalizeConfig({
   participants: [
@@ -243,49 +239,4 @@ test('网页：按议题、发言内容、编号搜索，按模式和时间筛�
   // 进行中的不能删
   fakeLarkRun(store, { number: 5, running: true });
   assert.equal((await request(port, 'POST', '/api/runs/5/delete', {})).status, 409);
-});
-
-test('迁移：旧 runs/ 目录导进记录库，讨论、追问、发言、用量、插话、工具调用都在；重复执行不重复导入', () => {
-  const runs = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-migrate-'));
-  const w = (rel, rows) => {
-    fs.mkdirSync(path.dirname(path.join(runs, rel)), { recursive: true });
-    fs.writeFileSync(path.join(runs, rel), Array.isArray(rows) ? rows.map((r) => `${JSON.stringify(r)}\n`).join('') : JSON.stringify(rows));
-  };
-  const main = '20261111-100000-#3-拆库';
-  w(`${main}/usage.jsonl`, [{ at: '2026-11-11T02:00:00Z', type: 'run_started', number: 3, topic: '拆库', mode: 'decision', pid: 1, channel: 'lark' }, { at: '2026-11-11T02:30:00Z', type: 'run_finished' }]);
-  w(`${main}/events.jsonl`, [{ at: '2026-11-11T02:00:00Z', speaker: 'chair', title: '开始', body: '议题', meta: { stage: 'open' } }]);
-  w(`${main}/state.json`, { version: 1, number: 3, topic: '拆库', mode: 'decision', docs: [{ version: 1, text: '# 结论' }], channel: 'lark' });
-  w(`${main}/result.json`, { number: 3, topic: '拆库' });
-  w(`${main}/inbox.jsonl`, [{ at: '2026-11-11T02:10:00Z', sender: '主持人', text: '只考虑 MySQL' }]);
-  w(`${main}/tool-calls.jsonl`, [{ time: '2026-11-11T02:05:00Z', source: 'command', tool: 'query-db', exitCode: 0, durationMs: 30 }]);
-  w('20261111-110000-追问#3-换分库/usage.jsonl', [{ at: '2026-11-11T03:00:00Z', type: 'run_started', pid: 2 }]);
-  w('20261111-110000-追问#3-换分库/events.jsonl', [{ at: '2026-11-11T03:00:00Z', speaker: 'a', title: 'A', body: '回应' }]);
-  w('20261111-120000-mock演练/events.jsonl', [{ at: '2026-11-11T04:00:00Z', speaker: 'a', title: 'A', body: 'mock' }]);
-  w('.tools/2026-11-11T05-00-00-000Z.jsonl', [{ time: '2026-11-11T05:00:00Z', tool: 'time-convert', exitCode: 0 }]);
-
-  w('20261111-130000-#4-进行中/usage.jsonl', [{ at: '2026-11-11T05:00:00Z', type: 'run_started', number: 4, pid: process.pid }]);
-  const store = openStore(':memory:');
-  const out = migrateRuns(store, runs);
-  assert.deepEqual(out.running, ['20261111-130000-#4-进行中']); // 进程还活着、没结束的先不导
-  assert.deepEqual([out.discussions, out.executions, out.posts, out.events, out.interjections, out.toolCalls, out.problems.length], [1, 4, 3, 3, 1, 2, 0]);
-  const d = store.discussion(3);
-  assert.equal(d.state.docs[0].text, '# 结论');
-  const [disc, follow] = store.executionsOf(3);
-  assert.deepEqual([disc.kind, disc.status, disc.pid, disc.result.topic], ['discussion', 'done', 1, '拆库']);
-  assert.deepEqual([follow.kind, follow.status], ['followup', 'failed']); // 没有结束记录
-  assert.equal(store.interjections(disc.id)[0].text, '只考虑 MySQL');
-  assert.equal(store.toolCalls(disc.id)[0].tool, 'query-db');
-  assert.equal(store.executions().find((e) => e.kind === 'tools-try').legacy_dir, '.tools/2026-11-11T05-00-00-000Z.jsonl');
-  assert.equal(store.executions().filter((e) => e.number === null).length, 2); // mock 演练和 tools try 不编号
-  assert.ok(!store.discussion(4));
-  const again = migrateRuns(store, runs);
-  assert.deepEqual([again.executions, again.skipped, again.synced], [0, 4, 0]);
-  // 导过之后旧版程序又追问了一次：state.json 更新了，再执行时同步状态、导入新的追问目录
-  w(`${main}/state.json`, { version: 1, number: 3, topic: '拆库', mode: 'decision', docs: [{ version: 1, text: '# 结论' }, { version: 2, text: '# 第 2 版' }], updatedAt: '2026-11-12T00:00:00Z' });
-  w('20261112-100000-追问#3-再问/usage.jsonl', [{ at: '2026-11-12T00:00:00Z', type: 'run_started', pid: 3 }, { type: 'run_finished', at: '2026-11-12T00:01:00Z' }]);
-  const third = migrateRuns(store, runs);
-  assert.deepEqual([third.executions, third.synced], [1, 1]);
-  assert.equal(store.discussion(3).state.docs.length, 2);
-  assert.equal(store.executionsOf(3).length, 3);
-  fs.rmSync(runs, { recursive: true, force: true });
 });

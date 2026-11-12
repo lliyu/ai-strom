@@ -181,6 +181,16 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     });
   }
 
+  /** 评审结论解析不出（页面标「未识别」）的发言数：数字变了才记一次日志。 */
+  const unknownSeen = new Map();
+  function logUnknown(run, posts) {
+    const crit = posts.filter((p) => p.stage === 'critique' && !p.error);
+    const n = crit.filter((p) => p.verdict === null).length;
+    if (!n || unknownSeen.get(run.number) === n) return;
+    unknownSeen.set(run.number, n);
+    log(`网页：#${run.number} 有 ${n}/${crit.length} 条评审发言解析不出评审结论，页面标「未识别」`);
+  }
+
   const alive = (pid) => {
     if (!pid) return false;
     try {
@@ -260,6 +270,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const progress = progressOf(number, run);
     const lastDiscuss = [...(state?.followUps ?? [])].reverse().find((f) => f.handling === 'discuss');
     const posts = postsOf(run);
+    logUnknown(run, posts);
     return {
       number,
       mode,

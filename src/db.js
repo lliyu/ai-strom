@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS executions (
   error       TEXT,
   pid         INTEGER,
   result      TEXT,
-  legacy_dir  TEXT UNIQUE
+  legacy_dir  TEXT UNIQUE  -- 从旧版 runs/ 目录导入的运行：原目录名
 );
 CREATE INDEX IF NOT EXISTS executions_number ON executions(number);
 CREATE TABLE IF NOT EXISTS posts (
@@ -127,7 +127,7 @@ export function openStore(file) {
     }
     return st;
   };
-  // 事务可以嵌套：外层已经开了事务时，里面的直接执行（迁移时整个目录一个事务）
+  // 事务可以嵌套：外层已经开了事务时，里面的直接执行
   let depth = 0;
   const tx = (fn) => {
     if (depth > 0) return fn();
@@ -164,7 +164,7 @@ export function openStore(file) {
       });
     },
 
-    /** 讨论结束或追问后写回完整状态；没有这一行时补上（迁移、直接调用时）。 */
+    /** 讨论结束或追问后写回完整状态；没有这一行时补上（直接调用时）。 */
     saveState(state) {
       if (!state?.number) throw new Error('state 里没有编号，不能保存');
       const at = now();

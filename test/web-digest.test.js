@@ -261,4 +261,10 @@ test('接口：评审发言带派生字段；阻断区块在裁决类追问之�
   assert.equal(logs.filter((m) => /未能提取/.test(m)).length, 1);
   await get(port, '/api/runs/6');
   assert.equal(logs.filter((m) => /未能提取/.test(m)).length, 1, '同一版只记一次');
+  assert.equal(logs.filter((m) => /未识别/.test(m)).length, 0, '评审结论都解析出来了，不记');
+  // 再来一条解析不出结论的评审：记一次「未识别」，数字没变就不重复记
+  store.addPost(main, { speaker: { id: 'r1' }, title: 'R1', brief: '- 只剩建议', body: '没写结论', meta: { stage: 'critique', round: 3, tag: '评审 1' } });
+  await get(port, '/api/runs/6');
+  await get(port, '/api/runs/6');
+  assert.deepEqual(logs.filter((m) => /未识别/.test(m)), ['网页：#6 有 1/2 条评审发言解析不出评审结论，页面标「未识别」']);
 });
