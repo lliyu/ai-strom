@@ -107,8 +107,9 @@ export function hasDataTools(dataTools) {
  * 工具调用记录写进记录库（record）。都没有时返回 null。
  */
 export function prepareData(cfg, selection, { record, knowledgeSetup } = {}) {
-  if (!selection || cfg.mode !== 'decision') return null;
-  const mcp = selection.tools && cfg.research && hasDataTools(cfg.dataTools) ? mcpSetup(cfg.dataTools, { record }) : null;
+  // 方案讨论能用数据工具和知识来源；快问只用知识来源（没有调研员，数据工具没人执行）
+  if (!selection || (cfg.mode !== 'decision' && cfg.mode !== 'quick')) return null;
+  const mcp = selection.tools && cfg.mode === 'decision' && cfg.research && hasDataTools(cfg.dataTools) ? mcpSetup(cfg.dataTools, { record }) : null;
   const usableMcp = mcp?.allowed.length ? mcp : null;
   const know = selection.knowledge?.length ? knowledgeSetup(cfg.knowledge, selection.knowledge) : null;
   const usableKnow = know?.dirs.length ? know : null;

@@ -53,13 +53,18 @@ export const STAGE_LABELS = {
   datareview: '实时数据审查',
   doc: '主文档',
   doccheck: '核对主文档',
+  quickanswer: '回答',
+  challenge: '挑刺',
+  quickfinal: '快问定稿',
 };
 
 export function participantSystem(p, { maxChars, mode } = {}) {
   const refine = mode === 'refine';
   const capped = Boolean(LIMITS[mode]);
   return [
-    `你是「${p.name}${p.role ? ` · ${p.role}` : ''}」，正在和其他几位 AI 参与一场多人讨论，${refine ? '作者会全程看着讨论过程' : '讨论过程会发到团队群里'}。`,
+    mode === 'quick'
+      ? `你是「${p.name}${p.role ? ` · ${p.role}` : ''}」，正在和另一位 AI 一起处理一个人的提问：一位先回答，另一位挑刺，最后由回答的一方定稿。过程只在提问人的网页上显示。`
+      : `你是「${p.name}${p.role ? ` · ${p.role}` : ''}」，正在和其他几位 AI 参与一场多人讨论，${refine ? '作者会全程看着讨论过程' : '讨论过程会发到团队群里'}。`,
     p.persona ?? '',
     '规则：',
     '- 独立思考。不要为了和别人保持一致而改变观点；同意或反对都要给出依据。',
@@ -204,7 +209,15 @@ export function chairSystem(mode) {
 }
 
 function topicBlock(topic, mode) {
-  return `## ${mode === 'brainstorm' ? '题目' : '议题'}\n${topic.trim()}`;
+  return `## ${mode === 'brainstorm' ? '题目' : mode === 'quick' ? '问题' : '议题'}\n${topic.trim()}`;
+}
+
+/** 新建时贴进「材料」框的内容（章节原文、日志、文档片段……）：单独放，不占议题的字数上限。 */
+export const MATERIAL_MAX = 30000;
+export function materialBlock(material) {
+  const text = String(material ?? '').trim();
+  if (!text) return '';
+  return `## 提问人提供的材料（只作参考，问题以上面为准）\n${text}`;
 }
 
 /**
@@ -234,7 +247,14 @@ export function interjectionBlock(items) {
  * 所有参与者和主席共用的系统提示词：整场讨论里内容不变，放在最前面方便命中缓存。
  * 这里不写任何发言者的身份，身份和本轮任务在消息正文开头。
  */
-export function sharedSystem({ mode, topic, context, subject, dataContext }) {
+export function sharedSystem({ mode, topic, context, subject, dataContext, material }) {
+  if (mode === 'quick') {
+    return join(
+      '这是一次快问：一位 AI 先回答下面的问题，另一位 AI 挑刺，最后由回答的一方定稿成一份短文档给提问人。过程只在提问人的网页上显示，不发到群里。你的身份、规则和本次任务写在用户消息开头，以那里为准。',
+      topicBlock(topic, mode),
+      materialBlock(material),
+    );
+  }
   if (mode === 'refine') {
     const label = subjectLabel(subject);
     return join(
@@ -245,6 +265,7 @@ export function sharedSystem({ mode, topic, context, subject, dataContext }) {
   return join(
     `这是一场多 AI ${mode === 'brainstorm' ? '脑洞风暴' : '方案讨论'}，过程会发到团队群里。你的身份、规则和本轮任务写在用户消息开头，以那里为准。`,
     topicBlock(topic, mode),
+    materialBlock(material),
     contextBlock(context),
     dataContextBlock(dataContext),
   );
@@ -1074,6 +1095,15 @@ const DOC_OUTLINE = {
     '## 放弃的方向（每个一句话：是什么、为什么放弃）',
     '## 下一步',
   ],
+  quick: [
+    '# 标题（一句话说清问的是什么）',
+    '**一句话结论**：……（只写一句话，不分行、不列点）',
+    '## 回答（直接回答问题：先给结论，再给理由；问题有歧义时写明按哪种理解回答）',
+    '## 你可能没考虑到的（挑刺里成立的盲点、风险、反例和更简单的做法，按重要程度排序，每条写清会怎样；没有就写「无」）',
+    '## 需要你补充的（回答依赖、但问题里没给的信息，每条写清补上之后结论可能怎样变；没有就写「无」）',
+    '## 下一步（提问人接下来最该做的几件事，按先后顺序）',
+    '## 可存入知识库的结论（最多 3 条以后会反复用到的结论，每条一句完整的话，不含只对这次有效的细节；没有就写「无」）',
+  ],
   refine: [
     '# 标题（打磨的是哪一份、改成什么样）',
     '**一句话结论**：最该改的是什么、改完会好在哪里（只写一句话，不分行、不列点）',
@@ -1087,6 +1117,20 @@ const DOC_OUTLINE = {
 
 /** 写文档的规则：初稿、追问后更新、按核对意见修改、重写共用。 */
 function docRules(mode) {
+  if (mode === 'quick') {
+    return [
+      '## 写法',
+      '这份文档给提问人读：读完就知道答案、自己可能漏掉了什么、还要补什么信息、接下来做什么。',
+      '- 先给结论再展开，只写会影响判断的内容，不写铺垫和客套。',
+      '- 挑刺里成立的意见吸收进回答，或者写进「你可能没考虑到的」；不成立的不用写。',
+      '- 不要出现「方案 A」「评审 1」这些代号。不知道的事实写明不知道，不要编造。',
+      '- 用 Markdown：# 标题、列表、加粗都可以，不要用表格。整份文档尽量控制在 1500 字以内。',
+      '- 不要写「变更记录」，程序会按版本自动生成。',
+      '',
+      '## 文档的结构',
+      ...DOC_OUTLINE.quick,
+    ].join('\n');
+  }
   return [
     '## 写法',
     '这份文档给没看过讨论的人读，不是讨论记录的归档。动笔前先想清楚：读者读完要知道什么结论、要做什么决定、接下来做什么，全文围绕这几件事组织。',
@@ -1129,6 +1173,13 @@ function docFormat({ update = false, allowUnchanged = false } = {}) {
 }
 
 export function docSystem(mode) {
+  if (mode === 'quick') {
+    return [
+      '你刚才回答了提问人的问题，另一位 AI 对你的回答挑了刺。现在由你定稿，写成一份给提问人看的短文档。',
+      '你只看到匿名代号，不要猜测它们来自哪个模型。挑刺的意见要认真对待，但不成立的不要为了迎合而采纳。',
+      '文档会一直维护：提问人之后每次追问，你都会回答并改进这份文档。',
+    ].join('\n');
+  }
   const who = mode === 'decision' ? '主席' : '主编';
   return [
     `你是「${who}」，负责把一场多 AI ${mode === 'brainstorm' ? '脑洞风暴' : mode === 'refine' ? '作品打磨讨论' : '方案讨论'}的结果整理成主文档，给没看过讨论的人读。`,
@@ -1195,7 +1246,7 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
     otherDocsBlock(otherDocs),
     `## 人类的追问\n${question.trim()}`,
     handling === 'answer'
-      ? `## 你对追问的回答（主席判断讨论记录足以回答，没有重新讨论）\n${answer}`
+      ? `## 你对追问的回答${mode === 'quick' ? '' : '（主席判断讨论记录足以回答，没有重新讨论）'}\n${answer}`
       : handling === 'verdict'
       ? join(
         `## 人的裁决（你复述的）\n${ruling}`,
@@ -1558,4 +1609,77 @@ function reviewRules(maxChars) {
 /** 数据核实时也能联网（本场无代码、选了核实员）：只用来查公开资料。 */
 export function webAlsoLine() {
   return `**也可以联网**：需要公开资料（开源软件或云服务的行为、公开标准、厂商文档）时可以用 WebSearch、WebFetch，结论写来源链接。${NO_INTERNAL}公司内部的数据用数据工具查，不要去搜。`;
+}
+
+// ---------- 快问：回答 → 挑刺 → 定稿，共 3 次调用 ----------
+
+/** 快问里带上的知识来源：索引；能读本机文件的模型（claude-cli）还能按需打开正文。 */
+function quickKnowledgeBlock(knowledge, canRead) {
+  if (!knowledge) return '';
+  return join(
+    knowledge,
+    canRead
+      ? '上面的知识来源你可以用 Read / Grep / Glob 打开（只读）。和问题相关时先查再答，引用时写来源名和相对路径。'
+      : '上面只是知识来源的索引，你打不开正文；只在索引本身能说明问题时引用，不要猜正文内容。',
+  );
+}
+
+/** 快问第一步：回答。不停下来反问，缺的信息列出来。 */
+export function quickAnswerPrompt({ knowledge = '', canRead = false } = {}) {
+  return join(
+    `【阶段：${STAGE_LABELS.quickanswer}】`,
+    quickKnowledgeBlock(knowledge, canRead),
+    [
+      '请回答上面的问题。',
+      '- 先给结论，再给理由。问题有歧义时按最合理的理解回答，并说明你是怎么理解的。',
+      '- 不要停下来反问。回答依赖、但问题里没给的信息，单独列在「**需要补充的信息**」下，每条写清补上之后结论可能怎样变。',
+      '- 开头写「**要点**」，不超过 3 行；正文不超过 1500 字。',
+    ].join('\n'),
+  );
+}
+
+/** 快问第二步：另一位 AI 挑刺。 */
+export function quickChallengePrompt({ answer, knowledge = '', canRead = false }) {
+  return join(
+    `【阶段：${STAGE_LABELS.challenge}】`,
+    `## 另一位 AI 的回答（匿名）\n${answer}`,
+    quickKnowledgeBlock(knowledge, canRead),
+    [
+      '你的任务是挑刺，帮提问人发现自己和回答者都没想到的地方：',
+      '- 回答里错了或站不住的地方；',
+      '- 提问人可能没考虑到的盲点、风险、反例，或者更简单的做法；',
+      '- 回答依赖、但没说出来的前提。',
+      '只写成立且会改变判断的问题，每条写清为什么、会怎样；回答没问题的地方不用夸。没有实质问题就直接说没有。',
+      '开头写「**要点**」，不超过 3 行；正文不超过 800 字。',
+    ].join('\n'),
+  );
+}
+
+/** 快问第三步：回答者吸收挑刺，按快问大纲定稿成短文档。 */
+export function quickFinalPrompt({ answer, challenge }) {
+  return join(
+    `【阶段：${STAGE_LABELS.quickfinal}】`,
+    `## 你的回答\n${answer}`,
+    challenge ? `## 挑刺（另一位 AI 的意见，匿名）\n${challenge}` : '## 挑刺\n这次挑刺没有成功，只按你的回答定稿，「你可能没考虑到的」写你自己能想到的。',
+    '请吸收挑刺里成立的意见，把回答定稿成给提问人看的短文档。',
+    docRules('quick'),
+    docFormat(),
+  );
+}
+
+/** 快问的追问：只靠现在的快问文档回答，不重新讨论。 */
+export function quickFollowUpPrompt({ doc, version, followUps = [], question, knowledge = '', canRead = false }) {
+  const asked = followUps.filter((f) => f.question && f.answer);
+  return join(
+    `【阶段：${STAGE_LABELS.answer}】`,
+    `## 现在的快问文档（第 ${version} 版）\n${doc}`,
+    asked.length ? `## 之前的追问（按时间先后）\n${asked.map((f, i) => `### ${i + 1}. ${f.question.trim()}\n${f.answer}`).join('\n\n')}` : '',
+    quickKnowledgeBlock(knowledge, canRead),
+    `## 提问人的追问\n${question.trim()}`,
+    [
+      '请直接回答这次追问。追问补充了信息的，说明它怎样改变原来的结论；推翻了原来的结论就直接说。',
+      '- 先给结论，再给理由；不要停下来反问，缺的信息照样列出来。',
+      '- 开头写「**要点**」，不超过 3 行；正文不超过 1200 字。',
+    ].join('\n'),
+  );
 }

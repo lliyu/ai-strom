@@ -3,9 +3,9 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeConfig, ConfigError } from '../config.js';
-import { lineupConfig, modelPool, roleTemplates, defaultLineup, MAX_SEATS, readsCode } from '../lineup.js';
+import { lineupConfig, modelPool, roleTemplates, defaultLineup, tierLineup, MAX_SEATS, readsCode } from '../lineup.js';
 import { nextNumber, saveState, removeSessionFiles } from '../state.js';
-import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle } from '../modes.js';
+import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX } from '../modes.js';
 import { groupKeys, critiqueDigest, blockerSummary, docSections } from './digest.js';
 import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
 import { claudeSessionFile, DEFAULT_CLAUDE_CWD } from '../providers/claude-cli.js';
@@ -29,7 +29,9 @@ import { inspectKnowledge } from '../knowledge.js';
 
 const PAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'page.html');
 const LOCAL = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
-const MODE_LABELS = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨' };
+const MODE_LABELS = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨', quick: '快问' };
+/** 方案讨论的档位：小会是两位主笔、一位评审，最多 3 轮。 */
+const MEETING_MAX_ROUNDS = 3;
 
 /** runsDir：Lark 监听进程的运行文件所在目录（.watch.state.json）。store：记录库，默认按配置打开。 */
 export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock = false, store = storeOf(cfg), runsDir = RUNS, log = defaultLog, echo = true, pollMs = 1000, runner = { runOne, runPrepared, followUpOne } } = {}) {
@@ -173,7 +175,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return [...latest.values()].map((d) => {
       const s = docSections(d.text, mode);
       const key = `${run.number}:${d.version}`;
-      if (s.failed && mode === 'decision' && !degraded.has(key)) {
+      if (s.failed && (mode === 'decision' || mode === 'quick') && !degraded.has(key)) {
         degraded.add(key);
         log(`网页：#${run.number} 第 ${d.version} 版主文档未能提取结论（缺：${s.missing.join('、') || '大纲'}），结论页显示全文`);
       }
@@ -250,6 +252,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       applied: state?.applied ?? null,
       mock: Boolean(state?.mock ?? start?.mock ?? row.mock) || (!run.execs.length && mock),
       archived: Boolean(row.archived_at),
+      tier: row.info?.tier ?? null,
     };
   }
 
@@ -276,6 +279,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       mode,
       channel: channelOf(run),
       topic: state?.topic ?? start?.topic ?? row.topic ?? '',
+      tier: row.info?.tier ?? null,
+      material: state?.material ?? start?.material ?? null,
       subject: subject && subject.fields ? { type: subject.type, id: subject.id, title: subject.title, current: subject.current, background: subject.background, fields: subject.fields, version: subject.version } : subject,
       summary: state?.summary ?? null,
       conclusion: lastDiscuss?.answer ?? state?.summary ?? null,
@@ -331,7 +336,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       if (job.kind === 'refine') {
         await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
       } else if (job.kind === 'discuss') {
-        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, number: job.number, repos: job.repos, data: job.data });
+        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, material: job.material, number: job.number, repos: job.repos, data: job.data });
       } else {
         // 群里的讨论在网页上追问：照样发到群里（dry-run 的讨论打印到终端）
         await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number, context: job.context });
@@ -355,9 +360,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   // ---------- 操作 ----------
 
   /** 页面上选的阵容 -> 这场讨论的配置；不传阵容用配置里的默认阵容。写错了直接 400，不排队。 */
-  function jobConfig(mode, rounds, lineup) {
+  function jobConfig(mode, rounds, lineup, base = cfg) {
     try {
-      return lineupConfig(cfg, { mode, ...(rounds !== undefined ? { rounds } : {}), lineup });
+      return lineupConfig(base, { mode, ...(rounds !== undefined ? { rounds } : {}), lineup });
     } catch (err) {
       if (err instanceof ConfigError) throw httpError(400, err.message.replace(/^配置有误：\n- /, '阵容有误：').replace(/\n- /g, '；'));
       throw err;
@@ -389,8 +394,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   /** 网页上发起方案讨论或脑洞风暴：只在网页上，不发到群里。 */
   /** 页面上选的数据工具和知识来源：{ tools, knowledge: [名字] }。只用于方案讨论；选了用不上的直接 400。 */
   function dataSelection(mode, data) {
-    if (!data || mode !== 'decision') return undefined;
-    const tools = data.tools === true;
+    if (!data || (mode !== 'decision' && mode !== 'quick')) return undefined;
+    const tools = data.tools === true && mode === 'decision'; // 快问没有调研员，数据工具没人执行
     const knowledge = Array.isArray(data.knowledge) ? [...new Set(data.knowledge.map(String))] : [];
     const avail = dataAvailable();
     if (tools && !avail.tools.count) throw httpError(400, `选了数据工具，但没有可用的工具：${avail.tools.reason}`);
@@ -416,19 +421,31 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return { tools, knowledge };
   }
 
-  function startDiscussion({ mode, topic, repos, rounds, lineup, data }) {
-    if (mode !== 'decision' && mode !== 'brainstorm') throw httpError(400, 'mode 只能是 decision 或 brainstorm');
+  /**
+   * 网页上发起：快问（quick）、方案讨论（decision，tier 为 meeting 时是小会）、脑洞风暴（brainstorm）。
+   * material 是「材料」框里的内容，单独限长，不占议题的字数上限。
+   */
+  function startDiscussion({ mode, tier, topic, material, repos, rounds, lineup, data }) {
+    if (!['decision', 'brainstorm', 'quick'].includes(mode)) throw httpError(400, 'mode 只能是 quick、decision 或 brainstorm');
+    if (tier !== undefined && tier !== null && tier !== '' && !(tier === 'meeting' && mode === 'decision')) throw httpError(400, 'tier 只能是 meeting（方案讨论的小会）');
+    const meeting = tier === 'meeting';
     const text = String(topic ?? '').trim();
-    if (!text) throw httpError(400, `${mode === 'brainstorm' ? '题目' : '议题'}不能为空`);
+    if (!text) throw httpError(400, `${mode === 'brainstorm' ? '题目' : mode === 'quick' ? '问题' : '议题'}不能为空`);
+    const mat = String(material ?? '').trim();
+    if (mat.length > MATERIAL_MAX) throw httpError(400, `材料最多 ${MATERIAL_MAX} 字，现在 ${mat.length} 字`);
     let r;
-    if (rounds !== undefined && rounds !== null && rounds !== '' && rounds !== 'auto') {
+    if (mode === 'quick' || meeting) r = mode === 'quick' ? undefined : 'auto';
+    else if (rounds !== undefined && rounds !== null && rounds !== '' && rounds !== 'auto') {
       r = Number(rounds);
       if (!Number.isInteger(r) || r < 2 || r > 12) throw httpError(400, '轮数要是 2 到 12 的整数，或者自动');
     } else if (rounds === 'auto') r = 'auto';
-    const jobCfg = jobConfig(mode, r, lineup);
+    // 快问、小会不传阵容时用各自的默认阵容（方案讨论默认阵容里挑人）
+    const seats = lineup ?? (mode === 'quick' || meeting ? tierLineup(cfg, mode === 'quick' ? 'quick' : 'meeting') : undefined);
+    if ((mode === 'quick' || meeting) && !seats) throw httpError(400, `配置里的参与者不够组成${mode === 'quick' ? '快问' : '小会'}，请在阵容里选`);
+    const jobCfg = jobConfig(mode, r, seats, meeting ? { ...cfg, maxRounds: MEETING_MAX_ROUNDS } : cfg);
     // 仓库：不写 = 方案讨论自动定位；「无」= 不读代码；否则是别名列表。先校验，写错了不排队
     let repoSpecs;
-    const repoText = String(repos ?? '').trim();
+    const repoText = mode === 'quick' ? '无' : String(repos ?? '').trim(); // 快问不读代码
     if (repoText) {
       try {
         const specs = parseRepoSpecs(repoText);
@@ -439,9 +456,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       }
     }
     const picked = dataSelection(mode, data);
-    const number = nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web' });
-    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
-    log(`网页：#${number} ${MODE_LABELS[mode]}排队`);
+    const number = nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web', ...(meeting ? { info: { tier: 'meeting' } } : {}) });
+    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), material: mat || undefined, repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
+    log(`网页：#${number} ${meeting ? '小会' : MODE_LABELS[mode]}排队`);
     return { number };
   }
 
@@ -525,6 +542,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       groups,
       maxRounds: cfg.maxRounds,
       participants: { decision: people('decision'), brainstorm: people('brainstorm'), refine: people('refine') },
+      // 新建页的档位：快问、小会的默认阵容（从方案讨论的默认阵容里挑），材料框的上限
+      tiers: { quick: tierLineup(cfg, 'quick'), meeting: tierLineup(cfg, 'meeting'), meetingMaxRounds: MEETING_MAX_ROUNDS },
+      materialMax: MATERIAL_MAX,
       // 自选阵容：可选的模型、角色模板、各模式的默认阵容
       models: modelPool(cfg).map((m) => ({ id: m.id, name: m.name, provider: m.provider, model: m.model ?? null, color: m.color ?? 'grey', readsCode: readsCode(cfg, m) })),
       roleTemplates: roleTemplates(cfg),

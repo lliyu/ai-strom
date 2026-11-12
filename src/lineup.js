@@ -83,6 +83,27 @@ export function defaultLineup(cfg, mode) {
 }
 
 /**
+ * 快问的默认阵容：方案讨论默认阵容里的第一位主笔回答，第一位评审挑刺（没有评审时用第二位）。
+ * 小会的默认阵容：两位主笔、一位评审。主席沿用方案讨论的。
+ */
+export function tierLineup(cfg, tier) {
+  const d = defaultLineup(cfg, 'decision');
+  const leads = d.participants.filter((p) => p.part !== 'reviewer');
+  const reviewers = d.participants.filter((p) => p.part === 'reviewer');
+  const rest = (taken) => d.participants.filter((p) => !taken.includes(p));
+  if (tier === 'quick') {
+    const answer = leads[0] ?? d.participants[0];
+    const critic = reviewers[0] ?? rest([answer])[0];
+    if (!answer || !critic) return null;
+    return { participants: [{ ...answer, part: 'lead' }, { ...critic, part: 'reviewer' }], chair: d.chair, factChecker: null };
+  }
+  const two = [...leads, ...reviewers].slice(0, 2);
+  const third = reviewers.find((p) => !two.includes(p)) ?? rest(two)[0];
+  if (two.length < 2 || !third) return null;
+  return { participants: [...two.map((p) => ({ ...p, part: 'lead' })), { ...third, part: 'reviewer' }], chair: d.chair, factChecker: null };
+}
+
+/**
  * 按页面上选的阵容生成这场讨论的配置。lineup = { participants: [{ model, part, role, persona }], chair: 模型 id }。
  * 同一个模型可以出现多次（比如两个 Opus 扮演不同角色），id 和名字后面加序号区分。
  * 不合法时抛 ConfigError。
@@ -94,6 +115,9 @@ export function lineupConfig(cfg, { mode, rounds, lineup }) {
   const seats = lineup.participants;
   if (!Array.isArray(seats) || seats.length < 2) throw new ConfigError('至少选 2 位参与者');
   if (seats.length > MAX_SEATS) throw new ConfigError(`最多 ${MAX_SEATS} 位参与者`);
+  if (mode === 'quick' && (seats.length !== 2 || seats.filter((x) => x?.part === 'reviewer').length !== 1)) {
+    throw new ConfigError('快问要两位：一位回答（主笔），一位挑刺（评审）');
+  }
   const pool = new Map(modelPool(cfg).map((m) => [m.id, m]));
   const used = new Set(['chair']);
   const count = new Map();

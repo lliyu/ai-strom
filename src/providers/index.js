@@ -43,7 +43,7 @@ export function createMockProvider(spec = {}) {
       const stage = /【阶段：([^】]+)】/.exec(prompt ?? '')?.[1] ?? '回答';
       if (stage === '修订版') return { text: mockRevision(prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 20 } };
       if (stage === '核对主文档') return { text: '没有问题', model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 4 } };
-      if (stage.includes('主文档')) return { text: mockDoc(stage, prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
+      if (stage.includes('主文档') || stage === '快问定稿') return { text: mockDoc(stage, prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
       return {
         text: `**${who}** 的${stage}（mock）\n\n- 要点一\n- 要点二\n\n提示词长度 ${prompt?.length ?? 0} 字。`,
         model: model ?? 'mock',
@@ -57,6 +57,25 @@ export function createMockProvider(spec = {}) {
 /** mock 的主文档：初稿或更新后的完整版本，版本号从提示词里取。 */
 function mockDoc(stage, prompt) {
   const version = Number(/现在的主文档（第 (\d+) 版）/.exec(prompt ?? '')?.[1] ?? 0) + 1;
+  if (/## 回答（直接回答问题/.test(prompt ?? '')) {
+    return [
+      '【说明】',
+      stage.startsWith('更新') ? `追问的结论（mock）：快问文档改到第 ${version} 版。` : '**一句话结论**：mock 快问的结论。',
+      '【主文档】',
+      '# mock 快问',
+      '**一句话结论**：mock 快问的结论。',
+      '## 回答',
+      `第 ${version} 版的回答（mock）。`,
+      '## 你可能没考虑到的',
+      '- 盲点一（mock）',
+      '## 需要你补充的',
+      '- 预算是多少（mock）',
+      '## 下一步',
+      '1. 先试一下（mock）',
+      '## 可存入知识库的结论',
+      '- 可以复用的结论（mock）',
+    ].join('\n');
+  }
   return [
     '【说明】',
     stage.startsWith('更新') ? `追问的结论（mock）：主文档改到第 ${version} 版。` : '**一句话结论**：mock 讨论的结论。',
@@ -72,6 +91,8 @@ function mockDoc(stage, prompt) {
     '议题背景（mock）。',
     '## 方案',
     `第 ${version} 版的方案（mock）。`,
+    '## 下一步',
+    '1. 下一步（mock）',
   ].join('\n');
 }
 

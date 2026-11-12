@@ -124,6 +124,10 @@ const DOC_SECTIONS = {
     sections: { points: /^要点/, decisions: /拍板/ },
     required: ['points', 'decisions'],
   },
+  quick: {
+    sections: { answer: /^回答/, blind: /没考虑到/, need: /补充/, next: /^下一步/, memo: /知识库/ },
+    required: ['answer', 'next'],
+  },
 };
 
 /** 按行首 `## ` 切段，跳过代码块里的 `##`。返回 { head（第一个 ## 之前）, sections: [{ title, text }] }。 */
@@ -178,10 +182,11 @@ export function docSections(text, mode = 'decision') {
   const spec = DOC_SECTIONS[mode];
   if (!spec || !text) return { failed: true, missing: [], oneLiner: null };
   const { head, sections } = splitH2(text);
-  const out = { failed: false, missing: [], oneLiner: oneLinerOf(head) };
+  const out = { failed: false, missing: [], oneLiner: oneLinerOf(head), order: [] };
   for (const [key, rule] of Object.entries(spec.sections)) {
     const hit = sections.find((s) => rule.test(s.title));
     out[key] = hit ? { title: hit.title, text: hit.text } : null;
+    if (hit) out.order.push(key); // 按大纲顺序列出切到的段，页面照这个顺序显示
   }
   if (out.decisions) out.decisions = { ...out.decisions, ...splitDecisions(out.decisions.text) };
   out.missing = spec.required.filter((k) => !out[k]);

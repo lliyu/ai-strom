@@ -209,7 +209,7 @@
     <button class="btn primary newbtn" id="new">＋ 新讨论</button>
     <input class="search" id="search" placeholder="搜索（讨论里搜议题和发言内容）">
     <div class="filters" id="filters">
-      <select id="fMode" title="模式"><option value="">全部模式</option><option value="decision">方案讨论</option><option value="brainstorm">脑洞风暴</option><option value="refine">作品打磨</option></select>
+      <select id="fMode" title="模式"><option value="">全部模式</option><option value="quick">快问</option><option value="decision">方案讨论</option><option value="brainstorm">脑洞风暴</option><option value="refine">作品打磨</option></select>
       <select id="fDays" title="时间"><option value="">全部时间</option><option value="7">最近 7 天</option><option value="30">最近 30 天</option><option value="90">最近 90 天</option></select>
       <label title="归档的讨论默认不在列表里"><input type="checkbox" id="fArchived">只看归档</label>
     </div>
@@ -221,8 +221,17 @@
 <script>
 const TABS = [['runs', '讨论'], ['idea', '脑洞'], ['premise', '梗概'], ['outline', '总纲']];
 const TYPE_LABEL = { idea: '脑洞', premise: '梗概', outline: '总纲' };
-const MODE_LABEL = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨' };
-const MODE_SHORT = { decision: '方案', brainstorm: '脑洞', refine: '打磨' };
+const MODE_LABEL = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨', quick: '快问' };
+const MODE_SHORT = { decision: '方案', brainstorm: '脑洞', refine: '打磨', quick: '快问' };
+// 新建页的档位：快问、小会（方案讨论的轻量版）、方案讨论、脑洞风暴
+const TIERS = [['quick', '快问'], ['meeting', '小会'], ['decision', '方案讨论'], ['brainstorm', '脑洞风暴']];
+const TIER_HINT = {
+  quick: '一位回答、一位挑刺、回答的一方定稿，3 次模型调用，通常一两分钟。缺的信息写在结果里，用追问补充；不够深可以「升级为讨论」。',
+  meeting: '两位主笔、一位评审，最多 3 轮，评审都没有新意见就提前结束。',
+  decision: '完整的方案讨论：可以读代码、查数据、核实事实，多轮评审直到收敛。',
+  brainstorm: '主笔发散脑洞，评审盲审，多轮修订后主编挑选。',
+};
+const modeOfTier = (t) => (t === 'meeting' ? 'decision' : t);
 const CHANNEL_LABEL = { lark: '群里', web: '网页', 'dry-run': 'dry-run' };
 const HANDLING_LABEL = { answer: '直接回答', discuss: '重新讨论', verdict: '按裁决定稿', verify: '核实' };
 const STATUS_LABEL = { queued: '排队中', running: '进行中', done: '已结束', failed: '失败', idle: '已结束' };
@@ -239,7 +248,7 @@ const FIELD_LABELS = {
 };
 
 // expanded：讨论页里展开着的组（组 id = 组键@第一条的 seq），整页重绘后恢复
-const S = { tab: 'runs', form: { mode: 'decision' }, items: [], runs: [], q: '', filter: { mode: '', days: '', archived: false }, sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null, docIdx: null, docDiff: false, docNo: null, expanded: new Set() };
+const S = { tab: 'runs', form: { tier: 'quick' }, items: [], runs: [], q: '', filter: { mode: '', days: '', archived: false }, sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null, docIdx: null, docDiff: false, docNo: null, expanded: new Set() };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -367,7 +376,7 @@ function renderList() {
     const rows = S.runs;
     html = rows.map((r) => `<div class="item ${S.run?.number === r.number ? 'on' : ''}" data-run="${r.number}">
       <div class="t">#${r.number} · ${r.mode === 'refine' ? `${esc(TYPE_LABEL[r.type] || '')}「${esc(r.topic)}」` : esc(r.topic)}</div>
-      <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span> <span class="chip">${MODE_SHORT[r.mode] || r.mode}</span> <span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.followUps ? ` 追问 ${r.followUps} 次` : ''}${r.hasRevision ? ' · 有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.mock ? ' · mock' : ''}</div>
+      <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span> <span class="chip">${r.tier === 'meeting' ? '小会' : MODE_SHORT[r.mode] || r.mode}</span> <span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.followUps ? ` 追问 ${r.followUps} 次` : ''}${r.hasRevision ? ' · 有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.mock ? ' · mock' : ''}</div>
       ${r.requirement ? `<div class="p">要求：${esc(r.requirement)}</div>` : ''}</div>`).join('');
     if (!rows.length) html = `<div class="empty">${S.q.trim() || S.filter.mode || S.filter.days || S.filter.archived ? '没有符合条件的讨论' : '还没有讨论'}</div>`;
   } else {
@@ -434,8 +443,10 @@ async function openItem(type, id) {
 // ---------- 阵容：这场讨论用哪些模型、各自当什么角色 ----------
 const LINEUP_KEY = (mode) => `ai-storm.lineup.${mode}`;
 const PART_LABEL = { lead: '主笔', reviewer: '评审' };
+const QUICK_PART = { lead: '回答', reviewer: '挑刺' };
 const clone = (x) => JSON.parse(JSON.stringify(x));
-function defaultLineupOf(mode) { return clone(S.status?.lineups?.[mode] || { participants: [], chair: null }); }
+// mode 这里是阵容的键：quick、meeting 用新建页档位的默认阵容，其余用各模式的
+function defaultLineupOf(mode) { return clone((mode === 'quick' || mode === 'meeting' ? S.status?.tiers?.[mode] : S.status?.lineups?.[mode]) || { participants: [], chair: null }); }
 // 上次在这个模式下用的阵容记在本机浏览器里；模型已经从配置里删掉的就退回默认
 function lineupOf(mode) {
   S.lineups = S.lineups || {};
@@ -448,8 +459,9 @@ function lineupOf(mode) {
   return S.lineups[mode];
 }
 function saveLineup(mode) { try { localStorage.setItem(LINEUP_KEY(mode), JSON.stringify(S.lineups[mode])); } catch { /* 同上 */ } }
-function lineupProblem(l) {
+function lineupProblem(l, mode) {
   const leads = l.participants.filter((p) => p.part !== 'reviewer').length;
+  if (mode === 'quick' && (l.participants.length !== 2 || leads !== 1)) return '快问要两位：一位回答，一位挑刺';
   if (l.participants.length < 2) return '至少要 2 位参与者';
   if (!leads) return '至少要 1 位主笔';
   const blank = l.participants.findIndex((p) => !String(p.role || '').trim());
@@ -461,17 +473,18 @@ function seatsHtml(mode) {
   const l = lineupOf(mode);
   const models = st.models || [];
   const tpls = st.roleTemplates || [];
-  const fits = tpls.filter((t) => !t.modes?.length || t.modes.includes(mode)), others = tpls.filter((t) => !fits.includes(t));
+  const fits = tpls.filter((t) => !t.modes?.length || t.modes.includes(modeOfTier(mode))), others = tpls.filter((t) => !fits.includes(t));
   const tplOptions = `<option value="">套用角色模板…</option>${fits.map((t) => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('')}${others.length ? `<optgroup label="其他模式的模板">${others.map((t) => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('')}</optgroup>` : ''}`;
+  const quick = mode === 'quick';
   return l.participants.map((p, i) => {
     const m = models.find((x) => x.id === p.model);
     return `<div class="seat" data-i="${i}" style="--c:${COLORS[m?.color] || 'var(--line)'}">
       <div class="st">
         <select data-k="model" title="模型">${models.map((x) => `<option value="${esc(x.id)}" ${x.id === p.model ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select>
-        <select data-k="part" title="主笔出方案并多轮修订；评审只提意见">${['lead', 'reviewer'].map((k) => `<option value="${k}" ${(p.part || 'lead') === k ? 'selected' : ''}>${PART_LABEL[k]}</option>`).join('')}</select>
+        ${quick ? `<span class="chip" title="快问固定一位回答、一位挑刺">${QUICK_PART[p.part === 'reviewer' ? 'reviewer' : 'lead']}</span>` : `<select data-k="part" title="主笔出方案并多轮修订；评审只提意见">${['lead', 'reviewer'].map((k) => `<option value="${k}" ${(p.part || 'lead') === k ? 'selected' : ''}>${PART_LABEL[k]}</option>`).join('')}</select>`}
         <select data-k="tpl">${tplOptions}</select>
         <input type="text" data-k="role" value="${esc(p.role || '')}" placeholder="角色，例如 架构视角" maxlength="40">
-        <button class="del" data-k="del" title="去掉这位" ${l.participants.length <= 2 ? 'disabled' : ''}>✕</button>
+        <button class="del" data-k="del" title="去掉这位" ${l.participants.length <= 2 || quick ? 'disabled' : ''}>✕</button>
       </div>
       <textarea data-k="persona" placeholder="角色设定（可选）：关注什么、怎么挑毛病">${esc(p.persona || '')}</textarea>
     </div>`;
@@ -481,6 +494,12 @@ function lineupHtml(mode) {
   const st = S.status || {};
   const l = lineupOf(mode);
   const chairName = mode === 'refine' ? '主编' : '主席';
+  if (mode === 'quick') {
+    return `<label>参与者<button class="btn" id="lnReset" type="button">恢复默认</button></label>
+    <div class="seats" id="seats">${seatsHtml(mode)}</div>
+    <div class="lnbar"><button class="btn" id="lnAdd" type="button" style="display:none"></button><span class="hint" id="lnHint"></span></div>
+    <div class="hint" style="margin-top:4px">回答的一方先答、最后定稿，追问也由它回答；挑刺的一方只找问题。阵容记在这台电脑的浏览器里。</div>`;
+  }
   return `<label>参与者<button class="btn" id="lnReset" type="button">恢复默认</button></label>
     <div class="seats" id="seats">${seatsHtml(mode)}</div>
     <div class="lnbar">
@@ -488,7 +507,7 @@ function lineupHtml(mode) {
       <span>${chairName}（最后汇总${mode === 'refine' ? '并写修订版' : '、写主文档'}）用 <select id="lnChair">${(st.models || []).map((m) => `<option value="${esc(m.id)}" ${m.id === l.chair ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></span>
       <span class="hint" id="lnHint"></span>
     </div>
-    ${mode === 'decision' ? `<div class="lnbar"><span>核实员 <select id="lnChecker" title="有代码时读代码回答「待核实的事实」；本场无代码时联网搜集资料、联网核实"><option value="">不用（${(st.repos || []).length ? '调研员直接读代码核实；无代码时不联网' : '不联网搜集资料'}）</option>${(st.models || []).filter((m) => m.readsCode).map((m) => `<option value="${esc(m.id)}" ${m.id === l.factChecker ? 'selected' : ''}>${esc(m.name)}：先答，调研员审查纠正后再发</option>`).join('')}</select></span></div>
+    ${mode === 'decision' || mode === 'meeting' ? `<div class="lnbar"><span>核实员 <select id="lnChecker" title="有代码时读代码回答「待核实的事实」；本场无代码时联网搜集资料、联网核实"><option value="">不用（${(st.repos || []).length ? '调研员直接读代码核实；无代码时不联网' : '不联网搜集资料'}）</option>${(st.models || []).filter((m) => m.readsCode).map((m) => `<option value="${esc(m.id)}" ${m.id === l.factChecker ? 'selected' : ''}>${esc(m.name)}：先答，调研员审查纠正后再发</option>`).join('')}</select></span></div>
     <div class="hint">选了核实员：有代码时它读代码回答「待核实的事实」；本场无代码时，主席先判断要不要联网搜集资料，它联网查、调研员联网审查，讨论中的待核实问题也联网查。搜索关键词不带公司内部信息。</div>` : ''}
     <div class="hint" style="margin-top:4px">${mode === 'brainstorm' ? '主笔发散并修订脑洞；评审只做盲审、不出脑洞。' : '主笔出方案并多轮修订；评审只提意见，不出方案。'}同一个模型可以选多次，扮演不同角色。阵容记在这台电脑的浏览器里，下次默认沿用。</div>`;
 }
@@ -496,9 +515,9 @@ function lineupHtml(mode) {
 function bindLineup(mode, onChange) {
   const l = lineupOf(mode);
   const refresh = () => {
-    const problem = lineupProblem(l);
+    const problem = lineupProblem(l, mode);
     const leads = l.participants.filter((p) => p.part !== 'reviewer').length;
-    $('lnHint').innerHTML = problem ? `<span class="err">${esc(problem)}</span>` : `${leads} 位主笔${l.participants.length - leads ? `、${l.participants.length - leads} 位评审` : ''}`;
+    $('lnHint').innerHTML = problem ? `<span class="err">${esc(problem)}</span>` : mode === 'quick' ? '' : `${leads} 位主笔${l.participants.length - leads ? `、${l.participants.length - leads} 位评审` : ''}`;
     $('lnAdd').disabled = l.participants.length >= (S.status?.maxSeats || 8);
     onChange?.(!problem);
   };
@@ -530,7 +549,7 @@ function bindLineup(mode, onChange) {
     if (!m) return;
     l.participants.push({ model: m.id, part: 'lead', role: '', persona: '' }); saveLineup(mode); redraw();
   };
-  $('lnChair').onchange = (ev) => { l.chair = ev.target.value; saveLineup(mode); };
+  if ($('lnChair')) $('lnChair').onchange = (ev) => { l.chair = ev.target.value; saveLineup(mode); };
   if ($('lnChecker')) $('lnChecker').onchange = (ev) => { l.factChecker = ev.target.value || null; saveLineup(mode); };
   $('lnReset').onclick = () => {
     S.lineups[mode] = defaultLineupOf(mode); saveLineup(mode);
@@ -539,55 +558,76 @@ function bindLineup(mode, onChange) {
   };
   refresh();
 }
-const lineupPayload = (mode) => { const l = lineupOf(mode); return { participants: l.participants.map((p) => ({ model: p.model, part: p.part || 'lead', role: String(p.role || '').trim(), persona: String(p.persona || '').trim() })), chair: l.chair, factChecker: mode === 'decision' ? l.factChecker || null : null }; };
+const lineupPayload = (mode) => { const l = lineupOf(mode); return { participants: l.participants.map((p) => ({ model: p.model, part: p.part || 'lead', role: String(p.role || '').trim(), persona: String(p.persona || '').trim() })), chair: l.chair, factChecker: mode === 'decision' || mode === 'meeting' ? l.factChecker || null : null }; };
 
-// ---------- 新讨论 ----------
+// ---------- 新讨论：一个问题框、一个材料框、档位；仓库、数据与知识、轮数、阵容收在「高级选项」里 ----------
 function openForm() {
   closeStream(); S.run = null; S.sel = null; S.tab = 'runs'; renderTabs(); renderList();
   const st = S.status || {};
   const f = S.form;
+  if (!TIERS.some(([k]) => k === f.tier)) f.tier = 'quick';
+  const tier = f.tier, mode = modeOfTier(tier);
   const repoHint = [...(st.groups || []).map((g) => `${g}（组）`), ...(st.repos || [])].join('、');
+  const max = st.materialMax || 30000;
+  const what = tier === 'brainstorm' ? '题目' : tier === 'quick' ? '问题' : '议题';
+  const adv = [
+    mode === 'decision' ? `<label>代码仓库</label>
+      <input type="text" id="repos" value="${esc(f.repos || '')}" placeholder="不写：调研员按议题自己定位；写「无」：不读代码；或者写别名，逗号分隔，@ 后写分支">
+      <div class="hint" style="margin-top:4px">可用：${esc(repoHint) || '（还没登记仓库）'}</div>` : '',
+    mode === 'decision' || tier === 'quick' ? dataHtml(st, f, tier === 'quick') : '',
+    tier === 'decision' || tier === 'brainstorm' ? `<label>轮数</label>
+      <select id="rounds"><option value="auto">自动：评审都没有新意见就结束（最多 ${st.maxRounds || 8} 轮）</option>${[2, 3, 4, 5, 6, 8].map((n) => `<option value="${n}" ${String(f.rounds) === String(n) ? 'selected' : ''}>固定 ${n} 轮</option>`).join('')}</select>` : '',
+    `<div id="lineupBox">${lineupHtml(tier)}</div>`,
+  ].filter(Boolean).join('');
   $('main').innerHTML = `
     <div class="head"><h2>新讨论</h2><span class="chip web">只在网页上，不发到群里</span></div>
     <div class="card form">
-      <div class="seg" id="modeSeg">${['decision', 'brainstorm'].map((m) => `<button data-mode="${m}" class="${f.mode === m ? 'on' : ''}">${MODE_LABEL[m]}</button>`).join('')}</div>
-      <label>${f.mode === 'brainstorm' ? '题目' : '议题'}</label>
-      <textarea id="topic" placeholder="${f.mode === 'brainstorm' ? '例如：给一款面向独居老人的智能音箱想功能' : '例如：订单服务要不要从单库拆成按用户分库？目前日订单 50 万……'}">${esc(f.topic || '')}</textarea>
-      ${f.mode === 'decision' ? `<label>代码仓库</label>
-      <input type="text" id="repos" value="${esc(f.repos || '')}" placeholder="不写：调研员按议题自己定位；写「无」：不读代码；或者写别名，逗号分隔，@ 后写分支">
-      <div class="hint" style="margin-top:4px">可用：${esc(repoHint) || '（还没登记仓库）'}</div>
-      ${dataHtml(st, f)}` : ''}
-      <label>轮数</label>
-      <select id="rounds"><option value="auto">自动：评审都没有新意见就结束（最多 ${st.maxRounds || 8} 轮）</option>${[2, 3, 4, 5, 6, 8].map((n) => `<option value="${n}" ${String(f.rounds) === String(n) ? 'selected' : ''}>固定 ${n} 轮</option>`).join('')}</select>
-      <div id="lineupBox">${lineupHtml(f.mode)}</div>
+      <div class="seg" id="modeSeg">${TIERS.map(([k, l]) => `<button data-tier="${k}" class="${tier === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <div class="hint" style="margin-top:8px">${esc(TIER_HINT[tier])}</div>
+      <label>${what}</label>
+      <textarea id="topic" placeholder="${tier === 'brainstorm' ? '例如：给一款面向独居老人的智能音箱想功能' : tier === 'quick' ? '例如：周末两个人去杭州还是苏州？预算两千' : '例如：订单服务要不要从单库拆成按用户分库？目前日订单 50 万……'}">${esc(f.topic || '')}</textarea>
+      <label>材料（可选）<span class="hint" id="matCount" style="font-weight:400;margin-left:8px"></span></label>
+      <textarea id="material" style="min-height:80px" placeholder="贴上相关的原文：章节、日志、文档片段、之前的结论……最多 ${max} 字，不占${what}的字数。">${esc(f.material || '')}</textarea>
+      <details class="adv" style="margin-top:12px" ${f.advOpen ? 'open' : ''}><summary>高级选项${tier === 'quick' ? '：知识来源、阵容' : mode === 'decision' ? '：仓库、数据与知识、阵容' : '：轮数、阵容'}</summary>${adv}</details>
       <div class="row"><button class="btn primary" id="startDiscuss">开始</button></div>
     </div>`;
-  bindLineup(f.mode, (ok) => { $('startDiscuss').disabled = !ok; });
+  bindLineup(tier, (ok) => { $('startDiscuss').disabled = !ok; });
+  const count = () => { const n = $('material').value.trim().length; $('matCount').innerHTML = n ? `${n} / ${max} 字${n > max ? ' <span class="err">超出上限</span>' : ''}` : ''; };
+  $('material').addEventListener('input', count); count();
   const keep = () => {
-    f.topic = $('topic').value; f.repos = $('repos')?.value ?? f.repos; f.rounds = $('rounds').value;
+    f.topic = $('topic').value; f.material = $('material').value; f.repos = $('repos')?.value ?? f.repos; f.rounds = $('rounds')?.value ?? f.rounds;
+    f.advOpen = document.querySelector('details.adv')?.open;
     if ($('dataTools')) f.dataTools = $('dataTools').checked;
     if (document.querySelector('[data-know]')) f.knowledge = [...document.querySelectorAll('[data-know]:checked')].map((x) => x.dataset.know);
   };
-  $('modeSeg').onclick = (ev) => { const b = ev.target.closest('[data-mode]'); if (!b) return; keep(); f.mode = b.dataset.mode; openForm(); };
+  $('modeSeg').onclick = (ev) => { const b = ev.target.closest('[data-tier]'); if (!b) return; keep(); f.tier = b.dataset.tier; openForm(); };
   $('startDiscuss').onclick = async () => {
     keep();
-    if (!f.topic.trim()) { toast('先写议题'); return; }
+    if (!f.topic.trim()) { toast(`先写${what}`); return; }
+    if (f.material.trim().length > max) { toast(`材料最多 ${max} 字`); return; }
     $('startDiscuss').disabled = true;
     try {
-      const data = f.mode === 'decision' ? { tools: Boolean(f.dataTools), knowledge: f.knowledge || [] } : undefined;
-      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ mode: f.mode, topic: f.topic, repos: f.mode === 'decision' ? f.repos : '', rounds: f.rounds, lineup: lineupPayload(f.mode), data }) });
-      S.form = { mode: f.mode };
+      const data = mode === 'decision' || tier === 'quick' ? { tools: tier !== 'quick' && Boolean(f.dataTools), knowledge: f.knowledge || [] } : undefined;
+      const body = { mode, ...(tier === 'meeting' ? { tier: 'meeting' } : {}), topic: f.topic, material: f.material, repos: mode === 'decision' ? f.repos : '', rounds: tier === 'decision' || tier === 'brainstorm' ? f.rounds : undefined, lineup: lineupPayload(tier), data };
+      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify(body) });
+      S.form = { tier };
       await loadRuns(); openRun(number);
     } catch (e) { toast(e.message, 6000); $('startDiscuss').disabled = false; }
   };
 }
 
 /** 方案讨论：数据工具和知识来源的勾选。默认能用的都勾上（主席判断要不要查，不需要时不会多花钱）。 */
-function dataHtml(st, f) {
+function dataHtml(st, f, knowledgeOnly = false) {
   const d = st.data || { tools: { count: 0 }, knowledge: [] };
   const know = d.knowledge.filter((k) => k.exists);
   if (f.dataTools === undefined) f.dataTools = d.tools.count > 0;
   if (f.knowledge === undefined) f.knowledge = know.map((k) => k.name);
+  if (knowledgeOnly) {
+    if (!know.length) return '';
+    return `<label>知识来源</label>
+      <div class="row" style="margin-top:4px">${know.map((k) => `<span class="pick" title="${esc(k.description || '')}"><input type="checkbox" data-know="${esc(k.name)}" ${f.knowledge.includes(k.name) ? 'checked' : ''}> ${esc(k.name)}（${k.docs} 篇）</span>`).join('')}</div>
+      <div class="hint" style="margin-top:4px">索引写进提示词；能读本机文件的模型（claude 命令）还能打开正文，其他模型只看得到索引。快问不查实时数据，要查就用方案讨论。</div>`;
+  }
   const tools = d.tools.count
     ? `<span class="pick"><input type="checkbox" id="dataTools" ${f.dataTools ? 'checked' : ''}> 数据工具（${d.tools.count} 个只读工具：${esc((d.tools.sources || []).join('、'))}）</span>`
     : `<span class="hint">数据工具不可用：${esc(d.tools.reason || '没有登记')}</span>`;
@@ -599,6 +639,15 @@ function dataHtml(st, f) {
 
 // ---------- 一场讨论 ----------
 function closeStream() { if (S.es) { S.es.close(); S.es = null; } clearInterval(S.ticker); hideNewMsg(); }
+// 重新取一场讨论的详情并重绘，保持当前子页、展开的组和滚动位置
+async function refreshRun(number) {
+  const fresh = await api(`/api/runs/${number}`).catch(() => null);
+  if (!fresh || S.run?.number !== number) return null;
+  const s = scroller(), top = s.scrollTop;
+  S.run = fresh; renderRun(); s.scrollTop = top;
+  return fresh;
+}
+
 // 子页：方案讨论有主文档时「结论 / 讨论 / 文档」；只有旧版汇总时「结论（旧版汇总） / 讨论」
 function tabsOf(r) {
   const docs = r.docs || [];
@@ -607,14 +656,14 @@ function tabsOf(r) {
   const revs = r.revisions?.length ? r.revisions : r.revision ? [r.revision] : [];
   if (r.mode === 'refine') return [['talk', '讨论'], docTab, ['rev', `修订版${revs.length ? '' : '（还没有）'}`], ['orig', '原稿']];
   if (!docs.length && r.summary) return [['conclusion', '结论（旧版汇总）'], ['talk', '讨论']];
-  if (r.mode === 'decision') return [['concl', '结论'], ['talk', '讨论'], docTab];
+  if (r.mode === 'decision' || r.mode === 'quick') return [['concl', '结论'], ['talk', '讨论'], docTab];
   return [['talk', '讨论'], docTab];
 }
 // 默认落点只在打开讨论时决定：已结束且有主文档进结论页；没有主文档进旧版汇总，再没有进讨论页；进行中进讨论页
 function landingOf(r) {
   const st = r.progress?.status;
   const live = st === 'running' || st === 'queued';
-  if (r.mode !== 'decision') return 'talk';
+  if (r.mode !== 'decision' && r.mode !== 'quick') return 'talk';
   if (live) return 'talk';
   if (r.docs?.length) return 'concl';
   return r.summary ? 'conclusion' : 'talk';
@@ -640,6 +689,8 @@ async function openRun(number, sub) {
     // 新建的组一律展开（不在讨论页时也记下，切回来时是展开的）
     if (p.groupKey && prev?.groupKey !== p.groupKey) S.expanded.add(`${p.groupKey}@${p.seq}`);
     S.run.posts.push(p); appendPost(p, prev);
+    // 主文档写出了新的一版：重新取详情，结论页和文档页跟着更新（运行太快、状态推送没看到变化时也能更新）
+    if (p.stage === 'doc') refreshRun(number);
   });
   es.addEventListener('blockers', (ev) => {
     if (S.run?.number !== number) return;
@@ -651,8 +702,8 @@ async function openRun(number, sub) {
     if (S.run?.number !== number) return;
     S.run.progress = prog; renderProgress();
     if (was !== prog.status && (prog.status === 'done' || prog.status === 'failed' || prog.status === 'running')) {
-      const fresh = await api(`/api/runs/${number}`).catch(() => null);
-      if (fresh && S.run?.number === number) { const s = scroller(), top = s.scrollTop; S.run = fresh; renderRun(); s.scrollTop = top; if (fresh.mode === 'refine' && fresh.revision && prog.status === 'done') toast('修订版写好了，去「修订版」里对比'); }
+      const fresh = await refreshRun(number);
+      if (fresh?.mode === 'refine' && fresh.revision && prog.status === 'done') toast('修订版写好了，去「修订版」里对比');
       loadRuns(); loadStatus();
     }
   });
@@ -781,9 +832,10 @@ function appendPost(p, prev) {
 }
 function ago(at) { const s = Math.max(0, Math.round((Date.now() - Date.parse(at)) / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; }
 // ---------- 吸顶状态条：状态、第几轮、谁在写、结束原因、仍提阻断的评审数 ----------
-function endingHtml(o) {
+function endingHtml(o, mode) {
   if (!o?.ending) return '';
-  const label = ENDING_LABEL[o.ending] || o.ending;
+  // 快问本身也记为「直接回答」：没有追问时写成「快问已定稿」
+  const label = mode === 'quick' && o.ending === 'answered' && !o.handling ? '快问已定稿' : ENDING_LABEL[o.ending] || o.ending;
   const round = o.round && ['converged', 'max', 'fixed', 'deadlock', 'dissent'].includes(o.ending) ? `第 ${o.round} 轮 · ` : '';
   const via = o.handling === 'discuss' && o.ending !== 'followup' ? '追问后重新讨论 · ' : '';
   return `<span class="${ENDING_WARN.has(o.ending) ? 'warn' : ''}">结束：${via}${round}${esc(label)}</span>`;
@@ -798,7 +850,7 @@ function renderStat() {
     items.push(`<span><span class="dot" style="display:inline-block;margin-right:6px"></span>${lastRound ? `第 ${lastRound} 轮` : '准备中'}${who ? ` · ${who} 在写` : ''}</span>`);
   } else if (p.status === 'queued') items.push('<span>排队中</span>');
   else if (p.status === 'failed') items.push(`<span class="warn">失败：${esc(p.error || '')}</span>`);
-  if (p.status !== 'running' && p.status !== 'queued') items.push(endingHtml(o));
+  if (p.status !== 'running' && p.status !== 'queued') items.push(endingHtml(o, r.mode));
   if (o.followUpStatus === 'running' && p.status !== 'running') items.push('<span>追问进行中</span>');
   if (o.followUpStatus === 'failed' && p.status !== 'failed') items.push('<span class="warn">最近一次追问没有完成</span>');
   if (typeof o.facts === 'number' && o.facts) items.push(`<span>核实了 ${o.facts} 个问题</span>`);
@@ -850,6 +902,8 @@ function renderProgress() {
     comp.dataset.mode = mode;
     comp.innerHTML = mode === 'talk'
       ? `<textarea id="say" placeholder="插话：下一轮开始时交给所有模型${lark ? '，群里也会出一张卡片' : ''}${refine ? '（例如：别动主角的名字；结局我想要开放式）' : ''}"></textarea><button class="btn primary" id="send">插话</button>`
+      : mode === 'ask' && S.run.mode === 'quick'
+        ? `<textarea id="say" placeholder="追问：补充信息或接着问，回答的一方直接回答并更新快问文档"></textarea><button class="btn primary" id="send">追问</button>`
       : mode === 'ask'
         ? `<textarea id="say" placeholder="追问：${refine ? '主编' : '主席'}判断直接回答、按裁决定稿（例如「按方案 A」）、核实还是重新讨论${refine ? '；重新讨论后会重写修订版' : ''}${lark ? '。这是群里的讨论，追问过程会发到群里' : ''}"></textarea><select id="ctx" title="重新讨论或定稿时，参与者接着原来的会话，还是各开一条新会话（带上主文档、方案、阻断存档、核实结果）"><option value="resume" ${S.run.followUpContext !== 'fresh' ? 'selected' : ''}>接着原会话</option><option value="fresh" ${S.run.followUpContext === 'fresh' ? 'selected' : ''}>新会话</option></select><button class="btn primary" id="send">追问</button>`
         : S.run.expired ? `<span class="hint">已超过保留期，会话已清理，不能再追问${refine ? '；修订版仍然可以写回' : ''}。</span>` : '';
@@ -897,13 +951,22 @@ function conclHtml(r, status) {
   const titleOf = (n) => docTitleOf(docs.filter((d) => docNoOf(d) === n).pop() || {});
   const head = `${nos.length > 1 ? `<div class="docbar">${nos.map((n) => `<button class="btn ${n === s.docNo ? 'primary' : ''}" data-docno="${n}">《${esc(titleOf(n))}》</button>`).join('')}</div>` : ''}
     ${live || r.outcome?.followUpStatus === 'running' ? '<div class="banner">追问进行中，下面是上一版主文档的结论。</div>' : ''}`;
-  const tail = `<div class="card"><h3>结束状态</h3>${endingHtml(r.outcome) || '<span class="hint">结束原因未知</span>'}
+  const tail = `<div class="card"><h3>结束状态</h3>${endingHtml(r.outcome, r.mode) || '<span class="hint">结束原因未知</span>'}
       ${r.outcome?.followUpStatus === 'failed' ? '<div class="warn" style="color:var(--warn)">最近一次追问没有完成，结束原因取的是前一次。</div>' : ''}
       ${typeof r.outcome?.facts === 'number' ? `<div class="hint">讨论中核实了 ${r.outcome.facts} 个问题。</div>` : ''}</div>
     ${blockerBoxHtml(r.blockers, r.outcome)}
     <div class="row"><button class="btn" data-sub="doc">看全文（第 ${s.version} 版）</button></div>`;
+  if (s.failed && r.mode === 'quick') return `${head}<div class="banner warn">未能提取结论，下面显示全文。</div><div class="card">${md(doc?.text || '')}</div><div class="row"><button class="btn primary" data-upgrade="1">升级为讨论</button></div>`;
   if (s.failed) return `${head}<div class="banner warn">未能提取结论（主文档里缺少：${esc((s.missing || []).map((k) => ({ points: '要点', decisions: '要拍板的事', next: '下一步' }[k] || k)).join('、') || '大纲')}），下面显示全文。</div><div class="card">${md(doc?.text || '')}</div>${tail}`;
   const sec = (x, title) => (x ? `<div class="card"><h3>${esc(title || x.title)}</h3>${md(x.text)}</div>` : '');
+  if (r.mode === 'quick') {
+    const QUICK_TITLE = { answer: '回答', blind: '你可能没考虑到的', need: '需要你补充的', next: '下一步', memo: '可存入知识库的结论' };
+    return `${head}
+      ${s.oneLiner ? `<div class="card oneliner">${md(s.oneLiner)}</div>` : ''}
+      ${(s.order || []).map((k) => sec(s[k], QUICK_TITLE[k])).join('')}
+      <div class="row"><button class="btn primary" data-upgrade="1" title="把问题和这份结果带进新建页，按方案讨论或小会再讨论一次">升级为讨论</button><button class="btn" data-sub="doc">看全文（第 ${s.version} 版）</button>
+        <span class="hint">${r.expired ? '已超过保留期，不能再追问，可以升级为讨论。' : '在下面追问补充信息，回答的一方会直接回答并更新这份文档。'}</span></div>`;
+  }
   const d = s.decisions;
   const decisions = d ? `<div class="card"><h3>${esc(d.title)}</h3>${d.lead ? md(d.lead) : ''}${d.parts.map((p) => `<div class="dsub ${p.pick ? 'pick' : ''}"><h4>${esc(p.title)}</h4>${md(p.text)}</div>`).join('')}</div>` : '';
   return `${head}
@@ -928,7 +991,7 @@ function renderRun() {
       <div class="statline" id="statline"></div>
       <div class="subtabs">${tabs.map(([k, l]) => `<button class="subtab ${S.sub === k ? 'on' : ''}" data-sub="${k}">${l}</button>`).join('')}<span class="tools" id="tools"></span></div>
     </div>
-    <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整议题</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : ''}${r.data ? ` · ${[r.data.tools ? '数据工具' : '', r.data.knowledge.length ? `知识：${esc(r.data.knowledge.join('、'))}` : ''].filter(Boolean).join(' · ')}` : ''}${r.followUps.length ? ` · 追问 ${r.followUps.length} 次` : ''}</div>
+    <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整${r.mode === 'quick' ? '问题' : '议题'}</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.material ? `<details><summary>材料（${r.material.length} 字）</summary><div class="pre">${esc(r.material)}</div></details>` : ''}${[r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : '', r.data?.tools ? '数据工具' : '', r.data?.knowledge?.length ? `知识：${esc(r.data.knowledge.join('、'))}` : '', r.followUps.length ? `追问 ${r.followUps.length} 次` : ''].filter(Boolean).join(' · ')}</div>
     <div id="pane"></div>
     <div class="progress" id="progress"><div class="bar"></div><div class="composer"></div></div>`;
   renderStat(); renderTools(); renderProgress();
@@ -1011,15 +1074,28 @@ function renderRun() {
   }
 }
 
+// 快问「升级为讨论」：问题照搬，快问结果和原来的材料放进材料框，默认选小会，可以改档位和阵容再开始
+function upgradeQuick() {
+  const r = S.run; if (!r) return;
+  const doc = (r.docs || []).at(-1);
+  const max = S.status?.materialMax || 30000;
+  let material = [r.material ? `## 原来的材料\n${r.material}` : '', `## 快问 #${r.number} 的结果${doc ? `（第 ${doc.version} 版）` : ''}\n${doc?.text || r.summary || ''}`].filter(Boolean).join('\n\n');
+  if (material.length > max) material = `${material.slice(0, max - 20)}\n（超出上限，已截断）`;
+  S.form = { tier: 'meeting', topic: r.topic, material, advOpen: false };
+  openForm();
+  toast('已把问题和快问结果带进来，确认档位后点「开始」');
+}
+
 // ---------- 事件 ----------
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],.more');
+  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],[data-upgrade],.more');
   if (!t) return;
   if (t.matches('.more')) { const post = t.closest('.post'); post.classList.remove('fold'); t.remove(); return; }
   ev.preventDefault();
   if (t.dataset.grp) { setOpen(t.dataset.grp, !S.expanded.has(t.dataset.grp)); return; }
   if (t.dataset.allgrp) { for (const b of blocksOf(S.run.posts).filter((x) => x.key)) setOpen(b.id, t.dataset.allgrp === '1'); return; }
   if (t.dataset.blkjump) { blockerJump(); return; }
+  if (t.dataset.upgrade) { upgradeQuick(); return; }
   if (t.dataset.tab) { S.tab = t.dataset.tab; renderTabs(); renderList(); if (S.tab === 'runs') loadRuns(); }
   else if (t.dataset.run) openRun(Number(t.dataset.run));
   else if (t.dataset.type) openItem(t.dataset.type, t.dataset.id);

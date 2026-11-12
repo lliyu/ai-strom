@@ -12,7 +12,7 @@ export const CARD_COLORS = [
   'blue', 'wathet', 'turquoise', 'green', 'yellow', 'orange',
   'red', 'carmine', 'violet', 'purple', 'indigo', 'grey',
 ];
-export const MODES = ['decision', 'brainstorm', 'refine'];
+export const MODES = ['decision', 'brainstorm', 'refine', 'quick'];
 export const PARTS = ['lead', 'reviewer'];
 
 /** 解析 .env：KEY=VALUE，忽略空行与注释；已存在的环境变量不覆盖。 */
@@ -65,6 +65,11 @@ export function normalizeConfig(raw, overrides = {}) {
     ? overrides.rounds === 'auto'
     : cfg.adaptive === true || cfg.rounds === undefined || cfg.rounds === null || cfg.rounds === 'auto';
   cfg.rounds = cfg.adaptive ? cfg.maxRounds : Number(cfg.rounds);
+  // 快问固定一轮：回答 → 挑刺 → 定稿
+  if (cfg.mode === 'quick') {
+    cfg.adaptive = false;
+    cfg.rounds = 1;
+  }
   cfg.concurrency = Number(cfg.concurrency ?? 3);
   // 会话：每位参与者整场讨论在同一条会话里，记得自己之前说过的话。false 时每轮都是新会话
   cfg.conversation = cfg.conversation !== false;
@@ -107,7 +112,7 @@ export function normalizeConfig(raw, overrides = {}) {
   const leadCount = parts.filter((x) => x === 'lead').length;
   const reviewerCount = parts.filter((x) => x === 'reviewer').length;
   if (Array.isArray(cfg.participants) && leadCount === 0) errors.push('至少需要 1 位主笔（part 为 lead 或不填）');
-  if (reviewerCount && cfg.rounds < 2) errors.push('配置了评审时 rounds 至少为 2，否则评审没有发言机会');
+  if (reviewerCount && cfg.rounds < 2 && cfg.mode !== 'quick') errors.push('配置了评审时 rounds 至少为 2，否则评审没有发言机会');
 
   // models：只给网页阵容用的额外模型（不在群里发言，不需要 webhook）
   cfg.models ??= [];
