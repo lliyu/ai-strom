@@ -3,6 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { normalizeDataTools, hasDataTools } from './tools/index.js';
 import { normalizeKnowledge } from './knowledge.js';
+import { ROOT } from './tools/index.js';
+
+/** 讨论记录库的默认位置（相对 ai-storm 目录）。跑测试时（node --test）默认只放内存里，不碰本机的库。 */
+export const DEFAULT_DB_PATH = 'local/ai-storm.db';
 
 export const CARD_COLORS = [
   'blue', 'wathet', 'turquoise', 'green', 'yellow', 'orange',
@@ -129,6 +133,13 @@ export function normalizeConfig(raw, overrides = {}) {
   // 打磨（refine）用的墨稿接口与本地网页
   cfg.novel = { baseUrl: 'http://127.0.0.1:3000', timeoutMs: 60000, ...(cfg.novel ?? {}) };
   cfg.web = { host: '127.0.0.1', port: 8790, ...(cfg.web ?? {}) };
+  // 讨论记录库：db.path，或环境变量 AI_STORM_DB
+  const dbPath = cfg.db?.path ?? process.env.AI_STORM_DB ?? (process.env.NODE_TEST_CONTEXT ? ':memory:' : DEFAULT_DB_PATH);
+  if (typeof dbPath !== 'string' || !dbPath) errors.push('db.path 需要是文件路径');
+  else {
+    const expanded = dbPath.startsWith('~/') ? path.join(os.homedir(), dbPath.slice(2)) : dbPath;
+    cfg.db = { ...(cfg.db ?? {}), path: expanded === ':memory:' || path.isAbsolute(expanded) ? expanded : path.join(ROOT, expanded) };
+  }
   if (!['127.0.0.1', 'localhost', '::1'].includes(cfg.web.host)) errors.push('web.host 只能是本机地址（127.0.0.1 / localhost / ::1），页面没有登录');
 
   const ij = cfg.lark.interjection;

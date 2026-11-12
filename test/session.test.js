@@ -12,6 +12,7 @@ import { createClaudeCliProvider, callCost } from '../src/providers/claude-cli.j
 import { createOpenAICompatibleProvider } from '../src/providers/openai-compatible.js';
 import { createAnthropicCompatibleProvider } from '../src/providers/anthropic-compatible.js';
 import { nextNumber, saveState, findState, listStates, expireOldSessions } from '../src/state.js';
+import { openStore } from '../src/db.js';
 import { parseTrigger } from '../src/watch.js';
 import { parseTriage } from '../src/modes.js';
 
@@ -247,37 +248,35 @@ test('解析主席的处理方式与追问指令', () => {
 // ---------- 状态与保留期 ----------
 
 test('编号递增、按编号或最近一场查找、超过保留期清理会话', () => {
-  const runs = fs.mkdtempSync(path.join(os.tmpdir(), 'storm-runs-'));
-  const mk = (n, updatedAt) => {
-    const dir = path.join(runs, `run-${n}`);
-    fs.mkdirSync(dir);
-    saveState(dir, { version: 1, number: n, topic: `t${n}`, updatedAt, sessions: { a: { id: `sid-${n}`, turns: [{ prompt: 'p', reply: 'r' }] } } });
-  };
-  assert.equal(nextNumber(runs), 1);
-  assert.equal(nextNumber(runs), 2);
+  const store = openStore(':memory:');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'storm-sessions-'));
+  const mk = (n, updatedAt) => saveState(store, { version: 1, number: n, topic: `t${n}`, updatedAt, sessions: { a: { id: `sid-${n}`, turns: [{ prompt: 'p', reply: 'r' }] } } });
+  assert.equal(nextNumber(store), 1);
+  assert.equal(nextNumber(store), 2);
   const now = Date.parse('2026-11-20T00:00:00Z');
   mk(1, '2026-11-10T00:00:00Z'); // 10 天前
   mk(2, '2026-11-18T00:00:00Z'); // 2 天前
-  fs.rmSync(path.join(runs, '.counter')); // 计数文件丢了也不重号
-  assert.equal(nextNumber(runs), 3);
-  assert.equal(findState(runs).state.number, 2);
-  assert.equal(findState(runs, 1).state.number, 1);
-  assert.throws(() => findState(runs, 9), /找不到讨论 #9/);
+  saveState(store, { version: 1, number: 7, topic: 't7', updatedAt: '2026-11-18T00:00:00Z', mock: true }); // 直接存进来的编号也不会被重用
+  assert.equal(nextNumber(store), 8);
+  assert.equal(findState(store).state.number, 2);
+  assert.equal(findState(store, 1).state.number, 1);
+  assert.throws(() => findState(store, 9), /找不到讨论 #9/);
   // dry-run 与正式讨论分开找最近一场
-  saveState(path.join(runs, 'run-2'), { ...findState(runs, 2).state, dryRun: true });
-  assert.equal(findState(runs, undefined, { dryRun: false }).state.number, 1);
-  assert.equal(findState(runs, undefined, { dryRun: true }).state.number, 2);
+  saveState(store, { ...findState(store, 2).state, dryRun: true });
+  assert.equal(findState(store, undefined, { dryRun: false }).state.number, 1);
+  assert.equal(findState(store, undefined, { dryRun: true }).state.number, 2);
 
-  const files = new Map([['sid-1', path.join(runs, 'sid-1.jsonl')], ['sid-2', path.join(runs, 'sid-2.jsonl')]]);
+  const files = new Map([['sid-1', path.join(tmp, 'sid-1.jsonl')], ['sid-2', path.join(tmp, 'sid-2.jsonl')]]);
   for (const f of files.values()) fs.writeFileSync(f, '{}');
-  const cleaned = expireOldSessions(runs, { retentionDays: 7, now, sessionFile: (id) => files.get(id) });
+  const cleaned = expireOldSessions(store, { retentionDays: 7, now, sessionFile: (id) => files.get(id) });
   assert.deepEqual(cleaned, [1]);
   assert.equal(fs.existsSync(files.get('sid-1')), false);
   assert.equal(fs.existsSync(files.get('sid-2')), true);
-  const s1 = listStates(runs).find((s) => s.state.number === 1).state;
+  const s1 = listStates(store).find((s) => s.state.number === 1).state;
   assert.equal(s1.expired, true);
   assert.deepEqual(s1.sessions, {});
-  assert.deepEqual(expireOldSessions(runs, { retentionDays: 7, now, sessionFile: (id) => files.get(id) }), []); // 不重复清理
+  assert.equal(store.discussion(1).expired, true);
+  assert.deepEqual(expireOldSessions(store, { retentionDays: 7, now, sessionFile: (id) => files.get(id) }), []); // 不重复清理
 });
 
 test('claude CLI：续接会话时 total_cost_usd 是累计值，只计差值', async () => {
@@ -326,17 +325,17 @@ test('解析主文档：说明、正文、附录（删除）、无需修改；�
   assert.equal(docLead('# T\n**一句话结论**：做\n## 要点\n- a\n## 问题\n不要'), '**一句话结论**：做\n- a');
 });
 
-test('主文档文件：写最新一版和附录，删掉的附录文件也去掉', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'storm-doc-'));
-  const state = (attachments) => ({ version: 1, number: 1, docs: [{ version: 1, text: '# v1', attachments: {} }, { version: 2, text: '# v2', attachments }] });
-  saveState(dir, state({ '迁移/步骤': '1. a', 清单: '- x' }));
-  assert.equal(fs.readFileSync(path.join(dir, '主文档.md'), 'utf8'), '# v2\n');
-  assert.equal(fs.readFileSync(path.join(dir, '附录-迁移-步骤.md'), 'utf8'), '# 迁移/步骤\n\n1. a\n');
-  saveState(dir, state({ 清单: '- y' }));
-  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort(), ['主文档.md', '附录-清单.md']);
-  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'storm-doc-'));
-  saveState(empty, { version: 1, number: 2 });
-  assert.deepEqual(fs.readdirSync(empty), ['state.json']);
+test('讨论状态存进记录库：主文档各版本和附录原样读回，列表里的议题、模式跟着更新', () => {
+  const store = openStore(':memory:');
+  const number = nextNumber(store, { mode: 'decision', topic: '排队时的议题' });
+  assert.equal(store.discussion(number).state, null);
+  const docs = [{ version: 1, text: '# v1', attachments: {} }, { version: 2, text: '# v2', attachments: { '迁移/步骤': '1. a' } }];
+  saveState(store, { version: 1, number, mode: 'decision', topic: '拆库', channel: 'web', docs });
+  const row = store.discussion(number);
+  assert.deepEqual(row.state.docs, docs);
+  assert.equal(row.topic, '拆库');
+  assert.equal(row.channel, 'web');
+  assert.throws(() => saveState(store, { version: 1 }), /没有编号/);
 });
 
 test('补写主文档：旧讨论读全部记录和之前的汇总、追问，主笔在原会话里核对', async () => {

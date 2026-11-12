@@ -53,7 +53,7 @@ export function buildCard({ title, subtitle, color = 'grey', brief, body, plan, 
  * 保证整条请求不超过 maxBytes（自定义机器人上限 20 KB）。
  * 超出时先去掉完整方案，再截断详细内容并追加提示，返回 { card, truncated }。
  */
-export function buildCardWithinLimit(spec, { maxBytes = 18000, truncatedHint = '（内容过长已截断，完整内容见本地记录）' } = {}) {
+export function buildCardWithinLimit(spec, { maxBytes = 18000, truncatedHint = '（内容过长已截断，完整内容见本机 ai-storm 网页）' } = {}) {
   const full = buildCard(spec);
   if (payloadBytes(full) <= maxBytes) return { card: full, truncated: false };
   if (spec.plan) {

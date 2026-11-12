@@ -1,5 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { buildCardWithinLimit } from './lark/card.js';
 import { sendCard } from './lark/webhook.js';
 import { resolveWebhook } from './config.js';
@@ -11,7 +9,7 @@ import { resolveWebhook } from './config.js';
  */
 
 /** 每个发言者用自己的自定义机器人发卡片；全部消息排成一个队列，保证顺序并控制频率。 */
-export function createLarkPublisher(cfg, { env = process.env, fetchImpl, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), transcriptPath } = {}) {
+export function createLarkPublisher(cfg, { env = process.env, fetchImpl, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), recordHint } = {}) {
   const hooks = new Map();
   // 调研员默认借用主席的机器人（research.webhook 默认等于 chair.webhook）
   for (const s of [...cfg.participants, cfg.chair, ...(cfg.research ? [cfg.research] : [])]) {
@@ -20,7 +18,7 @@ export function createLarkPublisher(cfg, { env = process.env, fetchImpl, sleep =
   }
   let chain = Promise.resolve();
   let last = 0;
-  const hint = transcriptPath ? `（内容过长已截断，完整内容见本机记录 ${transcriptPath}）` : undefined;
+  const hint = recordHint ? `（内容过长已截断，完整内容见${recordHint}）` : undefined;
 
   return {
     name: 'lark',
@@ -54,24 +52,12 @@ export function createConsolePublisher({ write = (s) => process.stdout.write(s),
   };
 }
 
-/** 本地记录：runs/<时间>-<议题>/transcript.md 与 events.jsonl。 */
-export function createTranscriptPublisher(dir) {
-  fs.mkdirSync(dir, { recursive: true });
-  const md = path.join(dir, 'transcript.md');
-  const jsonl = path.join(dir, 'events.jsonl');
-  fs.writeFileSync(md, '');
+/** 本地记录：每条发言写进记录库的 posts 表，挂在这次运行上。 */
+export function createStorePublisher(store, execId) {
   return {
-    name: 'transcript',
-    path: md,
+    name: 'record',
     async post(msg) {
-      const head = `## ${msg.title}${msg.subtitle ? ` · ${msg.subtitle}` : ''}`;
-      const parts = [
-        msg.brief ? `**要点**\n${msg.brief}` : '',
-        msg.body,
-        msg.plan ? `<details><summary>完整方案</summary>\n\n${msg.plan}\n\n</details>` : '',
-      ].filter(Boolean);
-      fs.appendFileSync(md, `${head}\n\n${parts.join('\n\n')}\n\n${msg.footer ? `> ${msg.footer}\n\n` : ''}`);
-      fs.appendFileSync(jsonl, `${JSON.stringify({ at: new Date().toISOString(), speaker: msg.speaker.id, title: msg.title, subtitle: msg.subtitle, brief: msg.brief ?? undefined, body: msg.body, plan: msg.plan ?? undefined, footer: msg.footer, meta: msg.meta })}\n`);
+      store.addPost(execId, msg);
     },
   };
 }

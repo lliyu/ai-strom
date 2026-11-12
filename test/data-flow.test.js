@@ -191,7 +191,7 @@ test('prepareData：按选择准备；工具没登记、来源不存在时用不
   const know = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-know-'));
   fs.writeFileSync(path.join(know, 'INDEX.md'), '索引');
   const c = cfg({ dataTools: { dir }, knowledge: { hotel: { path: know } } });
-  const d = prepareData(c, { tools: true, knowledge: ['hotel', 'nope'] }, { logFile: '/tmp/x.jsonl', knowledgeSetup });
+  const d = prepareData(c, { tools: true, knowledge: ['hotel', 'nope'] }, { record: { db: ':memory:' }, knowledgeSetup });
   assert.deepEqual(d.selection, { tools: true, knowledge: ['hotel'] });
   assert.deepEqual(d.mcp.allowed, ['mcp__storm__q']);
   assert.deepEqual(d.knowledge.dirs, [know]);
@@ -206,13 +206,13 @@ test('prepareData：按选择准备；工具没登记、来源不存在时用不
 test('网页：列出能选的数据工具和知识来源，选了用不上的直接 400', async (t) => {
   const http = await import('node:http');
   const { createWebApp, startWebServer } = await import('../src/web/server.js');
+  const { openStore } = await import('../src/db.js');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-data-web-'));
   fs.writeFileSync(path.join(dir, 'tools.json'), JSON.stringify({ tools: [{ id: 'q', description: 'q', effect: 'read', command: ['node', 'q.js'] }] }));
   const know = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-know-'));
   fs.writeFileSync(path.join(know, 'INDEX.md'), '索引');
-  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-data-runs-'));
   const c = cfg({ dataTools: { dir }, knowledge: { hotel: { path: know } } });
-  const app = createWebApp({ cfg: c, novel: { baseUrl: 'fake' }, runsDir, log: () => {}, echo: false });
+  const app = createWebApp({ cfg: c, novel: { baseUrl: 'fake' }, store: openStore(':memory:'), log: () => {}, echo: false });
   const server = await startWebServer(app, { host: '127.0.0.1', port: 0, log: () => {} });
   t.after(() => server.close());
   const port = server.address().port;
@@ -231,7 +231,7 @@ test('网页：列出能选的数据工具和知识来源，选了用不上的�
   const bad = await request('POST', '/api/runs', { mode: 'decision', topic: 'x', repos: '无', data: { tools: true, knowledge: ['nope'] } });
   assert.equal(bad.status, 400);
   assert.match(bad.body.error, /知识来源用不上.*nope/);
-  const plain = createWebApp({ cfg: cfg(), novel: { baseUrl: 'fake' }, runsDir, log: () => {}, echo: false });
+  const plain = createWebApp({ cfg: cfg(), novel: { baseUrl: 'fake' }, store: openStore(':memory:'), log: () => {}, echo: false });
   const server2 = await startWebServer(plain, { host: '127.0.0.1', port: 0, log: () => {} });
   t.after(() => server2.close());
   const r2 = await new Promise((resolve) => {

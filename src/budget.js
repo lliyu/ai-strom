@@ -10,7 +10,7 @@ import { splitReply } from './modes.js';
  *   较早的核实只留问题和回答开头 200 字；要点也放不下的更早部分整段省略，并注明省略范围。
  *
  * 预算 = 主席上下文窗口 × CHAIR_SHARE ÷ 每字 tokens 数。每字 tokens 数从本场无会话、单回合的调用里学
- * （tokens ÷ 提示词字数），存进 state.json；没有记录时按 DEFAULT_TOKENS_PER_CHAR 估。
+ * （tokens ÷ 提示词字数），存进讨论状态；没有记录时按 DEFAULT_TOKENS_PER_CHAR 估。
  */
 
 export const CHAIR_SHARE = 0.5;
@@ -125,9 +125,9 @@ export function budgetChars({ window, share = CHAIR_SHARE, factor = 1, tokensPer
 }
 
 /**
- * 旧讨论的 state.json 里没有预算数据：从它的 usage.jsonl 推出各模型的窗口和每字 tokens 数，
+ * 旧讨论的状态里没有预算数据：从它的用量事件推出各模型的窗口和每字 tokens 数，
  * 免得追问时主席的窗口未知、按保守的默认值把讨论记录缩略得太多。
- * rows：usage.jsonl 的各行（已解析）。
+ * rows：用量事件（记录库 events 表的 data）。
  */
 export function budgetFromUsage(rows, { minChars = 2000 } = {}) {
   const speakers = new Map();

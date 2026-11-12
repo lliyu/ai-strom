@@ -1,13 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import http from 'node:http';
 import { normalizeConfig } from '../src/config.js';
 import { lineupConfig, modelPool, defaultLineup, savedLineup, configForState, roleTemplates } from '../src/lineup.js';
 import { findState, saveState } from '../src/state.js';
 import { createWebApp, startWebServer } from '../src/web/server.js';
+import { openStore } from '../src/db.js';
 
 const raw = {
   participants: [
@@ -83,18 +81,10 @@ test('自选阵容：不合法时报错', () => {
 });
 
 test('「最近一场」不找网页上自选阵容的讨论', () => {
-  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-lineup-'));
-  try {
-    for (const [n, extra] of [[1, {}], [2, { lineup: { participants: [], chair: {} } }]]) {
-      const dir = path.join(runsDir, `run-${n}`);
-      fs.mkdirSync(dir);
-      saveState(dir, { number: n, mode: 'decision', topic: 't', ...extra });
-    }
-    assert.equal(findState(runsDir).state.number, 1);
-    assert.equal(findState(runsDir, 2).state.number, 2);
-  } finally {
-    fs.rmSync(runsDir, { recursive: true, force: true });
-  }
+  const store = openStore(':memory:');
+  for (const [n, extra] of [[1, {}], [2, { lineup: { participants: [], chair: {} } }]]) saveState(store, { number: n, mode: 'decision', topic: 't', ...extra });
+  assert.equal(findState(store).state.number, 1);
+  assert.equal(findState(store, 2).state.number, 2);
 });
 
 function request(port, method, pathname, body) {
@@ -109,11 +99,11 @@ function request(port, method, pathname, body) {
   });
 }
 
-test('网页：按自选阵容讨论，阵容存进 state.json，追问照原样用', async (t) => {
-  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-lineup-web-'));
-  const app = createWebApp({ cfg, novel: { baseUrl: 'fake' }, runsDir, log: () => {}, echo: false });
+test('网页：按自选阵容讨论，阵容存进讨论状态，追问照原样用', async (t) => {
+  const store = openStore(':memory:');
+  const app = createWebApp({ cfg, novel: { baseUrl: 'fake' }, store, log: () => {}, echo: false });
   const server = await startWebServer(app, { host: '127.0.0.1', port: 0, log: () => {} });
-  t.after(() => { server.close(); fs.rmSync(runsDir, { recursive: true, force: true }); });
+  t.after(() => server.close());
   const port = server.address().port;
   const waitIdle = async () => { for (let i = 0; i < 300 && !app.idle(); i += 1) await new Promise((r) => setTimeout(r, 10)); };
 
@@ -137,16 +127,15 @@ test('网页：按自选阵容讨论，阵容存进 state.json，追问照原样
   assert.ok(names.has('X 模型') && names.has('X 模型（2）'), [...names].join(','));
   assert.ok(!names.has('A') && !names.has('B'));
 
-  const dir = fs.readdirSync(runsDir).find((n) => n.includes(`#${number}-`));
-  const state = JSON.parse(fs.readFileSync(path.join(runsDir, dir, 'state.json'), 'utf8'));
+  const { state } = store.discussion(number);
   assert.deepEqual(state.lineup.participants.map((p) => [p.id, p.role]), [['x', '性能'], ['x-2', '成本'], ['r', '风险']]);
   assert.equal(state.lineup.chair.model, 'm-a');
 
   const asked = await request(port, 'POST', `/api/runs/${number}/followup`, { question: '成本再算细一点' });
   assert.equal(asked.status, 202);
   await waitIdle();
-  const follow = fs.readdirSync(runsDir).find((n) => n.includes(`追问#${number}-`));
-  const started2 = fs.readFileSync(path.join(runsDir, follow, 'usage.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).find((r) => r.type === 'run_started');
+  const follow = store.executionsOf(number).find((e) => e.kind === 'followup');
+  const started2 = store.startEvent(follow.id);
   assert.deepEqual(started2.participants.map((p) => p.id), ['x', 'x-2', 'r']);
   assert.equal(started2.chair.model, 'm-a');
 });

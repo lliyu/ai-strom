@@ -9,6 +9,7 @@ import { EventEmitter } from 'node:events';
 import { loadCommandTools, buildArgs, inputSchema } from '../src/tools/manifest.js';
 import { runCommandTool, cut } from '../src/tools/run.js';
 import { createGateway } from '../src/tools/gateway.js';
+import { openStore } from '../src/db.js';
 import { mcpSetup, allowedToolsNote, GATEWAY_PATH, ROOT } from '../src/tools/index.js';
 import { normalizeConfig } from '../src/config.js';
 import { createClaudeCliProvider, parseStream } from '../src/providers/claude-cli.js';
@@ -96,10 +97,10 @@ test('执行：输出、stderr 首末行、退出码、截断、超时', async (
   assert.deepEqual(cut('aaaa\nbbbb\ncccc', 11), { text: 'aaaa\nbbbb', truncated: true });
 });
 
-test('网关：initialize、tools/list、tools/call，调用记进日志', async () => {
+test('网关：initialize、tools/list、tools/call，调用交给 record 记录', async () => {
   const dir = toolDir({ tools: [ECHO_TOOL] }, { 'echo.js': ECHO });
-  const logFile = path.join(dir, 'log', 'calls.jsonl');
-  const g = createGateway({ dir, logFile });
+  const records = [];
+  const g = createGateway({ dir, record: (r) => records.push(r) });
   const init = await g.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } });
   assert.equal(init.result.protocolVersion, '2025-06-18');
   assert.ok(init.result.capabilities.tools);
@@ -116,15 +117,17 @@ test('网关：initialize、tools/list、tools/call，调用记进日志', async
   assert.match(none.result.content[0].text, /没有工具「deploy」/);
   const unknown = await g.handle({ jsonrpc: '2.0', id: 6, method: 'resources/list' });
   assert.equal(unknown.error.code, -32601);
-  const records = fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.equal(records.length, 2);
   assert.equal(records[0].exitCode, 0);
   assert.equal(records[1].rejected, true);
 });
 
-test('网关进程：按行收发 JSON-RPC', async () => {
+test('网关进程：按行收发 JSON-RPC，调用记录写进记录库', async () => {
   const dir = toolDir({ tools: [ECHO_TOOL] }, { 'echo.js': ECHO });
-  const child = spawn(process.execPath, [GATEWAY_PATH, '--dir', dir], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const dbFile = path.join(dir, 'records.db');
+  const store = openStore(dbFile);
+  const execId = store.startExecution({ kind: 'tools-try', topic: 'q' });
+  const child = spawn(process.execPath, [GATEWAY_PATH, '--dir', dir, '--db', dbFile, '--exec', String(execId)], { stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = [];
   let buf = '';
   child.stdout.on('data', (d) => {
@@ -142,6 +145,11 @@ test('网关进程：按行收发 JSON-RPC', async () => {
   assert.equal(replies.find((r) => r.id === 1).result.protocolVersion, '2024-11-05');
   assert.match(replies.find((r) => r.id === 2).result.content[0].text, /--sql=q/);
   assert.equal(replies.find((r) => r.error)?.error.code, -32700);
+  const calls = store.toolCalls(execId);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].tool, 'echo');
+  assert.deepEqual(calls[0].input, { sql: 'q' });
+  store.close();
 });
 
 const baseCfg = {
@@ -169,13 +177,14 @@ test('配置：dataTools 默认值与校验', () => {
 test('MCP 配置：网关加登记的服务，放行名单带全名，allow 不传给 CLI', () => {
   const dir = toolDir({ tools: [ECHO_TOOL] });
   const c = normalizeConfig({ ...baseCfg, dataTools: { dir, mcpServers: { logs: { type: 'http', url: 'https://x', headersHelper: 'h', allow: ['query_logs', 'list_envs'] } } } });
-  const setup = mcpSetup(c.dataTools, { logFile: '/tmp/calls.jsonl' });
+  const setup = mcpSetup(c.dataTools, { record: { db: '/tmp/records.db', execId: 5 } });
   assert.deepEqual(setup.allowed, ['mcp__storm__echo', 'mcp__logs__query_logs', 'mcp__logs__list_envs']);
   assert.deepEqual(setup.config.mcpServers.logs, { type: 'http', url: 'https://x', headersHelper: 'h' });
   const gw = setup.config.mcpServers.storm;
   assert.equal(gw.command, process.execPath);
   assert.deepEqual(gw.args.slice(0, 3), [GATEWAY_PATH, '--dir', dir]);
-  assert.ok(gw.args.includes('--log') && gw.args.includes('/tmp/calls.jsonl'));
+  assert.deepEqual(gw.args.slice(gw.args.indexOf('--db'), gw.args.indexOf('--db') + 4), ['--db', '/tmp/records.db', '--exec', '5']);
+  assert.ok(!mcpSetup(c.dataTools, { record: { db: ':memory:', execId: 5 } }).config.mcpServers.storm.args.includes('--db'), '内存库不传给网关');
   assert.match(allowedToolsNote(setup), /mcp__storm__echo：回显/);
   // 没有命令行工具时不起网关
   const empty = mcpSetup(normalizeConfig({ ...baseCfg, dataTools: { dir: path.join(dir, 'none') } }).dataTools);

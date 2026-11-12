@@ -10,6 +10,7 @@ import { runDiscussion, runFollowUp } from '../src/orchestrator.js';
 import { createMemoryPublisher } from '../src/publishers.js';
 import { parseRevision } from '../src/modes.js';
 import { createWebApp, startWebServer } from '../src/web/server.js';
+import { openStore } from '../src/db.js';
 
 const base = (extra = {}) => ({
   mode: 'refine',
@@ -133,7 +134,6 @@ function request(port, method, pathname, body, headers = {}) {
 }
 
 test('网页：发起打磨 → 讨论结束有修订版 → 确认后写回墨稿，带上开始时的 version', async (t) => {
-  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-storm-web-'));
   const applied = [];
   const novel = {
     baseUrl: 'fake',
@@ -142,9 +142,9 @@ test('网页：发起打磨 → 讨论结束有修订版 → 确认后写回墨�
     apply: async (req) => { applied.push(req); return { ok: true, version: 'v2' }; },
   };
   // providers.fake 是 mock 类型：不是 --mock 演练，修订版可以写回
-  const app = createWebApp({ cfg: normalizeConfig(base({ mode: 'decision' })), novel, runsDir, log: () => {}, echo: false });
+  const app = createWebApp({ cfg: normalizeConfig(base({ mode: 'decision' })), novel, store: openStore(':memory:'), log: () => {}, echo: false });
   const server = await startWebServer(app, { host: '127.0.0.1', port: 0, log: () => {} });
-  t.after(() => { server.close(); fs.rmSync(runsDir, { recursive: true, force: true }); });
+  t.after(() => server.close());
   const { port } = server.address();
 
   const started = await request(port, 'POST', '/api/runs', { type: 'premise', id: 'p1', requirement: '金手指太强' });

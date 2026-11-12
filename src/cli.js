@@ -8,7 +8,8 @@ import { loadDotEnv, loadConfig, normalizeConfig, resolveWebhook, maskUrl, Confi
 import { createProviderRegistry } from './providers/index.js';
 import { createLarkPublisher } from './publishers.js';
 import { createInterjectionReader } from './lark/interjections.js';
-import { RUNS, log, cleanupSessions, runOne, followUpOne, docOne } from './runner.js';
+import { RUNS, log, storeOf, cleanupSessions, runOne, followUpOne, docOne } from './runner.js';
+import { migrateRuns } from './migrate.js';
 import { buildCardWithinLimit } from './lark/card.js';
 import { sendCard } from './lark/webhook.js';
 import { watchLoop, acquireLock, isTrigger, DEFAULT_TRIGGERS } from './watch.js';
@@ -33,6 +34,7 @@ const HELP = `ai-storm：多个模型分角色讨论，每个模型用自己的 
   node src/cli.js tools                        列出数据工具：local/tools 里的命令行工具和登记的 MCP 服务
   node src/cli.js tools call <工具> 参数=值 …   不经过模型直接执行一个命令行工具，看它返回给模型的内容
   node src/cli.js tools try "<问题>" [--model sonnet]  让模型带着全部数据工具和知识回答一个问题，端到端检查
+  node src/cli.js migrate [--dir runs]         把旧版写在 runs/ 目录里的讨论记录导进记录库（可重复执行，不改动旧目录）
 
 选项：
   --config <文件>     配置文件，默认 ./config.json
@@ -41,11 +43,13 @@ const HELP = `ai-storm：多个模型分角色讨论，每个模型用自己的 
   --dry-run           不发到 Lark，只在终端打印卡片内容（仍会调用模型）
   --mock              不调用模型，用假回答演练整个流程（可与 --dry-run 一起用）
   --no-interject      本次不读取群里的插话
+  --dir <目录>        migrate 读的旧记录目录，默认 runs
   --repos <列表>      讨论前先由调研员读这些仓库：别名或组名，逗号分隔，@ 后写分支，例如 fission,pricing@develop
                       不写时调研员从全部登记的仓库里按议题定位；--repos none 不读代码
   -h, --help          显示帮助
 
-本地记录写在 runs/<时间>-<议题>/：transcript.md 与 events.jsonl；讨论的结论在 主文档.md（追问后更新同一份）。`;
+讨论记录（发言、主文档、追问、用量、插话、工具调用）都存在记录库 local/ai-storm.db（SQLite，config.json 的 db.path 可改），
+用 node src/cli.js web 打开本地网页查看、搜索、归档和删除。`;
 
 async function main(argv) {
   const { values, positionals } = parseArgs({
@@ -65,6 +69,7 @@ async function main(argv) {
       run: { type: 'string' },
       port: { type: 'string' },
       model: { type: 'string' },
+      dir: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -91,6 +96,14 @@ async function main(argv) {
     case 'repos': return listRepos(cfg);
     case 'web': return web(cfg, values);
     case 'knowledge': return listKnowledge(cfg);
+    case 'migrate': {
+      const dir = path.resolve(values.dir ?? RUNS);
+      const store = storeOf(cfg);
+      const out = migrateRuns(store, dir, { log });
+      for (const p of out.problems) console.error(`❌ ${p}`);
+      log(`记录库：${store.file}`);
+      return out.problems.length ? 1 : 0;
+    }
     case 'tools': {
       const [sub, ...args] = rest;
       if (!sub || sub === 'list') return listTools(cfg);
@@ -151,7 +164,7 @@ async function watch(rawCfg, cfg, values) {
   if (!allowFrom.length) throw new ConfigError('watch 需要 allowFrom（允许发起讨论的 open_id），避免群里任何人都能触发模型调用');
   const intervalMs = values.interval ? Number(values.interval) * 1000 : (w.intervalMs ?? 30000);
 
-  fs.mkdirSync(path.join(ROOT, 'runs'), { recursive: true });
+  fs.mkdirSync(RUNS, { recursive: true });
   const release = acquireLock(path.join(ROOT, 'runs', '.watch.pid'));
 
   // runs/.watch.state.json：给 klook-console 等外部页面看的运行状态

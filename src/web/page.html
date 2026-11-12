@@ -41,6 +41,14 @@
   .tab { border: 1px solid var(--line); background: transparent; border-radius: 999px; padding: 3px 12px; cursor: pointer; color: var(--muted); }
   .tab.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
   .search { margin: 10px 12px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); width: calc(100% - 24px); }
+  .filters { display: flex; gap: 6px; align-items: center; margin: -4px 12px 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .filters select { border: 1px solid var(--line); border-radius: 6px; background: var(--bg); padding: 2px 4px; font-size: 12px; }
+  .filters label { display: inline-flex; gap: 3px; align-items: center; cursor: pointer; }
+  .head .ops { margin-left: auto; display: flex; gap: 6px; }
+  .head .ops button { font-size: 12px; padding: 2px 10px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
+  .head .ops button:hover:not(:disabled) { color: var(--ink); border-color: var(--muted); }
+  .head .ops button.danger:hover:not(:disabled) { color: #e5484d; border-color: #e5484d; }
+  .head .ops button:disabled { opacity: .45; cursor: not-allowed; }
   .list { overflow: auto; flex: 1; padding: 0 8px 12px; }
   .item { padding: 9px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
   .item:hover { background: var(--bg); }
@@ -155,7 +163,12 @@
     </div>
     <div class="tabs" id="tabs"></div>
     <button class="btn primary newbtn" id="new">＋ 新讨论</button>
-    <input class="search" id="search" placeholder="搜索">
+    <input class="search" id="search" placeholder="搜索（讨论里搜议题和发言内容）">
+    <div class="filters" id="filters">
+      <select id="fMode" title="模式"><option value="">全部模式</option><option value="decision">方案讨论</option><option value="brainstorm">脑洞风暴</option><option value="refine">作品打磨</option></select>
+      <select id="fDays" title="时间"><option value="">全部时间</option><option value="7">最近 7 天</option><option value="30">最近 30 天</option><option value="90">最近 90 天</option></select>
+      <label title="归档的讨论默认不在列表里"><input type="checkbox" id="fArchived">只看归档</label>
+    </div>
     <div class="list" id="list"></div>
   </aside>
   <button class="sidetoggle" id="openSide" title="展开侧边栏（快捷键 [ ）" aria-label="展开侧边栏">☰</button>
@@ -178,7 +191,7 @@ const FIELD_LABELS = {
   summary: '概要', climax: '卷末高潮', estimatedChapters: '预计章数',
 };
 
-const S = { tab: 'runs', form: { mode: 'decision' }, items: [], runs: [], q: '', sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null, docIdx: null, docDiff: false };
+const S = { tab: 'runs', form: { mode: 'decision' }, items: [], runs: [], q: '', filter: { mode: '', days: '', archived: false }, sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null, docIdx: null, docDiff: false };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -286,13 +299,15 @@ function renderList() {
   const q = S.q.trim().toLowerCase();
   const match = (...xs) => !q || xs.some((x) => String(x ?? '').toLowerCase().includes(q));
   let html;
+  $('filters').style.display = S.tab === 'runs' ? '' : 'none';
   if (S.tab === 'runs') {
-    const rows = S.runs.filter((r) => match(r.topic, r.requirement, MODE_LABEL[r.mode], `#${r.number}`));
+    // 讨论在服务端按议题和发言内容搜（loadRuns），这里不再过滤
+    const rows = S.runs;
     html = rows.map((r) => `<div class="item ${S.run?.number === r.number ? 'on' : ''}" data-run="${r.number}">
       <div class="t">#${r.number} · ${r.mode === 'refine' ? `${esc(TYPE_LABEL[r.type] || '')}「${esc(r.topic)}」` : esc(r.topic)}</div>
       <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span> <span class="chip">${MODE_SHORT[r.mode] || r.mode}</span> <span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.followUps ? ` 追问 ${r.followUps} 次` : ''}${r.hasRevision ? ' · 有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.mock ? ' · mock' : ''}</div>
       ${r.requirement ? `<div class="p">要求：${esc(r.requirement)}</div>` : ''}</div>`).join('');
-    if (!rows.length) html = '<div class="empty">还没有讨论</div>';
+    if (!rows.length) html = `<div class="empty">${S.q.trim() || S.filter.mode || S.filter.days || S.filter.archived ? '没有符合条件的讨论' : '还没有讨论'}</div>`;
   } else {
     const rows = S.items.filter((i) => i.type === S.tab && match(i.title, i.preview, i.project, i.meta));
     html = rows.map((i) => `<div class="item ${S.sel?.type === i.type && S.sel?.id === i.id ? 'on' : ''}" data-type="${i.type}" data-id="${esc(i.id)}">
@@ -308,7 +323,12 @@ async function loadItems() {
   renderList();
 }
 async function loadRuns() {
-  try { S.runs = (await api('/api/runs')).runs; } catch (e) { toast(e.message); }
+  const p = new URLSearchParams();
+  if (S.q.trim()) p.set('q', S.q.trim());
+  if (S.filter.mode) p.set('mode', S.filter.mode);
+  if (S.filter.days) p.set('days', S.filter.days);
+  if (S.filter.archived) p.set('archived', '1');
+  try { S.runs = (await api(`/api/runs${p.size ? `?${p}` : ''}`)).runs; } catch (e) { toast(e.message); }
   if (S.tab === 'runs') renderList();
 }
 async function loadStatus() {
@@ -643,10 +663,25 @@ function renderRun() {
     ? [['talk', '讨论'], docTab, ['rev', `修订版${revs.length ? '' : '（还没有）'}`], ['orig', '原稿']]
     : docs.length || !r.summary ? [['talk', '讨论'], docTab] : [['talk', '讨论'], ['conclusion', '结论（旧版汇总）']];
   $('main').innerHTML = `
-    <div class="head"><h2>#${r.number} · ${title}</h2>${chips}</div>
+    <div class="head"><h2>#${r.number} · ${title}</h2>${chips}${r.archived ? '<span class="chip">已归档</span>' : ''}<span class="ops"><button id="archiveBtn">${r.archived ? '取消归档' : '归档'}</button><button id="deleteBtn" class="danger" ${status === 'running' || status === 'queued' ? 'disabled title="进行中或排队中的讨论不能删"' : ''}>删除</button></span></div>
     <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整议题</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : ''}${r.data ? ` · ${[r.data.tools ? '数据工具' : '', r.data.knowledge.length ? `知识：${esc(r.data.knowledge.join('、'))}` : ''].filter(Boolean).join(' · ')}` : ''}${r.followUps.length ? ` · 追问 ${r.followUps.length} 次` : ''}</div>
     <div class="subtabs">${tabs.map(([k, l]) => `<button class="subtab ${S.sub === k ? 'on' : ''}" data-sub="${k}">${l}</button>`).join('')}</div>
     <div id="pane"></div>`;
+  $('archiveBtn').onclick = async () => {
+    try {
+      const res = await api(`/api/runs/${r.number}/archive`, { method: 'POST', body: JSON.stringify({ archived: !r.archived }) });
+      toast(res.archived ? `#${r.number} 已归档，勾选「只看归档」可以找到` : `#${r.number} 已取消归档`);
+      S.run.archived = res.archived; renderRun(); loadRuns();
+    } catch (e) { toast(e.message); }
+  };
+  $('deleteBtn').onclick = async () => {
+    if (!confirm(`删除 #${r.number}？它的发言、主文档、追问和用量记录都会删掉，不能恢复。`)) return;
+    try {
+      await api(`/api/runs/${r.number}/delete`, { method: 'POST', body: '{}' });
+      toast(`#${r.number} 已删除`);
+      closeStream(); S.run = null; $('main').innerHTML = '<div class="welcome">已删除。</div>'; loadRuns();
+    } catch (e) { toast(e.message); }
+  };
   const pane = $('pane');
   if (S.sub === 'talk') {
     pane.innerHTML = `<div id="posts">${postsHtml(r.posts)}</div><div class="progress" id="progress"><div class="bar"></div><div class="composer"></div></div>`;
@@ -668,7 +703,7 @@ function renderRun() {
     pane.innerHTML = `
       <div class="docbar">${docs.map((v, i) => `<button class="btn ${i === idx ? 'primary' : ''}" data-docv="${i}" title="${esc(v.reason)}">第 ${v.version} 版</button>`).join('')}
         ${prev ? `<button class="btn" data-docdiff="1">${diff ? '看全文' : `和第 ${prev.version} 版对比`}</button>` : ''}</div>
-      <div class="docmeta">${esc(d.reason)} · ${new Date(d.at).toLocaleString('zh-CN', { hour12: false })}${check ? ` · ${check}` : ''}${idx === docs.length - 1 && r.docFile ? `<br>本机文件：${esc(r.docFile)}` : ''}</div>
+      <div class="docmeta">${esc(d.reason)} · ${new Date(d.at).toLocaleString('zh-CN', { hour12: false })}${check ? ` · ${check}` : ''}</div>
       <div class="card">${diff ? lineDiffHtml(prev.text, d.text) : md(d.text)}</div>
       ${atts.map(([title, text]) => `<div class="card"><details ${diff ? 'open' : ''}><summary>附录《${esc(title)}》${diff && !(title in (prev.attachments || {})) ? ' <span class="chip">新增</span>' : ''}</summary>${diff ? lineDiffHtml(prev.attachments?.[title] ?? '', text) : md(text)}</details></div>`).join('')}
       ${gone.map((title) => `<div class="card hint">附录《${esc(title)}》在这一版删掉了</div>`).join('')}
@@ -715,7 +750,15 @@ document.addEventListener('click', (ev) => {
   else if (t.dataset.docv) { S.docIdx = Number(t.dataset.docv); renderRun(); }
   else if (t.dataset.docdiff) { S.docDiff = !S.docDiff; renderRun(); }
 });
-$('search').addEventListener('input', (e) => { S.q = e.target.value; renderList(); });
+let searchTimer;
+$('search').addEventListener('input', (e) => {
+  S.q = e.target.value;
+  if (S.tab !== 'runs') return renderList();
+  clearTimeout(searchTimer); searchTimer = setTimeout(loadRuns, 250); // 讨论在服务端搜，停下来再查
+});
+$('fMode').onchange = (e) => { S.filter.mode = e.target.value; loadRuns(); };
+$('fDays').onchange = (e) => { S.filter.days = e.target.value; loadRuns(); };
+$('fArchived').onchange = (e) => { S.filter.archived = e.target.checked; loadRuns(); };
 $('new').onclick = () => openForm();
 // 侧边栏收起 / 展开：记在本机浏览器里，下次打开保持
 function setSide(off) {

@@ -4,9 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeConfig, ConfigError } from '../config.js';
 import { lineupConfig, modelPool, roleTemplates, defaultLineup, MAX_SEATS, readsCode } from '../lineup.js';
-import { listStates, nextNumber, saveState, STATE_FILE, DOC_FILE } from '../state.js';
+import { nextNumber, saveState, removeSessionFiles } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS } from '../modes.js';
-import { RUNS, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
+import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
+import { claudeSessionFile, DEFAULT_CLAUDE_CWD } from '../providers/claude-cli.js';
 import { parseRepoSpecs, resolveRepos, availableRepos } from '../repos.js';
 import { appendInbox } from '../inbox.js';
 import { createNovelClient } from '../novel.js';
@@ -17,24 +18,23 @@ import { inspectKnowledge } from '../knowledge.js';
  * 本地网页：所有讨论（群里发起的和网页上发起的）都能在这里看、插话、追问；
  * 网页上可以发起方案讨论、脑洞风暴（只在网页上，不发群），以及从墨稿挑一项做作品打磨。只监听本机地址，没有登录。
  *
- * 讨论记录都在 runs/ 下：每场讨论一个目录，追问各自一个「…-追问#编号-…」目录。
- * 网页直接读这些目录里的 events.jsonl（发言）、usage.jsonl（进度）和 state.json（结论、会话），
- * 所以不管讨论是 Lark 监听进程还是网页自己跑的，看到的都一样；进行中的讨论每秒检查一次文件，有新发言就推给页面。
- * 插话写进正在进行的那个目录的 inbox.jsonl，跑讨论的进程每轮开始时读。
+ * 讨论记录都在记录库里（db.js）：一场讨论一行，讨论本身和每次追问各是一次运行，发言、用量事件、插话挂在运行上。
+ * 不管讨论是 Lark 监听进程还是网页自己跑的，看到的都一样；进行中的讨论每秒查一次库，有新发言就推给页面。
+ * 插话写进正在进行的那次运行，跑讨论的进程每轮开始时读。
+ * 列表可以按议题和发言内容搜索、按模式和时间筛选；讨论可以归档（默认不在列表里）和删除。
  *
  * 网页上发起的讨论和追问一场一场排队，由网页进程自己跑；群里发起的讨论在网页上追问时，追问照样发到群里。
  */
 
 const PAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'page.html');
 const LOCAL = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
-const FOLLOW_UP_DIR = /-追问#(\d+)-/;
 const MODE_LABELS = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨' };
 
-export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock = false, runsDir = RUNS, log = defaultLog, echo = true, pollMs = 1000, runner = { runOne, runPrepared, followUpOne } } = {}) {
+/** runsDir：Lark 监听进程的运行文件所在目录（.watch.state.json）。store：记录库，默认按配置打开。 */
+export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock = false, store = storeOf(cfg), runsDir = RUNS, log = defaultLog, echo = true, pollMs = 1000, runner = { runOne, runPrepared, followUpOne } } = {}) {
   const queue = [];
   let current = null;
-  const pending = new Map(); // 网页上刚排队、还没建目录的讨论：编号 -> { mode, topic, subject }
-  const failures = new Map(); // 网页跑的讨论在建目录之前就失败了：编号 -> 错误
+  const failures = new Map(); // 网页跑的讨论在开始运行之前就失败了：编号 -> 错误
 
   const cfgFor = (mode, rounds) => normalizeConfig(cfg, { mode, ...(rounds !== undefined ? { rounds } : {}) });
   const speakers = () => {
@@ -46,18 +46,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return all;
   };
 
-  // ---------- 读 runs/ ----------
-
-  function readJsonl(file) {
-    if (!fs.existsSync(file)) return [];
-    return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).flatMap((l) => {
-      try {
-        return [JSON.parse(l)];
-      } catch {
-        return [];
-      }
-    });
-  }
+  // ---------- 读记录库 ----------
 
   function readJson(file) {
     try {
@@ -67,35 +56,22 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     }
   }
 
-  /** 编号 -> { number, dir, start（usage.jsonl 第一行）, state, followDirs } */
-  function scan() {
-    const runs = new Map();
-    const follows = [];
-    if (!fs.existsSync(runsDir)) return runs;
-    for (const name of fs.readdirSync(runsDir).sort()) {
-      const dir = path.join(runsDir, name);
-      if (name.startsWith('.') || !fs.statSync(dir).isDirectory()) continue;
-      const f = FOLLOW_UP_DIR.exec(name);
-      if (f) {
-        follows.push({ number: Number(f[1]), dir });
-        continue;
-      }
-      const start = readJsonl(path.join(dir, 'usage.jsonl')).find((r) => r.type === 'run_started');
-      const state = readJson(path.join(dir, STATE_FILE));
-      const number = state?.number ?? start?.number;
-      if (!number) continue; // 命令行 --mock 演练不编号
-      runs.set(number, { number, dir, start: start ?? null, state, followDirs: [] });
-    }
-    for (const f of follows) runs.get(f.number)?.followDirs.push(f.dir);
-    return runs;
+  /** 一场讨论：{ number, row（discussions 一行）, state, start（讨论本身那次运行的 run_started）, execs（全部运行，讨论在前） } */
+  function loadRun(row) {
+    const execs = store.executionsOf(row.number);
+    const first = execs.find((e) => e.kind === 'discussion');
+    return { number: row.number, row, state: row.state, start: first ? store.startEvent(first.id) : null, execs };
   }
 
-  const findRun = (number) => scan().get(number) ?? null;
-  const dirsOf = (run) => [run.dir, ...run.followDirs];
-  const latestDir = (run) => dirsOf(run).at(-1);
-  const modeOf = (run) => run.state?.mode ?? run.start?.mode ?? 'decision';
-  const channelOf = (run) => run.state?.channel ?? run.start?.channel
+  const findRun = (number) => {
+    const row = store.discussion(number);
+    return row ? loadRun(row) : null;
+  };
+  const latestExec = (run) => run.execs.at(-1) ?? null;
+  const modeOf = (run) => run.state?.mode ?? run.start?.mode ?? run.row.mode ?? 'decision';
+  const channelOf = (run) => run.state?.channel ?? run.start?.channel ?? run.row.channel
     ?? (modeOf(run) === 'refine' ? 'web' : (run.state?.dryRun ?? run.start?.dryRun) ? 'dry-run' : 'lark');
+  const subjectOf = (run) => run.state?.subject ?? run.start?.subject ?? run.row.info?.subject ?? null;
 
   /** 发言者 id -> { name, color }：先看这场讨论自己记的阵容（网页上自选的阵容和配置里的不一样），再看配置。 */
   function speakerOf(run) {
@@ -112,29 +88,26 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
 
   function postsOf(run) {
     const who = speakerOf(run);
-    const posts = [];
-    for (const [part, dir] of dirsOf(run).entries()) {
-      const followUp = part > 0;
-      for (const e of readJsonl(path.join(dir, 'events.jsonl'))) {
-        const sp = who(e.speaker);
-        posts.push({
-          seq: posts.length + 1,
-          at: e.at,
-          speaker: { id: e.speaker, name: sp?.name ?? e.speaker, color: sp?.color ?? 'grey' },
-          title: e.title,
-          subtitle: e.subtitle ?? '',
-          brief: e.brief ?? null,
-          body: e.body ?? '',
-          plan: e.plan ?? null,
-          footer: e.footer ?? '',
-          stage: e.meta?.stage ?? null,
-          error: e.meta?.error ?? null,
-          followUp,
-          part,
-        });
-      }
-    }
-    return posts;
+    const partOf = new Map(run.execs.map((e, i) => [e.id, i]));
+    return store.posts(run.execs.map((e) => e.id)).map((e, i) => {
+      const sp = who(e.speaker);
+      const part = partOf.get(e.exec_id) ?? 0;
+      return {
+        seq: i + 1,
+        at: e.at,
+        speaker: { id: e.speaker, name: sp?.name ?? e.speaker, color: sp?.color ?? 'grey' },
+        title: e.title,
+        subtitle: e.subtitle ?? '',
+        brief: e.brief ?? null,
+        body: e.body ?? '',
+        plan: e.plan ?? null,
+        footer: e.footer ?? '',
+        stage: e.meta?.stage ?? null,
+        error: e.meta?.error ?? null,
+        followUp: part > 0,
+        part,
+      };
+    });
   }
 
   const alive = (pid) => {
@@ -147,103 +120,93 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     }
   };
 
-  /** 进度：看最新一个目录（原讨论或最后一次追问）的 usage.jsonl。 */
+  /** 进度：看最新一次运行（讨论本身或最后一次追问）的状态和用量事件。 */
   function progressOf(number, run) {
     const qi = queue.findIndex((j) => j.number === number);
     if (qi >= 0) return { status: 'queued', queuedAhead: qi + (current ? 1 : 0), speaking: [] };
-    if (!run) {
+    const exec = run && latestExec(run);
+    if (!exec) {
       if (failures.has(number)) return { status: 'failed', error: failures.get(number), speaking: [] };
-      return { status: current?.number === number ? 'running' : 'queued', speaking: [] };
+      if (current?.number === number) return { status: 'running', speaking: [] };
+      return { status: 'failed', error: '没有开始：排队时网页进程退出了，或者开始前就出错了', speaking: [] };
     }
-    const rows = readJsonl(path.join(latestDir(run), 'usage.jsonl'));
-    const startIdx = rows.findLastIndex((r) => r.type === 'run_started');
-    const tail = startIdx >= 0 ? rows.slice(startIdx) : rows;
-    const end = tail.find((r) => r.type === 'run_finished' || r.type === 'run_failed');
-    if (end?.type === 'run_failed') return { status: 'failed', error: end.error, speaking: [] };
-    if (end || startIdx < 0) return { status: current?.number === number ? 'running' : 'done', speaking: [] };
-    const started = tail[0];
-    if (current?.number !== number && !alive(started.pid)) return { status: 'failed', error: '跑这场讨论的进程已经退出，讨论没有正常结束', speaking: [] };
+    if (exec.status === 'failed') return { status: 'failed', error: exec.error ?? '运行失败', speaking: [] };
+    if (exec.status === 'done') return { status: current?.number === number ? 'running' : 'done', speaking: [] };
+    if (current?.number !== number && !alive(exec.pid)) return { status: 'failed', error: '跑这场讨论的进程已经退出，讨论没有正常结束', speaking: [] };
     const open = [];
-    for (const r of tail) {
+    for (const r of store.events(exec.id)) {
       if (r.type === 'call_started') open.push(r);
       if (r.type === 'call_finished' || r.type === 'call_failed') {
-        const i = open.findIndex((s) => s.speaker === r.speaker && s.stage === r.stage && s.round === r.round);
+        const i = open.findIndex((x) => x.speaker === r.speaker && x.stage === r.stage && x.round === r.round);
         if (i >= 0) open.splice(i, 1);
       }
     }
     const who = speakerOf(run);
     return {
       status: 'running',
-      speaking: open.map((s) => ({ name: who(s.speaker)?.name ?? s.speaker, stage: STAGE_LABELS[s.stage] ?? s.stage, round: s.round, at: s.at })),
+      speaking: open.map((x) => ({ name: who(x.speaker)?.name ?? x.speaker, stage: STAGE_LABELS[x.stage] ?? x.stage, round: x.round, at: x.at })),
     };
   }
 
   function summaryOf(run) {
-    const { state, start } = run;
+    const { state, start, row } = run;
     const mode = modeOf(run);
-    const subject = state?.subject ?? start?.subject;
+    const subject = subjectOf(run);
+    const topic = state?.topic ?? start?.topic ?? row.topic ?? '';
     return {
       number: run.number,
       mode,
       channel: channelOf(run),
-      topic: mode === 'refine' ? subject?.title ?? '' : (state?.topic ?? start?.topic ?? '').split('\n')[0].slice(0, 120),
-      requirement: mode === 'refine' ? (state?.topic ?? start?.topic ?? '') : undefined,
+      topic: mode === 'refine' ? subject?.title ?? '' : topic.split('\n')[0].slice(0, 120),
+      requirement: mode === 'refine' ? topic : undefined,
       type: subject?.type,
-      createdAt: state?.createdAt ?? start?.at ?? null,
+      createdAt: state?.createdAt ?? start?.at ?? row.created_at ?? null,
       updatedAt: state?.updatedAt ?? null,
       status: progressOf(run.number, run).status,
-      followUps: state?.followUps?.length ?? run.followDirs.length,
+      followUps: state?.followUps?.length ?? run.execs.filter((e) => e.kind === 'followup').length,
       hasRevision: Boolean(state?.revision),
       docVersion: state?.docs?.at(-1)?.version ?? null,
       applied: state?.applied ?? null,
-      mock: Boolean(state?.mock ?? start?.mock),
+      mock: Boolean(state?.mock ?? start?.mock ?? row.mock) || (!run.execs.length && mock),
+      archived: Boolean(row.archived_at),
     };
   }
 
-  function listRuns() {
-    const runs = scan();
-    const rows = [...runs.values()].map(summaryOf);
-    for (const [number, p] of pending) {
-      if (runs.has(number)) {
-        pending.delete(number);
-        continue;
-      }
-      rows.push({ number, mode: p.mode, channel: 'web', topic: p.mode === 'refine' ? p.subject.title : p.topic.split('\n')[0].slice(0, 120), requirement: p.mode === 'refine' ? p.topic : undefined, type: p.subject?.type, status: progressOf(number, null).status, followUps: 0, hasRevision: false, applied: null, mock });
-    }
-    return rows.sort((a, b) => b.number - a.number);
+  /** 列表：q 搜议题和发言内容，mode 模式，days 最近几天，archived 只看归档的。 */
+  function listRuns({ q, mode, days, archived } = {}) {
+    const since = Number(days) > 0 ? new Date(Date.now() - Number(days) * 86400000).toISOString() : undefined;
+    return store.discussions({ q: q || undefined, mode: MODE_LABELS[mode] ? mode : undefined, since, archived: Boolean(archived) })
+      .map((row) => summaryOf(loadRun(row)))
+      .sort((x, y) => y.number - x.number);
   }
 
   function runDetail(number) {
     const run = findRun(number);
-    const p = pending.get(number);
-    if (!run && !p) throw httpError(404, `没有 #${number} 这场讨论`);
-    if (!run) {
-      return { number, mode: p.mode, channel: 'web', topic: p.topic, subject: p.subject ?? null, summary: null, docs: [], docFile: null, revision: null, revisions: [], followUps: [], applied: null, expired: false, mock, canFollowUp: false, progress: progressOf(number, null), posts: [] };
-    }
-    const { state, start } = run;
+    if (!run) throw httpError(404, `没有 #${number} 这场讨论`);
+    const { state, start, row } = run;
     const mode = modeOf(run);
-    const subject = state?.subject ?? start?.subject ?? null;
+    const subject = subjectOf(run);
     const progress = progressOf(number, run);
     const lastDiscuss = [...(state?.followUps ?? [])].reverse().find((f) => f.handling === 'discuss');
     return {
       number,
       mode,
       channel: channelOf(run),
-      topic: state?.topic ?? start?.topic ?? '',
+      topic: state?.topic ?? start?.topic ?? row.topic ?? '',
       subject: subject && subject.fields ? { type: subject.type, id: subject.id, title: subject.title, current: subject.current, background: subject.background, fields: subject.fields, version: subject.version } : subject,
       summary: state?.summary ?? null,
       conclusion: lastDiscuss?.answer ?? state?.summary ?? null,
       // 主文档的所有版本（最新的在最后）；旧讨论没有主文档时为空，页面退回显示汇总
       docs: state?.docs ?? [],
-      docFile: state?.docs?.length ? path.join(run.dir, DOC_FILE) : null,
       revision: state?.revision ?? null,
       revisions: state?.revisions ?? [],
       followUps: (state?.followUps ?? []).map((f) => ({ question: f.question, handling: f.handling, answer: f.answer, doc: f.doc ?? null, context: f.context ?? 'resume', at: f.at })),
       followUpContext: cfg.followUpContext === 'fresh' ? 'fresh' : 'resume',
       applied: state?.applied ?? null,
       expired: Boolean(state?.expired),
+      archived: Boolean(row.archived_at),
       docFailed: Boolean(state?.docFailed),
-      mock: Boolean(state?.mock ?? start?.mock),
+      mock: Boolean(state?.mock ?? start?.mock ?? row.mock) || (!run.execs.length && mock),
       dryRun: Boolean(state?.dryRun ?? start?.dryRun),
       code: state?.context && !state.context.web ? { auto: Boolean(state.context.auto), repos: state.context.repos ?? [] } : null,
       web: state?.context?.web ? { questions: state.context.questions ?? [] } : null,
@@ -260,7 +223,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     if (current || !queue.length) return;
     current = queue.shift();
     const job = current;
-    const common = { runsDir, echo, mock, interject: true };
+    const common = { store, echo, mock, interject: true };
     try {
       if (job.kind === 'refine') {
         await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
@@ -302,7 +265,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     if (!SUBJECT_LABELS[type] || !id) throw httpError(400, '需要 type（idea / premise / outline）和 id');
     const jobCfg = jobConfig('refine', undefined, lineup);
     const item = await novel.get(type, id);
-    const number = nextNumber(runsDir);
+    const number = nextNumber(store, { mode: 'refine', topic: String(requirement).slice(0, 4000), channel: 'web', info: { subject: { type: item.type, id: item.id, title: item.title } } });
     const subject = {
       type: item.type,
       id: item.id,
@@ -315,7 +278,6 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       rules: item.rules,
     };
     const topic = String(requirement).slice(0, 4000);
-    pending.set(number, { mode: 'refine', topic, subject });
     enqueue({ kind: 'refine', number, subject, topic, cfg: jobCfg });
     log(`网页：#${number} 打磨${SUBJECT_LABELS[type]}「${item.title}」排队`);
     return { number };
@@ -374,8 +336,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       }
     }
     const picked = dataSelection(mode, data);
-    const number = nextNumber(runsDir);
-    pending.set(number, { mode, topic: text.slice(0, 8000) });
+    const number = nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web' });
     enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
     log(`网页：#${number} ${MODE_LABELS[mode]}排队`);
     return { number };
@@ -386,7 +347,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     if (!t) throw httpError(400, '插话不能为空');
     const run = findRun(number);
     if (!run || progressOf(number, run).status !== 'running') throw httpError(409, '这场讨论没有在进行，插话不会被看到；讨论结束后可以追问');
-    appendInbox(latestDir(run), { sender: modeOf(run) === 'refine' ? '作者' : '主持人', text: t.slice(0, 4000) });
+    appendInbox(store, latestExec(run).id, { sender: modeOf(run) === 'refine' ? '作者' : '主持人', text: t.slice(0, 4000) });
     return { ok: true, lark: channelOf(run) === 'lark' };
   }
 
@@ -419,9 +380,29 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       note: `ai-storm #${number} 打磨写回前`,
     });
     const applied = { at: new Date().toISOString(), revisionAt: state.revision.at, version: res.version };
-    saveState(run.dir, { ...state, applied, appliedHistory: [...(state.appliedHistory ?? []), applied] });
+    saveState(store, { ...state, applied, appliedHistory: [...(state.appliedHistory ?? []), applied] });
     log(`网页：#${number} 修订版已写回墨稿`);
     return { ok: true, applied };
+  }
+
+  function archive(number, archived) {
+    if (!store.discussion(number)) throw httpError(404, `没有 #${number} 这场讨论`);
+    store.setArchived(number, archived !== false);
+    log(`网页：#${number} ${archived === false ? '取消归档' : '已归档'}`);
+    return { ok: true, archived: archived !== false };
+  }
+
+  /** 删除一场讨论的全部记录，连同它的 Claude 会话文件；进行中或排队中的不能删。 */
+  function remove(number) {
+    const run = findRun(number);
+    if (!run) throw httpError(404, `没有 #${number} 这场讨论`);
+    if (busyWith(number) || progressOf(number, run).status === 'running') throw httpError(409, `#${number} 还在进行或排队中，等它结束再删`);
+    const cwd = cfg.providers?.['claude-cli']?.cwd ?? DEFAULT_CLAUDE_CWD;
+    removeSessionFiles(run.state, (id) => claudeSessionFile(cwd, id));
+    store.deleteDiscussion(number);
+    failures.delete(number);
+    log(`网页：#${number} 已删除`);
+    return { ok: true };
   }
 
   function status() {
@@ -454,7 +435,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   // ---------- 路由 ----------
 
   async function route(req, res, url) {
-    const m = /^\/api\/runs\/(\d+)(?:\/(events|interject|followup|apply))?$/.exec(url.pathname);
+    const m = /^\/api\/runs\/(\d+)(?:\/(events|interject|followup|apply|archive|delete))?$/.exec(url.pathname);
     if (req.method === 'GET' && url.pathname === '/') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(fs.readFileSync(PAGE));
@@ -462,7 +443,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     if (req.method === 'GET' && url.pathname === '/api/status') return json(res, status());
     if (req.method === 'GET' && url.pathname === '/api/novel/items') return json(res, { items: await novel.list() });
     if (req.method === 'GET' && url.pathname === '/api/novel/item') return json(res, await novel.get(url.searchParams.get('type'), url.searchParams.get('id')));
-    if (req.method === 'GET' && url.pathname === '/api/runs') return json(res, { runs: listRuns() });
+    if (req.method === 'GET' && url.pathname === '/api/runs') {
+      const p = url.searchParams;
+      return json(res, { runs: listRuns({ q: p.get('q')?.trim(), mode: p.get('mode'), days: p.get('days'), archived: p.get('archived') === '1' }) });
+    }
     if (req.method === 'POST' && url.pathname === '/api/runs') {
       const b = await body(req);
       return json(res, b.type ? await startRefine(b) : startDiscussion(b), 201);
@@ -477,10 +461,12 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       return json(res, followUp(number, b.question, b.context), 202);
     }
     if (req.method === 'POST' && m[2] === 'apply') return json(res, await apply(number, (await body(req)).revisionAt));
+    if (req.method === 'POST' && m[2] === 'archive') return json(res, archive(number, (await body(req)).archived));
+    if (req.method === 'POST' && m[2] === 'delete') return json(res, remove(number));
     throw httpError(405, '不支持的请求');
   }
 
-  /** 每秒看一次文件：有新发言就推 post，进度变了就推 progress。 */
+  /** 每秒查一次库：有新发言就推 post，进度变了就推 progress。 */
   function sse(req, res, number) {
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive' });
     let sent = Number(new URL(req.url, 'http://x').searchParams.get('after') ?? 0);

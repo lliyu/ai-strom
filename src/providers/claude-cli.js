@@ -108,7 +108,7 @@ export function createClaudeCliProvider(spec, { spawnImpl = spawn } = {}) {
 
 /**
  * 本次调用的费用。--resume 接着聊时，CLI 返回的 total_cost_usd 是整条会话到现在的累计值，
- * 所以记下会话上次的累计值（session.cliCostUsd，随 state.json 保存），本次只算差值。
+ * 所以记下会话上次的累计值（session.cliCostUsd，随讨论状态保存），本次只算差值。
  * 续接一条没记过累计值的旧会话时无法求差，返回 undefined，由调用方按配置价格估算。
  */
 export function callCost(total, session) {

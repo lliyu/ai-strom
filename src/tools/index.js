@@ -58,7 +58,8 @@ export function normalizeDataTools(cfg, errors) {
  * 一次调用要用的 MCP 配置：网关（有命令行工具时）加上登记的 MCP 服务，以及放行名单。
  * 放行名单就是权限边界：claude -p 里没放行的工具调用一律被拒（服务的其他工具模型能看到但用不了）。
  */
-export function mcpSetup(dataTools, { logFile } = {}) {
+/** record：{ db: 记录库文件, execId: 这次运行 }，命令行工具的调用记录写进库里（内存库写不了，不记）。 */
+export function mcpSetup(dataTools, { record } = {}) {
   const { tools, skipped, file } = loadCommandTools(dataTools.dir);
   const mcpServers = {};
   const allowed = [];
@@ -69,7 +70,7 @@ export function mcpSetup(dataTools, { logFile } = {}) {
       args: [
         GATEWAY_PATH, '--dir', dataTools.dir,
         '--timeout', String(dataTools.timeoutSec), '--max-chars', String(dataTools.maxOutputChars),
-        ...(logFile ? ['--log', logFile] : []),
+        ...(record?.db && record.db !== ':memory:' ? ['--db', record.db, ...(record.execId ? ['--exec', String(record.execId)] : [])] : []),
       ],
     };
     for (const t of tools) {
@@ -102,12 +103,12 @@ export function hasDataTools(dataTools) {
 }
 
 /**
- * 一场讨论要带的数据工具和知识：selection = { tools: 布尔, knowledge: [来源名] }（网页上选的，存进 state.json）。
- * 工具调用记录写到 logFile。都没有时返回 null。
+ * 一场讨论要带的数据工具和知识：selection = { tools: 布尔, knowledge: [来源名] }（网页上选的，存进讨论状态）。
+ * 工具调用记录写进记录库（record）。都没有时返回 null。
  */
-export function prepareData(cfg, selection, { logFile, knowledgeSetup } = {}) {
+export function prepareData(cfg, selection, { record, knowledgeSetup } = {}) {
   if (!selection || cfg.mode !== 'decision') return null;
-  const mcp = selection.tools && cfg.research && hasDataTools(cfg.dataTools) ? mcpSetup(cfg.dataTools, { logFile }) : null;
+  const mcp = selection.tools && cfg.research && hasDataTools(cfg.dataTools) ? mcpSetup(cfg.dataTools, { record }) : null;
   const usableMcp = mcp?.allowed.length ? mcp : null;
   const know = selection.knowledge?.length ? knowledgeSetup(cfg.knowledge, selection.knowledge) : null;
   const usableKnow = know?.dirs.length ? know : null;

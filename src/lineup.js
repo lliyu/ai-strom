@@ -5,7 +5,7 @@ import { normalizeConfig, ConfigError, resolveProviderSpec } from './config.js';
  * Lark 群里的讨论（watch）和命令行不走这里，仍然用 config.json 里固定的 participants / chair。
  *
  * 可选的模型（模型清单）：config.json 里每位参与者就是一个模型（id 不变），再加上 models 里只给网页用的模型；
- * 主席用的模型不在其中时也加进来。阵容选好后存进这场讨论的 state.json（lineup），追问时照原样用，
+ * 主席用的模型不在其中时也加进来。阵容选好后存进这场讨论的状态（lineup），追问时照原样用，
  * 不受之后改配置的影响。
  */
 
@@ -137,7 +137,7 @@ export function lineupConfig(cfg, { mode, rounds, lineup }) {
   return normalizeConfig({ ...cfg, participants, chair, personas: {}, customLineup: true, ...(research ? { research } : {}) }, overrides);
 }
 
-/** 存进 state.json 的阵容：完整的发言者定义（不含 webhook），追问时不再依赖模型清单。 */
+/** 存进讨论状态的阵容：完整的发言者定义（不含 webhook），追问时不再依赖模型清单。 */
 export function savedLineup(cfg) {
   if (!cfg.customLineup) return null;
   return { participants: cfg.participants.map(speakerDef), chair: speakerDef(cfg.chair), ...(cfg.research?.factChecker ? { factChecker: speakerDef(cfg.research.factChecker) } : {}) };

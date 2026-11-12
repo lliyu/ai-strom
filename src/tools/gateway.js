@@ -3,29 +3,29 @@
  * 数据工具网关：一个本地 MCP 服务（stdio，按行收发 JSON-RPC），把工具目录里登记的只读命令行工具
  * 交给 claude CLI 调用。调研员不开 Bash，只能通过这里执行登记过的命令，参数也只能填登记过的。
  *
- * 用法：node src/tools/gateway.js --dir <工具目录> [--log <调用记录.jsonl>] [--timeout <秒>] [--max-chars <字数>]
+ * 用法：node src/tools/gateway.js --dir <工具目录> [--db <记录库> --exec <运行 id>] [--timeout <秒>] [--max-chars <字数>]
  */
-import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { loadCommandTools, inputSchema } from './manifest.js';
 import { runCommandTool } from './run.js';
+import { openStore } from '../db.js';
 
 export const GATEWAY_NAME = 'storm';
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
 /** 处理一条 JSON-RPC 消息；通知返回 null。拆出来便于测试。 */
-export function createGateway({ dir, logFile, timeoutSec, maxOutputChars, run = runCommandTool }) {
+/** record(调用记录)：每次调用后回调，主进程里写进记录库。 */
+export function createGateway({ dir, record, timeoutSec, maxOutputChars, run = runCommandTool }) {
   const { tools } = loadCommandTools(dir);
   const byId = new Map(tools.map((t) => [t.id, t]));
 
-  const log = (record) => {
-    if (!logFile) return;
+  const log = (rec) => {
+    if (!record) return;
     try {
-      fs.mkdirSync(path.dirname(logFile), { recursive: true });
-      fs.appendFileSync(logFile, `${JSON.stringify(record)}\n`);
+      record(rec);
     } catch {
       // 记录失败不影响调用结果
     }
@@ -74,11 +74,21 @@ export function createGateway({ dir, logFile, timeoutSec, maxOutputChars, run = 
   return { tools, handle };
 }
 
+/** 网关进程里写记录库：第一次调用时才打开。 */
+function recorder(file, execId) {
+  let store;
+  return (rec) => {
+    store ??= openStore(file);
+    store.addToolCall(execId, rec);
+  };
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
       dir: { type: 'string' },
-      log: { type: 'string' },
+      db: { type: 'string' },
+      exec: { type: 'string' },
       timeout: { type: 'string' },
       'max-chars': { type: 'string' },
     },
@@ -89,7 +99,7 @@ async function main() {
   }
   const gateway = createGateway({
     dir: path.resolve(values.dir),
-    logFile: values.log ? path.resolve(values.log) : undefined,
+    record: values.db ? recorder(path.resolve(values.db), values.exec ? Number(values.exec) : null) : undefined,
     timeoutSec: values.timeout ? Number(values.timeout) : undefined,
     maxOutputChars: values['max-chars'] ? Number(values['max-chars']) : undefined,
   });

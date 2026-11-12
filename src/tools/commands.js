@@ -1,8 +1,8 @@
 import fs from 'node:fs';
-import path from 'node:path';
+import { sharedStore } from '../db.js';
 import { loadCommandTools } from './manifest.js';
 import { runCommandTool } from './run.js';
-import { mcpSetup, allowedToolsNote, ROOT } from './index.js';
+import { mcpSetup, allowedToolsNote } from './index.js';
 import { createProviderRegistry } from '../providers/index.js';
 import { inspectKnowledge, knowledgeSetup } from '../knowledge.js';
 
@@ -75,14 +75,11 @@ export function listKnowledge(cfg) {
 
 /**
  * node src/cli.js tools try "<问题>" [--model sonnet]：让模型带着全部数据工具回答一个问题，
- * 端到端检查网关、MCP 服务和登录态。调用记录写在 runs/.tools/。
+ * 端到端检查网关、MCP 服务和登录态。这次运行记在记录库里（kind = tools-try），命令行工具的调用记录在 tool_calls 表。
  */
-export async function tryTools(cfg, question, { model } = {}) {
-  const dir = path.join(ROOT, 'runs', '.tools');
-  fs.mkdirSync(dir, { recursive: true });
-  const logFile = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
-  const setup = mcpSetup(cfg.dataTools, { logFile });
-  if (!setup.allowed.length) {
+export async function tryTools(cfg, question, { model, store = sharedStore(cfg.db.path) } = {}) {
+  const probe = mcpSetup(cfg.dataTools);
+  if (!probe.allowed.length) {
     console.error('没有可用的数据工具：local/tools/tools.json 里没有只读工具，config.json 也没有登记 dataTools.mcpServers');
     return 2;
   }
@@ -90,14 +87,23 @@ export async function tryTools(cfg, question, { model } = {}) {
     ?? Object.entries(cfg.providers).find(([, p]) => p.type === 'claude-cli')?.[0]
     ?? 'claude-cli';
   const provider = createProviderRegistry(cfg).get(providerName);
+  const execId = store.startExecution({ kind: 'tools-try', topic: question });
+  const setup = mcpSetup(cfg.dataTools, { record: { db: store.file, execId } });
   const know = knowledgeSetup(cfg.knowledge);
   const system = '你在用数据工具和业务知识回答问题。只用放行的工具，不要编造数据；查不到或工具报错时如实说明，并写出你用的查询条件。';
   const prompt = [allowedToolsNote(setup), know.block, `**问题**\n${question}`].filter(Boolean).join('\n\n');
-  console.log(`放行 ${setup.allowed.length} 个工具，知识来源 ${know.sources.join('、') || '无'}，模型 ${model ?? '默认'}，调用记录：${path.relative(process.cwd(), logFile)}\n`);
-  const res = await provider.complete({
-    model, system, prompt, mcp: setup, timeoutMs: (cfg.dataTools.timeoutSec + 300) * 1000,
-    ...(know.dirs.length ? { tools: ['Read', 'Grep', 'Glob'], addDirs: know.dirs } : {}),
-  });
+  console.log(`放行 ${setup.allowed.length} 个工具，知识来源 ${know.sources.join('、') || '无'}，模型 ${model ?? '默认'}，记录库里的运行 id：${execId}\n`);
+  let res;
+  try {
+    res = await provider.complete({
+      model, system, prompt, mcp: setup, timeoutMs: (cfg.dataTools.timeoutSec + 300) * 1000,
+      ...(know.dirs.length ? { tools: ['Read', 'Grep', 'Glob'], addDirs: know.dirs } : {}),
+    });
+  } catch (err) {
+    store.finishExecution(execId, { status: 'failed', error: err.message.slice(0, 500) });
+    throw err;
+  }
+  store.finishExecution(execId, { status: 'done', result: { model: res.model, text: res.text, toolCalls: res.toolCalls ?? [], costUsd: res.costUsd, durationMs: res.durationMs } });
   console.log(res.text);
   console.log(`\n工具调用 ${res.toolCalls?.length ?? 0} 次：`);
   for (const c of res.toolCalls ?? []) {

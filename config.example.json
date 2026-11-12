@@ -216,5 +216,8 @@
   },
   "web": {
     "port": 8790
+  },
+  "db": {
+    "path": "local/ai-storm.db"
   }
 }

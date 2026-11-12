@@ -174,7 +174,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   const retryDelayMs = cfg.retryDelayMs ?? 5000;
-  // 主席输入预算用：各模型的上下文窗口（provider:model）、各 provider 每字多少 tokens。随 state.json 保存，追问时接着用
+  // 主席输入预算用：各模型的上下文窗口（provider:model）、各 provider 每字多少 tokens。随讨论状态保存，追问时接着用
   run.budget = { windows: { ...(budget.windows ?? {}) }, tokenRatios: { ...(budget.tokenRatios ?? {}) } };
   run.occupancy = new Map(); // 参与者 id -> 最近一次的上下文占用 { tokens, kind, pct }
 
@@ -960,7 +960,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
 
   /**
    * 阻断原文存档：每位评审最近一次提出【阻断】的那一轮的阻断原文。之后的轮次里这位评审不再提阻断时，记下从哪一轮起。
-   * 交给主席写主文档、判断追问，也存进 state.json。
+   * 交给主席写主文档、判断追问，也存进讨论状态。
    */
   run.blockerArchive = () => reviewers.map((p) => {
     const mine = rounds.filter((x) => (x.stage === 'critique' || x.stage === 'feedback') && x.entries.some((e) => e.id === p.id))
@@ -1074,7 +1074,7 @@ function compactCalls(calls) {
   return Object.keys(out).length ? out : null;
 }
 
-/** 讨论结束后可以续接的状态，写到 runs/<讨论>/state.json。 */
+/** 讨论结束后可以续接的状态，存进记录库（discussions.state）。 */
 /** 主席提示词末尾附上的核实结果。 */
 function chairFacts(facts) {
   const block = factsBlock(facts, { forChair: true });
@@ -1134,7 +1134,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
  * @param {object} [opts.interjections] createInterjectionReader 的结果（可选）
  * @param {function} [opts.log]      进度日志
  * @param {function} [opts.rng]      随机数（测试时固定代号）
- * @param {function} [opts.onEvent]  用量事件回调（写 usage.jsonl）
+ * @param {function} [opts.onEvent]  用量事件回调（写进记录库 events 表）
  * @param {object} [opts.code]       prepareRepos 的结果：有值时先由调研员读代码，整理背景资料给所有人
  * @param {number} [opts.number]     讨论编号，显示在卡片上，追问时用
  */
@@ -1299,7 +1299,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
  * 之后照常「评审提意见 → 主笔修订」，直到评审没有新意见（最多 cfg.followUpMaxRounds 轮），主席把结论改进主文档。
  * 直接回答的也会让主席判断要不要改主文档。还没有主文档的旧讨论，重新讨论后补写一份。
  *
- * @param {object} opts.state  原讨论的 state.json
+ * @param {object} opts.state  原讨论的状态
  * @returns {Promise<{ handling, answer, stats, state }>}  state 是更新后的，调用方负责写回
  */
 export async function runFollowUp({ cfg, state, question, providers, publisher, interjections, log = () => {}, onEvent = () => {}, code, context: contextMode, data }) {
@@ -1659,7 +1659,7 @@ function noCodeOf(mode, context) {
   return mode === 'decision' && (!context || Boolean(context.web));
 }
 
-/** 存进 state.json / result.json 的背景资料。联网资料没有仓库。 */
+/** 存进讨论状态和运行结果的背景资料。联网资料没有仓库。 */
 function contextOut(context) {
   if (!context) return null;
   if (context.web) return { web: true, text: context.text, questions: context.questions, ...(context.review ? { review: context.review } : {}) };
