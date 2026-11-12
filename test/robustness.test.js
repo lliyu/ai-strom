@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { normalizeConfig } from '../src/config.js';
 import { runDiscussion, runFollowUp, occupancyOf, isTransient, blockerLines } from '../src/orchestrator.js';
 import { createMemoryPublisher } from '../src/publishers.js';
-import { createOpenAICompatibleProvider, httpError } from '../src/providers/openai-compatible.js';
+import { createOpenAICompatibleProvider, httpError, networkError } from '../src/providers/openai-compatible.js';
 import { docPrompt, critiquePrompt } from '../src/modes.js';
 
 const base = (extra = {}) => normalizeConfig({
@@ -81,6 +81,23 @@ test('openai-compatible：finish_reason 为 length 时标记截断', async () =>
   assert.equal(res.truncated, true);
   const failing = createOpenAICompatibleProvider({ name: 'gw', baseUrl: 'http://x', contextWindow: 100 }, { fetchImpl: async () => ({ ok: false, status: 500, text: async () => 'oops' }) });
   await assert.rejects(failing.complete({ model: 'm', prompt: 'hi' }), (err) => err.retryable === true && err.status === 500);
+});
+
+test('连不上接口：fetch failed 的错误信息带上每个地址的失败原因，仍按临时故障重试', async () => {
+  const cause = Object.assign(new AggregateError([
+    Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT', address: '39.96.6.130', port: 443 }),
+    Object.assign(new Error('connect EHOSTUNREACH'), { code: 'EHOSTUNREACH', address: '2408::1', port: 443 }),
+  ]), { code: 'ETIMEDOUT' });
+  const fetchImpl = async () => { throw new TypeError('fetch failed', { cause }); };
+  const p = createOpenAICompatibleProvider({ name: 'bl', baseUrl: 'http://x', contextWindow: 100 }, { fetchImpl });
+  await assert.rejects(p.complete({ model: 'm', prompt: 'hi' }), (err) => {
+    assert.equal(err.message, 'provider bl fetch failed（ETIMEDOUT：ETIMEDOUT 39.96.6.130:443, EHOSTUNREACH 2408::1:443）');
+    assert.equal(err.cause, cause);
+    assert.equal(isTransient(err), true);
+    return true;
+  });
+  const timeout = Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+  assert.equal(networkError('bl', timeout), timeout);
 });
 
 test('上下文占用：单回合是准确值，多回合只能估下界', () => {

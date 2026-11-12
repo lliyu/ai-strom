@@ -57,6 +57,8 @@ export function createOpenAICompatibleProvider(spec, { fetchImpl = globalThis.fe
         },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(timeoutMs),
+      }).catch((err) => {
+        throw networkError(spec.name, err);
       });
       const text = await res.text();
       if (!res.ok) throw httpError(spec.name, res.status, text);
@@ -94,4 +96,19 @@ export function httpError(name, status, body) {
   err.status = status;
   if (status >= 500) err.retryable = true;
   return err;
+}
+
+/**
+ * 连不上接口时 Node 的 fetch 只说「fetch failed」，真正原因（ETIMEDOUT、ENOTFOUND、证书错误……）在 err.cause 里，
+ * 多地址建连失败时还是一个 AggregateError。把这些拼进错误信息，记录里才看得出是哪种故障。
+ * 超时和主动中止原样抛出。
+ */
+export function networkError(name, err) {
+  if (!err || err.name === 'TimeoutError' || err.name === 'AbortError' || !err.cause) return err;
+  const c = err.cause;
+  const one = (e) => [e.code, e.address && `${e.address}${e.port ? `:${e.port}` : ''}`].filter(Boolean).join(' ') || e.message;
+  const detail = Array.isArray(c.errors) && c.errors.length ? `${c.code ?? c.name}：${c.errors.map(one).join(', ')}` : one(c);
+  const wrapped = new Error(`provider ${name} ${err.message}（${detail}）`, { cause: c });
+  if (c.code) wrapped.code = c.code;
+  return wrapped;
 }

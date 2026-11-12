@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -14,6 +15,10 @@ import { sendCard } from './lark/webhook.js';
 import { watchLoop, acquireLock, isTrigger, DEFAULT_TRIGGERS } from './watch.js';
 import { listTools, callTool, tryTools, listKnowledge } from './tools/commands.js';
 import { parseRepoSpecs, resolveRepos, prepareRepos, availableRepos, describeRepo, allRepoSpecs } from './repos.js';
+
+// Node 建连时对每个解析出的地址只等 250ms 就换下一个，全部超时就报 fetch failed。
+// 到远端节点（比如百炼北京）建连常要 0.5 到 2.5 秒，放宽到 3 秒。
+net.setDefaultAutoSelectFamilyAttemptTimeout(3000);
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
