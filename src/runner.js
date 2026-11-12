@@ -122,14 +122,14 @@ export function prepareCode(cfg, repos) {
  * subject：打磨模式的打磨对象（墨稿里的脑洞 / 梗概 / 总纲）。
  * store：记录库，默认按配置的 db.path 打开。onExecution：建好这次运行的记录后回调（运行 id、编号）。
  */
-export async function runPrepared(cfg, { topic, dryRun, mock, interject, triggers, code, number: given, subject, lark, extraPublishers, interjections: ownInterjections, onExecution, onEvent: watcher, store = storeOf(cfg), echo, data: dataSelection, material, memory: memoryDomains }) {
+export async function runPrepared(cfg, { topic, dryRun, mock, interject, triggers, code, number: given, subject, lark, extraPublishers, interjections: ownInterjections, onExecution, onEvent: watcher, store = storeOf(cfg), echo, data: dataSelection, material, setting, memory: memoryDomains }) {
   cleanupSessions(cfg, store);
   // mock 演练不编号、不保存会话，免得被当成「最近一场」追问（网页演练例外：页面靠编号找讨论）
   const number = given ?? (mock ? undefined : nextNumber(store, { mode: cfg.mode, topic, info: subject ? { subject: { type: subject.type, id: subject.id, title: subject.title } } : null }));
   const execId = store.startExecution({ number: number ?? null, kind: 'discussion', topic: subject ? subject.title : topic });
   onExecution?.(execId, number);
   const { publisher, interjections, providers, onEvent, channel } = guard(store, execId, () => setupRun(cfg, { store, execId, number, dryRun, mock, interject, triggers, lark, extraPublishers, interjections: ownInterjections, onEvent: watcher, echo }));
-  log(`开始${number ? ` #${number}` : ''} ${{ brainstorm: '脑洞风暴', refine: '打磨', decision: '方案讨论', quick: '快问' }[cfg.mode]}：${cfg.participants.length} 位参与者，${cfg.adaptive ? `自动轮数（最多 ${cfg.rounds} 轮）` : `${cfg.rounds} 轮`}${dryRun ? '（dry-run，不发到 Lark）' : ''}${mock ? '（mock，不调用模型）' : ''}`);
+  log(`开始${number ? ` #${number}` : ''} ${{ brainstorm: '脑洞风暴', refine: '打磨', decision: '方案讨论', quick: '快问', redraft: '改稿' }[cfg.mode]}：${cfg.participants.length} 位参与者，${cfg.adaptive ? `自动轮数（最多 ${cfg.rounds} 轮）` : `${cfg.rounds} 轮`}${dryRun ? '（dry-run，不发到 Lark）' : ''}${mock ? '（mock，不调用模型）' : ''}`);
   if (code?.auto) log(`代码上下文：未指定仓库，调研员从 ${code.repos.length} 个登记的仓库里按议题定位`);
   else if (code) for (const r of code.repos) log(`代码上下文 ${describeRepo(r)}`);
   const data = dataFor(cfg, dataSelection, { store, execId });
@@ -139,7 +139,7 @@ export async function runPrepared(cfg, { topic, dryRun, mock, interject, trigger
 
   let result;
   try {
-    result = await runDiscussion({ cfg, topic, providers, publisher, interjections, log, onEvent, code, number, subject, data, material, memory });
+    result = await runDiscussion({ cfg, topic, providers, publisher, interjections, log, onEvent, code, number, subject, data, material, setting, memory });
   } catch (err) {
     onEvent({ type: 'run_failed', error: err.message.slice(0, 500) });
     throw err;

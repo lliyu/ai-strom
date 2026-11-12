@@ -56,20 +56,24 @@ export const STAGE_LABELS = {
   quickanswer: '回答',
   challenge: '挑刺',
   quickfinal: '快问定稿',
+  redraft: '改稿',
+  redraftfinal: '改稿定稿',
 };
 
 export function participantSystem(p, { maxChars, mode } = {}) {
   const refine = mode === 'refine';
   const capped = Boolean(LIMITS[mode]);
   return [
-    mode === 'quick'
+    mode === 'redraft'
+      ? `你是「${p.name}${p.role ? ` · ${p.role}` : ''}」，正在和另一位 AI 一起改一章小说：一位改稿，另一位挑刺，最后由改稿的一方定稿。过程只在作者的网页上显示。`
+      : mode === 'quick'
       ? `你是「${p.name}${p.role ? ` · ${p.role}` : ''}」，正在和另一位 AI 一起处理一个人的提问：一位先回答，另一位挑刺，最后由回答的一方定稿。过程只在提问人的网页上显示。`
       : `你是「${p.name}${p.role ? ` · ${p.role}` : ''}」，正在和其他几位 AI 参与一场多人讨论，${refine ? '作者会全程看着讨论过程' : '讨论过程会发到团队群里'}。`,
     p.persona ?? '',
     '规则：',
     '- 独立思考。不要为了和别人保持一致而改变观点；同意或反对都要给出依据。',
     '- 不知道的事实明确说不知道，不要编造数据、接口或配置。',
-    refine ? '- 作品定位是作者定的，不要建议换题材、换平台；以作者的要求为准。' : '',
+    refine || mode === 'redraft' ? '- 作品定位是作者定的，不要建议换题材、换平台；以作者的要求为准。' : '',
     '- 一针见血：先说结论，只写会影响判断的内容。不复述议题、别人的方案、评审意见或你自己说过的话，不写铺垫和客套。',
     capped
       ? '- 用中文，使用 Markdown 的加粗和列表，不要使用表格和 # 标题。每次发言的字数上限写在本轮任务里，必须遵守，宁可少写；超出会被要求压缩重写。'
@@ -214,11 +218,15 @@ function topicBlock(topic, mode) {
 
 /** 新建时贴进「材料」框的内容（章节原文、日志、文档片段……）：单独放，不占议题的字数上限。 */
 export const MATERIAL_MAX = 30000;
+/** 改稿的「设定与上下文」框：人物、世界观、前情，单独限长。 */
+export const SETTING_MAX = 20000;
 export function materialBlock(material) {
   const text = String(material ?? '').trim();
   if (!text) return '';
   return `## 提问人提供的材料（只作参考，问题以上面为准）\n${text}`;
 }
+/** 改稿要求为空时用的说法。 */
+export const REDRAFT_DEFAULT_ASK = '（作者没有写具体要求：找出最影响阅读体验的问题来改）';
 
 /**
  * 追问后给评审看的讨论范围：人类追问的原文（不含主席的说明，避免评审被主席的判断带偏）。
@@ -247,7 +255,16 @@ export function interjectionBlock(items) {
  * 所有参与者和主席共用的系统提示词：整场讨论里内容不变，放在最前面方便命中缓存。
  * 这里不写任何发言者的身份，身份和本轮任务在消息正文开头。
  */
-export function sharedSystem({ mode, topic, context, subject, dataContext, material, memory }) {
+export function sharedSystem({ mode, topic, context, subject, dataContext, material, memory, setting }) {
+  if (mode === 'redraft') {
+    return join(
+      '这是一次粘贴式改稿：一位 AI 按作者的要求改下面这章，另一位 AI 挑刺，最后由改稿的一方定稿。过程只在作者的网页上显示，不发到群里，结果由作者自己复制回去。你的身份、规则和本次任务写在用户消息开头，以那里为准。',
+      `## 作者的要求\n${String(topic ?? '').trim() || REDRAFT_DEFAULT_ASK}`,
+      `## 章节原文\n${String(material ?? '').trim()}`,
+      String(setting ?? '').trim() ? `## 设定与上下文（人物、世界观、前情；不在这次修改范围内，用来判断改得对不对）\n${String(setting).trim()}` : '',
+      memory,
+    );
+  }
   if (mode === 'quick') {
     return join(
       '这是一次快问：一位 AI 先回答下面的问题，另一位 AI 挑刺，最后由回答的一方定稿成一份短文档给提问人。过程只在提问人的网页上显示，不发到群里。你的身份、规则和本次任务写在用户消息开头，以那里为准。',
@@ -261,6 +278,7 @@ export function sharedSystem({ mode, topic, context, subject, dataContext, mater
     return join(
       `这是一场多 AI 网文${label}打磨讨论：几位 AI 找出下面这份${label}的不足、讨论怎么改，作者全程看着，最后决定是否采用。你的身份、规则和本轮任务写在用户消息开头，以那里为准。`,
       subjectBlock(subject, topic),
+      memory,
     );
   }
   return join(
@@ -1107,6 +1125,13 @@ const DOC_OUTLINE = {
     '## 下一步（提问人接下来最该做的几件事，按先后顺序）',
     '## 可存入知识库的结论（最多 3 条以后会反复用到的结论，每条一句完整的话，不含只对这次有效的细节，也不要和记忆里已有的重复；没有就写「无」。提问人确认后才会存）',
   ],
+  redraft: [
+    '# 标题（改的是哪一章、改成什么样）',
+    '**一句话结论**：……（这次最主要改了什么，只写一句话）',
+    '## 修改说明（按重要程度排序，每条写清改了哪里、为什么这样改；作者照着就能判断要不要接受）',
+    '## 没采纳的意见（挑刺里没采纳的，每条一句为什么不采纳；没有就写「无」）',
+    '## 可存入知识库的结论（关于这部作品以后改稿都要遵守的设定、人物、文风约定，最多 3 条，每条一句完整的话；没有就写「无」。作者确认后才会存）',
+  ],
   refine: [
     '# 标题（打磨的是哪一份、改成什么样）',
     '**一句话结论**：最该改的是什么、改完会好在哪里（只写一句话，不分行、不列点）',
@@ -1120,6 +1145,19 @@ const DOC_OUTLINE = {
 
 /** 写文档的规则：初稿、追问后更新、按核对意见修改、重写共用。 */
 function docRules(mode) {
+  if (mode === 'redraft') {
+    return [
+      '## 写法',
+      '这份文档给作者读：先看修改说明决定接不接受，再从「修改稿」附录里复制全文。',
+      '- 修改说明只写会影响判断的改动，按重要程度排序；措辞上的小改动合成一条带过。',
+      '- 挑刺里成立的意见吸收进修改稿；不采纳的写进「没采纳的意见」。',
+      '- 不要出现「方案 A」「评审 1」这些代号。不要写「变更记录」，程序会自动生成。',
+      `- 修改后的完整章节放在「${DOC_MARK.doc}」之后的附录里，标记写「【附录：修改稿】」：完整写出整章，没改的段落也照抄，保持原文的分段，不要加标题、批注或解释，不要省略。`,
+      '',
+      '## 文档的结构',
+      ...DOC_OUTLINE.redraft,
+    ].join('\n');
+  }
   if (mode === 'quick') {
     return [
       '## 写法',
@@ -1176,6 +1214,13 @@ function docFormat({ update = false, allowUnchanged = false } = {}) {
 }
 
 export function docSystem(mode) {
+  if (mode === 'redraft') {
+    return [
+      '你刚才按作者的要求改了一章，另一位 AI 对你的修改稿挑了刺。现在由你定稿：写出修改说明，并给出修改后的完整章节。',
+      '你只看到匿名代号，不要猜测它们来自哪个模型。挑刺的意见要认真对待，但不成立的不要为了迎合而采纳。',
+      '作品定位、人设和世界观以作者给的设定为准；作者之后还可能追问，你会接着改。',
+    ].join('\n');
+  }
   if (mode === 'quick') {
     return [
       '你刚才回答了提问人的问题，另一位 AI 对你的回答挑了刺。现在由你定稿，写成一份给提问人看的短文档。',
@@ -1671,18 +1716,67 @@ export function quickFinalPrompt({ answer, challenge }) {
 }
 
 /** 快问的追问：只靠现在的快问文档回答，不重新讨论。 */
-export function quickFollowUpPrompt({ doc, version, followUps = [], question, knowledge = '', canRead = false }) {
+export function quickFollowUpPrompt({ doc, version, attachments = {}, followUps = [], question, knowledge = '', canRead = false, redraft = false }) {
   const asked = followUps.filter((f) => f.question && f.answer);
   return join(
     `【阶段：${STAGE_LABELS.answer}】`,
-    `## 现在的快问文档（第 ${version} 版）\n${doc}`,
+    `## 现在的${redraft ? '改稿文档' : '快问文档'}（第 ${version} 版）\n${doc}`,
+    attachmentsBlock(attachments),
     asked.length ? `## 之前的追问（按时间先后）\n${asked.map((f, i) => `### ${i + 1}. ${f.question.trim()}\n${f.answer}`).join('\n\n')}` : '',
     quickKnowledgeBlock(knowledge, canRead),
-    `## 提问人的追问\n${question.trim()}`,
+    `## ${redraft ? '作者' : '提问人'}的追问\n${question.trim()}`,
     [
-      '请直接回答这次追问。追问补充了信息的，说明它怎样改变原来的结论；推翻了原来的结论就直接说。',
+      redraft
+        ? '请直接回答这次追问。作者要求再改的，说清怎么改、改哪几段（完整的修改稿接下来更新文档时再写），不要在这里贴整章。'
+        : '请直接回答这次追问。追问补充了信息的，说明它怎样改变原来的结论；推翻了原来的结论就直接说。',
       '- 先给结论，再给理由；不要停下来反问，缺的信息照样列出来。',
       '- 开头写「**要点**」，不超过 3 行；正文不超过 1200 字。',
     ].join('\n'),
+  );
+}
+
+// ---------- 粘贴式改稿：改稿 → 挑刺 → 定稿，共 3 次调用 ----------
+
+/** 改稿第一步：按要求改，修改后的完整章节写在「【完整方案】」之后（只交给挑刺的一方和定稿时用，卡片上折叠）。 */
+export function redraftPrompt() {
+  return join(
+    `【阶段：${STAGE_LABELS.redraft}】`,
+    [
+      '请按作者的要求修改上面的章节原文。',
+      '- 先写「**要点**」，不超过 3 行：这次最主要的改动；然后用几条列表说明改了哪里、为什么，不超过 600 字。',
+      `- 然后单独一行写「${PLAN_MARKER}」，下面是修改后的完整章节：整章完整写出，没改的段落也照抄，保持原文分段，不要加标题、批注或解释。`,
+      '- 设定和人设以作者给的为准，不要擅自改人名、地名和已经发生的情节。',
+    ].join('\n'),
+  );
+}
+
+/** 改稿第二步：另一位 AI 对照原文挑刺。 */
+export function redraftChallengePrompt({ notes, draft }) {
+  return join(
+    `【阶段：${STAGE_LABELS.challenge}】`,
+    notes ? `## 改稿的一方说明的改动（匿名）\n${notes}` : '',
+    `## 修改稿\n${draft}`,
+    [
+      '对照上面的章节原文和设定，给这份修改稿挑刺：',
+      '- 改坏了的地方：节奏、情绪、信息量变差，或者原文的好东西被删掉了；',
+      '- 和设定、人设、前情冲突的地方；',
+      '- 作者的要求没做到或做过头的地方；',
+      '- 还能明显更好的地方（给出具体改法，指明是哪一段）。',
+      '只写成立且值得改的问题，每条指明位置（引用原句开头几个字）；没有实质问题就直接说没有。',
+      '开头写「**要点**」，不超过 3 行；正文不超过 800 字。',
+    ].join('\n'),
+  );
+}
+
+/** 改稿第三步：改稿的一方吸收挑刺，写修改说明，并在附录里给出完整的修改稿。 */
+export function redraftFinalPrompt({ notes, draft, challenge }) {
+  return join(
+    `【阶段：${STAGE_LABELS.redraftfinal}】`,
+    notes ? `## 你说明的改动\n${notes}` : '',
+    `## 你的修改稿\n${draft}`,
+    challenge ? `## 挑刺（另一位 AI 的意见，匿名）\n${challenge}` : '## 挑刺\n这次挑刺没有成功，只按你的修改稿定稿，「没采纳的意见」写「无」。',
+    '请吸收挑刺里成立的意见，定稿：写出修改说明，并在【附录：修改稿】里给出修改后的完整章节。',
+    docRules('redraft'),
+    docFormat(),
   );
 }

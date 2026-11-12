@@ -43,7 +43,8 @@ export function createMockProvider(spec = {}) {
       const stage = /【阶段：([^】]+)】/.exec(prompt ?? '')?.[1] ?? '回答';
       if (stage === '修订版') return { text: mockRevision(prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 20 } };
       if (stage === '核对主文档') return { text: '没有问题', model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 4 } };
-      if (stage.includes('主文档') || stage === '快问定稿') return { text: mockDoc(stage, prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
+      if (stage === '改稿') return { text: `**要点**：改了开头（mock）\n\n- 开头更快进入冲突\n\n【完整方案】\n${mockRedraft(`${system ?? ''}\n${prompt ?? ''}`)}`, model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
+      if (stage.includes('主文档') || stage === '快问定稿' || stage === '改稿定稿') return { text: mockDoc(stage, prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
       return {
         text: `**${who}** 的${stage}（mock）\n\n- 要点一\n- 要点二\n\n提示词长度 ${prompt?.length ?? 0} 字。`,
         model: model ?? 'mock',
@@ -57,6 +58,24 @@ export function createMockProvider(spec = {}) {
 /** mock 的主文档：初稿或更新后的完整版本，版本号从提示词里取。 */
 function mockDoc(stage, prompt) {
   const version = Number(/现在的主文档（第 (\d+) 版）/.exec(prompt ?? '')?.[1] ?? 0) + 1;
+  if (/## 修改说明（按重要程度/.test(prompt ?? '')) {
+    const draft = /## 你的修改稿\n([\s\S]*?)\n\n## /.exec(prompt ?? '')?.[1] ?? mockRedraft(prompt);
+    return [
+      '【说明】',
+      stage.startsWith('更新') ? `追问后改到第 ${version} 版（mock）。` : '**一句话结论**：开头更快进入冲突（mock）。',
+      '【主文档】',
+      '# mock 改稿',
+      '**一句话结论**：开头更快进入冲突（mock）。',
+      '## 修改说明',
+      '- 第一段：删掉铺垫，直接进冲突（mock）',
+      '## 没采纳的意见',
+      '无',
+      '## 可存入知识库的结论',
+      '- 主角说话简短，不用感叹号（mock）',
+      '【附录：修改稿】',
+      draft,
+    ].join('\n');
+  }
   if (/## 回答（直接回答问题/.test(prompt ?? '')) {
     return [
       '【说明】',
@@ -94,6 +113,13 @@ function mockDoc(stage, prompt) {
     '## 下一步',
     '1. 下一步（mock）',
   ].join('\n');
+}
+
+/** mock 的改稿：把章节原文第一段换掉，其余照抄。 */
+function mockRedraft(prompt) {
+  const original = /## 章节原文\n([\s\S]*?)(?:\n\n## |$)/.exec(prompt ?? '')?.[1] ?? '';
+  const paras = original.split('\n').filter((l) => l.trim());
+  return ['（mock 改过的第一段）他推门进来，屋里的人都不说话了。', ...paras.slice(1)].join('\n');
 }
 
 /** mock 的修订版：按提示词里的 JSON Schema，把第一个文字字段改一下，其余字段由解析时用原值补齐。 */

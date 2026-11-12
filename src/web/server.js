@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { normalizeConfig, ConfigError } from '../config.js';
 import { lineupConfig, modelPool, roleTemplates, defaultLineup, tierLineup, MAX_SEATS, readsCode } from '../lineup.js';
 import { nextNumber, saveState, removeSessionFiles } from '../state.js';
-import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX } from '../modes.js';
+import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX, SETTING_MAX } from '../modes.js';
 import { groupKeys, critiqueDigest, blockerSummary, docSections } from './digest.js';
 import { listMemory, appendEntries, deleteEntry, isDomain, memoCandidates, ENTRY_MAX_CHARS } from '../memory.js';
 import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
@@ -30,7 +30,7 @@ import { inspectKnowledge } from '../knowledge.js';
 
 const PAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'page.html');
 const LOCAL = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i;
-const MODE_LABELS = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨', quick: '快问' };
+const MODE_LABELS = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨', quick: '快问', redraft: '改稿' };
 /** 方案讨论的档位：小会是两位主笔、一位评审，最多 3 轮。 */
 const MEETING_MAX_ROUNDS = 3;
 
@@ -176,7 +176,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return [...latest.values()].map((d) => {
       const s = docSections(d.text, mode);
       const key = `${run.number}:${d.version}`;
-      if (s.failed && (mode === 'decision' || mode === 'quick') && !degraded.has(key)) {
+      if (s.failed && ['decision', 'quick', 'redraft'].includes(mode) && !degraded.has(key)) {
         degraded.add(key);
         log(`网页：#${run.number} 第 ${d.version} 版主文档未能提取结论（缺：${s.missing.join('、') || '大纲'}），结论页显示全文`);
       }
@@ -237,11 +237,12 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const mode = modeOf(run);
     const subject = subjectOf(run);
     const topic = state?.topic ?? start?.topic ?? row.topic ?? '';
+    const material = state?.material ?? start?.material ?? row.info?.material ?? '';
     return {
       number: run.number,
       mode,
       channel: channelOf(run),
-      topic: mode === 'refine' ? subject?.title ?? '' : topic.split('\n')[0].slice(0, 120),
+      topic: mode === 'refine' ? subject?.title ?? '' : mode === 'redraft' && !topic.trim() ? `改稿：${material.trim().split('\n')[0].slice(0, 40)}` : topic.split('\n')[0].slice(0, 120),
       requirement: mode === 'refine' ? topic : undefined,
       type: subject?.type,
       createdAt: state?.createdAt ?? start?.at ?? row.created_at ?? null,
@@ -282,6 +283,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       topic: state?.topic ?? start?.topic ?? row.topic ?? '',
       tier: row.info?.tier ?? null,
       material: state?.material ?? start?.material ?? null,
+      setting: state?.setting ?? start?.setting ?? null,
       // 这场带了哪些记忆；这场已经存进记忆的结论（结论页标「已存入」）
       memory: state?.memory ?? start?.memory ?? null,
       memorySaved: savedFrom(number),
@@ -368,9 +370,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const common = { store, echo, mock, interject: true };
     try {
       if (job.kind === 'refine') {
-        await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
+        await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject, memory: job.memory });
       } else if (job.kind === 'discuss') {
-        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, material: job.material, memory: job.memory, number: job.number, repos: job.repos, data: job.data });
+        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, material: job.material, setting: job.setting, memory: job.memory, number: job.number, repos: job.repos, data: job.data });
       } else {
         // 群里的讨论在网页上追问：照样发到群里（dry-run 的讨论打印到终端）
         await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number, context: job.context });
@@ -403,8 +405,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     }
   }
 
-  async function startRefine({ type, id, requirement = '', lineup }) {
+  async function startRefine({ type, id, requirement = '', lineup, memory }) {
     if (!SUBJECT_LABELS[type] || !id) throw httpError(400, '需要 type（idea / premise / outline）和 id');
+    const mem = memoryPick(memory);
     const jobCfg = jobConfig('refine', undefined, lineup);
     const item = await novel.get(type, id);
     const number = nextNumber(store, { mode: 'refine', topic: String(requirement).slice(0, 4000), channel: 'web', info: { subject: { type: item.type, id: item.id, title: item.title } } });
@@ -420,7 +423,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       rules: item.rules,
     };
     const topic = String(requirement).slice(0, 4000);
-    enqueue({ kind: 'refine', number, subject, topic, cfg: jobCfg });
+    enqueue({ kind: 'refine', number, subject, topic, cfg: jobCfg, memory: mem.length ? mem : undefined });
     log(`网页：#${number} 打磨${SUBJECT_LABELS[type]}「${item.title}」排队`);
     return { number };
   }
@@ -459,30 +462,39 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
    * 网页上发起：快问（quick）、方案讨论（decision，tier 为 meeting 时是小会）、脑洞风暴（brainstorm）。
    * material 是「材料」框里的内容，单独限长，不占议题的字数上限。
    */
-  function startDiscussion({ mode, tier, topic, material, memory, repos, rounds, lineup, data }) {
-    if (!['decision', 'brainstorm', 'quick'].includes(mode)) throw httpError(400, 'mode 只能是 quick、decision 或 brainstorm');
+  /** 记忆：按域勾选（work / personal / novel）。 */
+  function memoryPick(memory) {
+    const mem = Array.isArray(memory) ? [...new Set(memory.map(String))] : [];
+    if (mem.some((d) => !isDomain(d))) throw httpError(400, 'memory 只能是 work、personal、novel 的组合');
+    return mem;
+  }
+
+  function startDiscussion({ mode, tier, topic, material, setting, memory, repos, rounds, lineup, data }) {
+    if (!['decision', 'brainstorm', 'quick', 'redraft'].includes(mode)) throw httpError(400, 'mode 只能是 quick、redraft、decision 或 brainstorm');
+    const light = mode === 'quick' || mode === 'redraft'; // 两位、一轮
     if (tier !== undefined && tier !== null && tier !== '' && !(tier === 'meeting' && mode === 'decision')) throw httpError(400, 'tier 只能是 meeting（方案讨论的小会）');
     const meeting = tier === 'meeting';
     const text = String(topic ?? '').trim();
-    if (!text) throw httpError(400, `${mode === 'brainstorm' ? '题目' : mode === 'quick' ? '问题' : '议题'}不能为空`);
+    if (!text && mode !== 'redraft') throw httpError(400, `${mode === 'brainstorm' ? '题目' : mode === 'quick' ? '问题' : '议题'}不能为空`);
     const mat = String(material ?? '').trim();
-    // 记忆：按域勾选（work / personal / novel）
-    const mem = Array.isArray(memory) ? [...new Set(memory.map(String))] : [];
-    if (mem.some((d) => !isDomain(d))) throw httpError(400, 'memory 只能是 work、personal、novel 的组合');
-    if (mat.length > MATERIAL_MAX) throw httpError(400, `材料最多 ${MATERIAL_MAX} 字，现在 ${mat.length} 字`);
+    if (mat.length > MATERIAL_MAX) throw httpError(400, `${mode === 'redraft' ? '章节原文' : '材料'}最多 ${MATERIAL_MAX} 字，现在 ${mat.length} 字`);
+    if (mode === 'redraft' && !mat) throw httpError(400, '改稿要贴上章节原文');
+    const set = mode === 'redraft' ? String(setting ?? '').trim() : '';
+    if (set.length > SETTING_MAX) throw httpError(400, `设定与上下文最多 ${SETTING_MAX} 字，现在 ${set.length} 字`);
+    const mem = memoryPick(memory);
     let r;
-    if (mode === 'quick' || meeting) r = mode === 'quick' ? undefined : 'auto';
+    if (light || meeting) r = light ? undefined : 'auto';
     else if (rounds !== undefined && rounds !== null && rounds !== '' && rounds !== 'auto') {
       r = Number(rounds);
       if (!Number.isInteger(r) || r < 2 || r > 12) throw httpError(400, '轮数要是 2 到 12 的整数，或者自动');
     } else if (rounds === 'auto') r = 'auto';
     // 快问、小会不传阵容时用各自的默认阵容（方案讨论默认阵容里挑人）
-    const seats = lineup ?? (mode === 'quick' || meeting ? tierLineup(cfg, mode === 'quick' ? 'quick' : 'meeting') : undefined);
-    if ((mode === 'quick' || meeting) && !seats) throw httpError(400, `配置里的参与者不够组成${mode === 'quick' ? '快问' : '小会'}，请在阵容里选`);
+    const seats = lineup ?? (light || meeting ? tierLineup(cfg, meeting ? 'meeting' : mode) : undefined);
+    if ((light || meeting) && !seats) throw httpError(400, `配置里的参与者不够组成${meeting ? '小会' : MODE_LABELS[mode]}，请在阵容里选`);
     const jobCfg = jobConfig(mode, r, seats, meeting ? { ...cfg, maxRounds: MEETING_MAX_ROUNDS } : cfg);
     // 仓库：不写 = 方案讨论自动定位；「无」= 不读代码；否则是别名列表。先校验，写错了不排队
     let repoSpecs;
-    const repoText = mode === 'quick' ? '无' : String(repos ?? '').trim(); // 快问不读代码
+    const repoText = light ? '无' : String(repos ?? '').trim(); // 快问、改稿不读代码
     if (repoText) {
       try {
         const specs = parseRepoSpecs(repoText);
@@ -492,9 +504,11 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
         throw httpError(400, err.message);
       }
     }
-    const picked = dataSelection(mode, data);
-    const number = nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web', ...(meeting ? { info: { tier: 'meeting' } } : {}) });
-    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), material: mat || undefined, memory: mem.length ? mem : undefined, repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
+    const picked = mode === 'redraft' ? undefined : dataSelection(mode, data);
+    // 改稿没写要求时，列表标题用原文第一行（排队时就要能显示）
+    const info = { ...(meeting ? { tier: 'meeting' } : {}), ...(mode === 'redraft' && !text ? { material: mat.split('\n')[0].slice(0, 80) } : {}) };
+    const number = nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web', ...(Object.keys(info).length ? { info } : {}) });
+    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), material: mat || undefined, setting: set || undefined, memory: mem.length ? mem : undefined, repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
     log(`网页：#${number} ${meeting ? '小会' : MODE_LABELS[mode]}排队`);
     return { number };
   }
@@ -580,8 +594,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       maxRounds: cfg.maxRounds,
       participants: { decision: people('decision'), brainstorm: people('brainstorm'), refine: people('refine') },
       // 新建页的档位：快问、小会的默认阵容（从方案讨论的默认阵容里挑），材料框的上限
-      tiers: { quick: tierLineup(cfg, 'quick'), meeting: tierLineup(cfg, 'meeting'), meetingMaxRounds: MEETING_MAX_ROUNDS },
+      tiers: { quick: tierLineup(cfg, 'quick'), meeting: tierLineup(cfg, 'meeting'), redraft: tierLineup(cfg, 'redraft'), meetingMaxRounds: MEETING_MAX_ROUNDS },
       materialMax: MATERIAL_MAX,
+      settingMax: SETTING_MAX,
       memory: memoryDir() ? memoryOverview() : null,
       // 自选阵容：可选的模型、角色模板、各模式的默认阵容
       models: modelPool(cfg).map((m) => ({ id: m.id, name: m.name, provider: m.provider, model: m.model ?? null, color: m.color ?? 'grey', readsCode: readsCode(cfg, m) })),

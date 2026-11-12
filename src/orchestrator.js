@@ -12,6 +12,7 @@ import {
   webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
   dataAskLine, webAlsoLine, evidenceBlock, toolCallsBlock, dataPlanPrompt, parseDataPlan, dataCheckPrompt, dataReviewPrompt,
   quickAnswerPrompt, quickChallengePrompt, quickFinalPrompt, quickFollowUpPrompt,
+  redraftPrompt, redraftChallengePrompt, redraftFinalPrompt, REDRAFT_DEFAULT_ASK,
 } from './modes.js';
 import { resolveProviderSpec } from './config.js';
 import { allowedToolsNote } from './tools/index.js';
@@ -103,7 +104,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   const stats = { calls: 0, failures: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
   const ideasPerAgent = cfg.ideasPerAgent ?? 3;
   const limits = limitsFor(cfg.mode, cfg.limits); // 脑洞风暴不限字数（null）
-  const run = { participants, leads, reviewers, reviewerIds, tagOf, convo, heard, stats, emit, ideasPerAgent, limits, shared: '' };
+  const run = { participants, leads, reviewers, reviewerIds, tagOf, convo, heard, stats, emit, ideasPerAgent, limits, shared: '', truncations: 0 };
   /**
    * 代码目录（prepareRepos 的结果）：调研员确认议题涉及代码后才设置。
    * 有值时：readCode 的参与者发言时带只读工具；参与者列出的「待核实的事实」由调研员在下一轮开始前查代码回答。
@@ -226,7 +227,10 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       }
       if (session) session.contextTokens = res.occupancy.tokens;
       if (tags.has(speaker.id)) run.occupancy.set(speaker.id, res.occupancy);
-      if (res.truncated) log(`⚠️ ${speaker.name} 的输出到了长度上限，被截断了`);
+      if (res.truncated) {
+        run.truncations += 1;
+        log(`⚠️ ${speaker.name} 的输出到了长度上限，被截断了`);
+      }
       // 接口不返回费用时（例如百炼），按配置的价格估算
       const estimate = res.costUsd == null ? estimateCost(priceFor(cfg, speaker, res.model), res.usage, new Date(started)) : null;
       if (estimate?.costUsd != null) res.costUsd = estimate.costUsd;
@@ -743,7 +747,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         heard.length ? `**收到的插话**：${heard.length} 条` : null,
         number && cfg.mode === 'refine' ? '**追问**：在页面上接着追问，主编会判断是直接回答还是重新讨论；重新讨论后会重写修订版。' : null,
         number && cfg.mode === 'quick' ? '**追问**：在页面上接着追问，回答的一方会直接回答并更新快问文档；想深入讨论可以「升级为讨论」。' : null,
-        number && cfg.mode !== 'refine' && cfg.mode !== 'quick' ? `**追问**：发 \`/追问 <问题>\` 接着问这场讨论（更早的讨论写 \`/追问 #${number} <问题>\`），主席会判断是直接回答还是重新讨论。` : null,
+        number && cfg.mode === 'redraft' ? '**追问**：在页面上接着追问（例如「第三段再收一点」），改稿的一方会回答，需要时更新修改稿。' : null,
+        number && !['refine', 'quick', 'redraft'].includes(cfg.mode) ? `**追问**：发 \`/追问 <问题>\` 接着问这场讨论（更早的讨论写 \`/追问 #${number} <问题>\`），主席会判断是直接回答还是重新讨论。` : null,
       ].filter((l) => l !== null).join('\n'),
     });
   };
@@ -1187,8 +1192,8 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
  * @param {object} [opts.code]       prepareRepos 的结果：有值时先由调研员读代码，整理背景资料给所有人
  * @param {number} [opts.number]     讨论编号，显示在卡片上，追问时用
  */
-export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data, material, memory }) {
-  if (cfg.mode === 'quick') return runQuick({ cfg, topic, providers, publisher, log, rng, onEvent, number, data, material, memory });
+export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data, material, memory, setting }) {
+  if (cfg.mode === 'quick' || cfg.mode === 'redraft') return runQuick({ cfg, topic, providers, publisher, log, rng, onEvent, number, data, material, memory, setting });
   if (cfg.mode === 'refine' && !subject) throw new Error('打磨模式需要打磨对象（subject）');
   const tags = assignTags(cfg.participants, rng);
   const sessions = new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
@@ -1362,27 +1367,31 @@ const memoryOut = (memory) => (memory?.domains?.length ? { domains: memory.domai
  * 不反问、不核实、不查代码；网页上选了知识来源时，索引写进提示词，能读本机文件的模型（claude-cli）可以打开正文。
  * 产出和方案讨论一样存成主文档的版本和讨论状态，结束原因记为「直接回答」：结论页、追问、升级为讨论共用一条管线。
  */
-export async function runQuick({ cfg, topic, providers, publisher, log = () => {}, rng = Math.random, onEvent = () => {}, number, data, material, memory }) {
+export async function runQuick({ cfg, topic, providers, publisher, log = () => {}, rng = Math.random, onEvent = () => {}, number, data, material, memory, setting }) {
+  const redraft = cfg.mode === 'redraft';
+  const kind = redraft ? '改稿' : '快问';
   const tags = assignTags(cfg.participants, rng);
   const sessions = new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
   const latest = new Map();
   const rounds = [];
-  const run = createRun({ cfg, providers, publisher, log, onEvent, tags, sessions, latest, rounds, data });
+  const run = createRun({ cfg, providers, publisher, log, onEvent, tags, sessions, latest, rounds, data: redraft ? null : data });
   const { leads, reviewers, participants, stats, emit, tagOf, convo } = run;
   const answerer = leads[0];
   const critic = reviewers[0] ?? leads[1];
-  if (!answerer || !critic) throw new Error('快问需要一位回答（主笔）和一位挑刺（评审）');
+  if (!answerer || !critic) throw new Error(`${kind}需要一位${redraft ? '改稿' : '回答'}（主笔）和一位挑刺（评审）`);
+  if (redraft && !String(material ?? '').trim()) throw new Error('改稿需要章节原文');
   const no = number ? ` #${number}` : '';
   const sources = run.data?.knowledge?.sources ?? [];
 
   emit({
     type: 'run_started',
     topic,
-    mode: 'quick',
+    mode: cfg.mode,
     rounds: 1,
     adaptive: false,
     number: number ?? null,
     ...(material ? { material } : {}),
+    ...(setting ? { setting } : {}),
     ...(memoryOut(memory) ? { memory: memoryOut(memory) } : {}),
     participants: participants.map(brief),
     chair: { ...brief(cfg.chair), part: 'chair' },
@@ -1390,58 +1399,77 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
   });
   await publisher.post({
     speaker: cfg.chair,
-    title: `⚡ 快问${no} 开始`,
-    subtitle: `回答：${answerer.name} · ${answerer.role}　挑刺：${critic.name} · ${critic.role}`,
+    title: `${redraft ? '✍️ 改稿' : '⚡ 快问'}${no} 开始`,
+    subtitle: `${redraft ? '改稿' : '回答'}：${answerer.name} · ${answerer.role}　挑刺：${critic.name} · ${critic.role}`,
     body: [
-      '**问题**',
-      topic.trim(),
-      material ? `\n**材料**：${material.length} 字` : null,
+      redraft ? '**作者的要求**' : '**问题**',
+      topic.trim() || (redraft ? REDRAFT_DEFAULT_ASK : ''),
+      redraft ? `\n**章节原文**：${material.length} 字${setting ? `；**设定与上下文**：${setting.length} 字` : ''}` : material ? `\n**材料**：${material.length} 字` : null,
       '',
-      `**流程**：${answerer.name}先回答，${critic.name}挑刺，最后由${answerer.name}定稿成一份短文档（回答、你可能没考虑到的、需要你补充的、下一步），共 3 次模型调用。不会停下来反问：缺的信息写在结果里，用追问补充。`,
+      redraft
+        ? `**流程**：${answerer.name}先改，${critic.name}对照原文挑刺，最后由${answerer.name}定稿：修改说明加完整的修改稿，共 3 次模型调用。结果只在页面上，自己复制回去，不写回墨稿。`
+        : `**流程**：${answerer.name}先回答，${critic.name}挑刺，最后由${answerer.name}定稿成一份短文档（回答、你可能没考虑到的、需要你补充的、下一步），共 3 次模型调用。不会停下来反问：缺的信息写在结果里，用追问补充。`,
       memoryLine(memory),
       sources.length ? `**知识来源**：${sources.join('、')}（索引写进提示词；${participants.filter((p) => run.readsFiles(p)).map((p) => p.name).join('、') || '没有模型'}能打开正文）` : null,
-      `**内容去向**：问题和材料会发给这两位模型所在的服务（${[...new Set(participants.map((p) => p.provider))].join('、')}），不发到群里。`,
+      `**内容去向**：${redraft ? '章节和设定' : '问题和材料'}会发给这两位模型所在的服务（${[...new Set(participants.map((p) => p.provider))].join('、')}），不发到群里。`,
     ].filter((l) => l !== null).join('\n'),
   });
 
-  run.shared = sharedSystem({ mode: 'quick', topic, material, memory: memory?.block });
+  run.shared = sharedSystem({ mode: cfg.mode, topic, material, memory: memory?.block, setting });
   const say = async (p, stage, task) => {
     const k = run.knowledgeFor(p);
     const session = convo ? sessions.get(p.id) : null;
-    const text = await run.speak(p, { stage, round: 1, system: run.shared, prompt: `${participantSystem(p, { mode: 'quick' })}\n\n${task(k)}`, session, callOptions: k.callOptions });
+    const text = await run.speak(p, { stage, round: 1, system: run.shared, prompt: `${participantSystem(p, { mode: cfg.mode })}\n\n${task(k)}`, session, callOptions: k.callOptions });
     if (text != null) rounds.push({ round: 1, stage, entries: [{ id: p.id, label: tags.get(p.id).label, tag: tagOf(p), text: splitReply(text).shown }] });
     return text;
   };
 
-  // ---------- 回答 ----------
-  const answer = await say(answerer, 'quickanswer', (k) => quickAnswerPrompt({ knowledge: k.text, canRead: k.canRead }));
-  if (answer == null) throw new Error(`${answerer.name}没能回答，快问没有完成`);
-  const shown = splitReply(answer).shown;
-  latest.set(answerer.id, { id: answerer.id, label: tags.get(answerer.id).label, tag: tagOf(answerer), text: shown });
+  // ---------- 回答 / 改稿 ----------
+  const answer = await say(answerer, redraft ? 'redraft' : 'quickanswer', (k) => (redraft ? redraftPrompt() : quickAnswerPrompt({ knowledge: k.text, canRead: k.canRead })));
+  if (answer == null) throw new Error(`${answerer.name}没能${redraft ? '改稿' : '回答'}，${kind}没有完成`);
+  const parts = splitReply(answer);
+  const shown = parts.shown;
+  // 改稿：完整的修改稿写在「【完整方案】」之后；没按格式写时整段当修改稿
+  const draft = redraft ? parts.plan ?? answer : null;
+  latest.set(answerer.id, { id: answerer.id, label: tags.get(answerer.id).label, tag: tagOf(answerer), text: shown, ...(draft ? { plan: draft } : {}) });
 
   // ---------- 挑刺 ----------
-  const challenge = await say(critic, 'challenge', (k) => quickChallengePrompt({ answer: shown, knowledge: k.text, canRead: k.canRead }));
-  if (challenge == null) log(`⚠️ ${critic.name}挑刺失败，只按回答定稿`);
+  const challenge = await say(critic, 'challenge', (k) => (redraft ? redraftChallengePrompt({ notes: parts.plan ? shown : '', draft }) : quickChallengePrompt({ answer: shown, knowledge: k.text, canRead: k.canRead })));
+  if (challenge == null) log(`⚠️ ${critic.name}挑刺失败，只按${redraft ? '修改稿' : '回答'}定稿`);
+  const critique = challenge == null ? null : splitReply(challenge).shown;
 
-  // ---------- 定稿：回答的一方写成快问文档 ----------
+  // ---------- 定稿：回答（改稿）的一方写成文档 ----------
+  const truncatedBefore = run.truncations;
   const written = await run.writeDoc({
     writer: answerer,
     round: 2,
-    reason: '快问定稿',
+    reason: `${kind}定稿`,
     check: false,
-    prompt: quickFinalPrompt({ answer: shown, challenge: challenge == null ? null : splitReply(challenge).shown }),
+    prompt: redraft ? redraftFinalPrompt({ notes: parts.plan ? shown : '', draft, challenge: critique }) : quickFinalPrompt({ answer: shown, challenge: critique }),
   });
   const docs = written ?? [];
   if (!docs.length) {
-    await publisher.post({ speaker: cfg.chair, title: '快问定稿失败', subtitle: '回答见上面', body: `${answerer.name}没能写出快问文档，上面的回答${challenge == null ? '' : '和挑刺'}就是这次的结果。可以追问一次，会按回答重新整理。`, meta: { stage: 'fallback', round: 2 } });
+    await publisher.post({ speaker: cfg.chair, title: `${kind}定稿失败`, subtitle: `${redraft ? '修改稿' : '回答'}见上面`, body: `${answerer.name}没能写出${kind}文档，上面的${redraft ? '修改稿' : '回答'}${challenge == null ? '' : '和挑刺'}就是这次的结果。可以追问一次，会重新整理。`, meta: { stage: 'fallback', round: 2 } });
   }
   const doc = docs[0] ?? null;
+  // 改稿：修改稿太短或者输出被截断，多半没写完，提醒作者别直接用
+  if (redraft && doc) {
+    const final = doc.attachments?.['修改稿'] ?? '';
+    const warn = !final ? '定稿里没有「修改稿」附录，完整修改稿只能从第一步的卡片里取。'
+      : run.truncations > truncatedBefore ? '定稿时模型输出到了长度上限，修改稿可能没写完。'
+      : final.length < material.length * 0.6 ? `修改稿只有 ${final.length} 字，原文 ${material.length} 字，可能有段落被省略了。` : '';
+    if (warn) {
+      log(`⚠️ ${warn}`);
+      await publisher.post({ speaker: cfg.chair, title: '⚠️ 修改稿可能不完整', subtitle: '复制前先核对', body: `${warn}可以追问「把修改稿完整写出来」，或者把章节拆短一点再改。`, meta: { stage: 'fallback', round: 2 } });
+    }
+  }
   const summary = doc?.text ?? shown;
   const ending = { reason: 'answered', round: 1 };
-  await run.postEnd({ number, title: `快问${no} 完成`, subtitle: `${stats.calls} 次模型调用${stats.failures ? `，${stats.failures} 次失败` : ''}` });
+  await run.postEnd({ number, title: `${kind}${no} 完成`, subtitle: `${stats.calls} 次模型调用${stats.failures ? `，${stats.failures} 次失败` : ''}` });
 
   const labels = Object.fromEntries([...tags].map(([id, t]) => [id, t.tag]));
   emit({ type: 'run_finished', stats, labels, roundsUsed: 1, ending: ending.reason });
+  const state = exportState({ number, topic, cfg, tags, shared: run.shared, context: null, code: null, facts: [], sessions, latest, rounds, lastRound: 1, summary, docs, ending, docFailed: !docs.length, budget: run.budget, blockers: [], interjections: [], data: run.data?.selection, material, memory: memoryOut(memory) });
   return {
     labels,
     rounds,
@@ -1453,7 +1481,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
     context: null,
     doc,
     docs,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context: null, code: null, facts: [], sessions, latest, rounds, lastRound: 1, summary, docs, ending, docFailed: !docs.length, budget: run.budget, blockers: [], interjections: [], data: run.data?.selection, material, memory: memoryOut(memory) }),
+    state: setting ? { ...state, setting } : state,
   };
 }
 
@@ -1477,7 +1505,8 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget, data: state.mode === 'decision' || state.mode === 'quick' ? data : null });
   const { leads, participants, stats, emit, heard, ideasPerAgent, tagOf } = run;
   // 快问的追问固定走直接回答：不经过主席分流，由回答的一方只靠现在的快问文档回答，再更新文档
-  const quick = state.mode === 'quick';
+  const quick = state.mode === 'quick' || state.mode === 'redraft';
+  const redraft = state.mode === 'redraft';
   run.shared = state.shared; // 和原讨论完全一样，缓存还能命中
   // 原讨论带了代码背景时，调用方会重新准备代码目录：追问中照样能查代码、核实事实
   if (code && state.context && !state.context.web) run.code = code;
@@ -1527,7 +1556,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     title: `🔁 追问 · 讨论${no}`,
     subtitle: state.topic.split('\n')[0].slice(0, 60),
     body: quick
-      ? `**追问**\n${question.trim()}\n\n${leads[0]?.name ?? '回答的一方'}按现在的快问文档直接回答，再把结论改进文档。想深入讨论可以在页面上「升级为讨论」。`
+      ? `**追问**\n${question.trim()}\n\n${leads[0]?.name ?? '回答的一方'}按现在的${redraft ? '改稿文档和修改稿直接回答，需要再改时更新修改稿' : '快问文档直接回答，再把结论改进文档。想深入讨论可以在页面上「升级为讨论」'}。`
       : `**追问**\n${question.trim()}\n\n主席先判断怎么处理：讨论记录里能回答的直接回答；对分歧做选择的按裁决定稿；要查证事实的先核实；需要重新权衡的让参与者再讨论（${ctxMode === 'fresh' ? '各开一条新会话，带上讨论现状' : '接着原来的会话'}）。`,
   });
 
@@ -1565,7 +1594,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         stage: 'answer',
         round: state.lastRound,
         system: run.shared,
-        prompt: `${participantSystem(answerer, { mode: 'quick' })}\n\n${quickFollowUpPrompt({ doc: current?.text ?? state.summary ?? '', version: current?.version ?? 1, followUps: state.followUps, question, knowledge: k.text, canRead: k.canRead })}`,
+        prompt: `${participantSystem(answerer, { mode: state.mode })}\n\n${quickFollowUpPrompt({ doc: current?.text ?? state.summary ?? '', version: current?.version ?? 1, attachments: current?.attachments, followUps: state.followUps, question, knowledge: k.text, canRead: k.canRead, redraft })}`,
         callOptions: k.callOptions,
       });
       if (text == null) throw new Error(`${answerer.name}没能回答这次追问`);
@@ -1584,7 +1613,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     const doc = firstDoc(out);
     if (out?.length) docs.push(...out);
     followUps.push({ question, handling, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
-    await run.postEnd({ title: `追问已回答 · ${quick ? '快问' : '讨论'}${no}`, subtitle: `${quick ? `${answerer.name}` : '主席'}直接回答 · ${stats.calls} 次模型调用` });
+    await run.postEnd({ title: `追问已回答 · ${redraft ? '改稿' : quick ? '快问' : '讨论'}${no}`, subtitle: `${quick ? `${answerer.name}` : '主席'}直接回答 · ${stats.calls} 次模型调用` });
   } else if (handling === 'verdict') {
     // ---------- 裁决型：被选中的主笔按裁决定稿；选择不对应单个方案时由主席合并。不再经过评审 ----------
     log(`主席判断：裁决，${pick.target === 'merge' ? '由主席合并定稿' : `由${pick.target}的主笔定稿`}`);

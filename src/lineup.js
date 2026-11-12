@@ -87,11 +87,12 @@ export function defaultLineup(cfg, mode) {
  * 小会的默认阵容：两位主笔、一位评审。主席沿用方案讨论的。
  */
 export function tierLineup(cfg, tier) {
-  const d = defaultLineup(cfg, 'decision');
+  // 改稿从作品打磨的默认阵容里挑（角色是编辑、读者视角）
+  const d = defaultLineup(cfg, tier === 'redraft' ? 'refine' : 'decision');
   const leads = d.participants.filter((p) => p.part !== 'reviewer');
   const reviewers = d.participants.filter((p) => p.part === 'reviewer');
   const rest = (taken) => d.participants.filter((p) => !taken.includes(p));
-  if (tier === 'quick') {
+  if (tier === 'quick' || tier === 'redraft') {
     const answer = leads[0] ?? d.participants[0];
     const critic = reviewers[0] ?? rest([answer])[0];
     if (!answer || !critic) return null;
@@ -115,8 +116,8 @@ export function lineupConfig(cfg, { mode, rounds, lineup }) {
   const seats = lineup.participants;
   if (!Array.isArray(seats) || seats.length < 2) throw new ConfigError('至少选 2 位参与者');
   if (seats.length > MAX_SEATS) throw new ConfigError(`最多 ${MAX_SEATS} 位参与者`);
-  if (mode === 'quick' && (seats.length !== 2 || seats.filter((x) => x?.part === 'reviewer').length !== 1)) {
-    throw new ConfigError('快问要两位：一位回答（主笔），一位挑刺（评审）');
+  if ((mode === 'quick' || mode === 'redraft') && (seats.length !== 2 || seats.filter((x) => x?.part === 'reviewer').length !== 1)) {
+    throw new ConfigError(mode === 'redraft' ? '改稿要两位：一位改稿（主笔），一位挑刺（评审）' : '快问要两位：一位回答（主笔），一位挑刺（评审）');
   }
   const pool = new Map(modelPool(cfg).map((m) => [m.id, m]));
   const used = new Set(['chair']);

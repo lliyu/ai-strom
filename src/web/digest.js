@@ -128,6 +128,10 @@ const DOC_SECTIONS = {
     sections: { answer: /^回答/, blind: /没考虑到/, need: /补充/, next: /^下一步/, memo: /知识库/ },
     required: ['answer', 'next'],
   },
+  redraft: {
+    sections: { notes: /^修改说明/, rejected: /没采纳/, memo: /知识库/ },
+    required: ['notes'],
+  },
 };
 
 /** 按行首 `## ` 切段，跳过代码块里的 `##`。返回 { head（第一个 ## 之前）, sections: [{ title, text }] }。 */
