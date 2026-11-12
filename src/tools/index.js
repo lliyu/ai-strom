@@ -1,7 +1,8 @@
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadCommandTools } from './manifest.js';
+import { loadCommandTools, MANIFEST_FILE } from './manifest.js';
 import { GATEWAY_NAME } from './gateway.js';
 import { DEFAULT_TIMEOUT_SEC, DEFAULT_MAX_OUTPUT_CHARS } from './run.js';
 
@@ -23,6 +24,8 @@ export function normalizeDataTools(cfg, errors) {
   const d = cfg.dataTools ?? {};
   const dir = expandHome(d.dir ?? DEFAULT_TOOLS_DIR);
   const out = {
+    // 配置里写了 dataTools 才算启用（没写时不去看本机目录，测试和没配的环境不受 local/tools 影响）
+    declared: d.declared ?? cfg.dataTools !== undefined,
     dir: path.isAbsolute(dir) ? dir : path.join(ROOT, dir),
     timeoutSec: d.timeoutSec ?? DEFAULT_TIMEOUT_SEC,
     maxOutputChars: d.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS,
@@ -90,4 +93,24 @@ export function allowedToolsNote(setup) {
   if (!setup.allowed.length) return '';
   const lines = setup.listed.map((t) => `- mcp__${t.server}__${t.name}${t.description ? `：${t.description}` : ''}`);
   return `**可以用的数据工具**（只有这些会被放行，其他工具调用会被拒绝）：\n${lines.join('\n')}`;
+}
+
+/** 有没有可用的数据工具：登记了 MCP 服务，或工具目录里有清单。 */
+export function hasDataTools(dataTools) {
+  if (!dataTools?.declared) return false;
+  return Object.keys(dataTools.mcpServers ?? {}).length > 0 || fs.existsSync(path.join(dataTools.dir, MANIFEST_FILE));
+}
+
+/**
+ * 一场讨论要带的数据工具和知识：selection = { tools: 布尔, knowledge: [来源名] }（网页上选的，存进 state.json）。
+ * 工具调用记录写到 logFile。都没有时返回 null。
+ */
+export function prepareData(cfg, selection, { logFile, knowledgeSetup } = {}) {
+  if (!selection || cfg.mode !== 'decision') return null;
+  const mcp = selection.tools && cfg.research && hasDataTools(cfg.dataTools) ? mcpSetup(cfg.dataTools, { logFile }) : null;
+  const usableMcp = mcp?.allowed.length ? mcp : null;
+  const know = selection.knowledge?.length ? knowledgeSetup(cfg.knowledge, selection.knowledge) : null;
+  const usableKnow = know?.dirs.length ? know : null;
+  if (!usableMcp && !usableKnow) return null;
+  return { selection: { tools: Boolean(usableMcp), knowledge: usableKnow?.sources ?? [] }, mcp: usableMcp, knowledge: usableKnow };
 }

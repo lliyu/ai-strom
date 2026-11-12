@@ -12,6 +12,8 @@ import { isTrigger, DEFAULT_TRIGGERS } from './watch.js';
 import { describeRepo, resolveRepos, prepareRepos, allRepoSpecs, parseRepoSpecs } from './repos.js';
 import { createFileInbox, combineInterjections } from './inbox.js';
 import { savedLineup, configForState } from './lineup.js';
+import { prepareData } from './tools/index.js';
+import { knowledgeSetup } from './knowledge.js';
 import { budgetFromUsage } from './budget.js';
 import { HANDLING_LABELS } from './modes.js';
 
@@ -113,7 +115,7 @@ export function prepareCode(cfg, repos) {
  * subject：打磨模式的打磨对象（墨稿里的脑洞 / 梗概 / 总纲）。
  * onRunDir：建好本地记录目录后回调，网页用来找这场讨论的记录。
  */
-export async function runPrepared(cfg, { topic, dryRun, mock, interject, triggers, code, number: given, subject, lark, extraPublishers, interjections: ownInterjections, onRunDir, onEvent: watcher, runsDir = RUNS, echo }) {
+export async function runPrepared(cfg, { topic, dryRun, mock, interject, triggers, code, number: given, subject, lark, extraPublishers, interjections: ownInterjections, onRunDir, onEvent: watcher, runsDir = RUNS, echo, data: dataSelection }) {
   cleanupSessions(cfg, runsDir);
   // mock 演练不编号、不保存会话，免得被当成「最近一场」追问（网页演练例外：页面靠编号找讨论）
   const number = given ?? (mock ? undefined : nextNumber(runsDir));
@@ -123,10 +125,11 @@ export async function runPrepared(cfg, { topic, dryRun, mock, interject, trigger
   log(`开始${number ? ` #${number}` : ''} ${{ brainstorm: '脑洞风暴', refine: '打磨', decision: '方案讨论' }[cfg.mode]}：${cfg.participants.length} 位参与者，${cfg.adaptive ? `自动轮数（最多 ${cfg.rounds} 轮）` : `${cfg.rounds} 轮`}${dryRun ? '（dry-run，不发到 Lark）' : ''}${mock ? '（mock，不调用模型）' : ''}`);
   if (code?.auto) log(`代码上下文：未指定仓库，调研员从 ${code.repos.length} 个登记的仓库里按议题定位`);
   else if (code) for (const r of code.repos) log(`代码上下文 ${describeRepo(r)}`);
+  const data = dataFor(cfg, dataSelection, runDir);
 
   let result;
   try {
-    result = await runDiscussion({ cfg, topic, providers, publisher, interjections, log, onEvent, code, number, subject });
+    result = await runDiscussion({ cfg, topic, providers, publisher, interjections, log, onEvent, code, number, subject, data });
   } catch (err) {
     onEvent({ type: 'run_failed', error: err.message.slice(0, 500) });
     throw err;
@@ -161,9 +164,10 @@ export async function followUpOne(cfg, { question, number, dryRun = false, mock 
   const { publisher, interjections, providers, onEvent } = setupRun(jobCfg, { runDir, dryRun, mock, interject, triggers, lark, extraPublishers, interjections: ownInterjections, onEvent: watcher, echo });
   log(`追问 #${state.number}「${state.topic.split('\n')[0].slice(0, 30)}」：${question.split('\n')[0].slice(0, 40)}${dryRun ? '（dry-run）' : ''}`);
   const code = codeForFollowUp(jobCfg, state);
+  const data = dataFor(jobCfg, state.data, runDir);
   let result;
   try {
-    result = await runFollowUp({ cfg: jobCfg, state, question, providers, publisher, interjections, log, onEvent, code, context });
+    result = await runFollowUp({ cfg: jobCfg, state, question, providers, publisher, interjections, log, onEvent, code, context, data });
   } catch (err) {
     onEvent({ type: 'run_failed', error: err.message.slice(0, 500) });
     throw err;
@@ -202,6 +206,20 @@ export async function docOne(cfg, { number, mock = false, runsDir = RUNS }) {
   const extra = Object.keys(doc.attachments).length;
   log(`完成：第 ${doc.version} 版，${doc.text.length} 字${extra ? `，附录 ${extra} 份` : ''}。${stats.calls} 次模型调用${stats.costUsd ? `，约 $${stats.costUsd.toFixed(2)}` : ''}。文件：${path.join(dir, '主文档.md')}`);
   return result;
+}
+
+/**
+ * 网页上选的数据工具和知识来源：工具调用记录写在这次运行的目录（tool-calls.jsonl）。
+ * 选了但用不上的（没有工具、来源目录不存在）记一行日志。
+ */
+export function dataFor(cfg, selection, runDir) {
+  if (!selection) return null;
+  const data = prepareData(cfg, selection, { logFile: path.join(runDir, 'tool-calls.jsonl'), knowledgeSetup });
+  if (selection.tools && !data?.mcp) log('⚠️ 选了数据工具，但没有可用的工具（local/tools 或 dataTools.mcpServers 都没有，或没有调研员配置），这场不查实时数据');
+  const missing = (selection.knowledge ?? []).filter((n) => !data?.knowledge?.sources.includes(n));
+  if (missing.length) log(`⚠️ 这些知识来源用不上（没登记或目录不存在）：${missing.join('、')}`);
+  if (data) log(`数据工具：${data.mcp ? `${data.mcp.allowed.length} 个` : '不用'}；知识来源：${data.knowledge?.sources.join('、') || '不用'}`);
+  return data;
 }
 
 /** 旧讨论的 state.json 里没有主席输入预算的数据时，从它的 usage.jsonl 推出来。 */

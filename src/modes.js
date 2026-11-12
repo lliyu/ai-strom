@@ -48,6 +48,9 @@ export const STAGE_LABELS = {
   final: '按裁决定稿',
   webresearch: '资料搜集',
   webreview: '资料审查',
+  dataplan: '数据核实判断',
+  dataresearch: '实时数据初稿',
+  datareview: '实时数据审查',
   doc: '主文档',
   doccheck: '核对主文档',
 };
@@ -221,7 +224,7 @@ export function interjectionBlock(items) {
  * 所有参与者和主席共用的系统提示词：整场讨论里内容不变，放在最前面方便命中缓存。
  * 这里不写任何发言者的身份，身份和本轮任务在消息正文开头。
  */
-export function sharedSystem({ mode, topic, context, subject }) {
+export function sharedSystem({ mode, topic, context, subject, dataContext }) {
   if (mode === 'refine') {
     const label = subjectLabel(subject);
     return join(
@@ -233,6 +236,7 @@ export function sharedSystem({ mode, topic, context, subject }) {
     `这是一场多 AI ${mode === 'brainstorm' ? '脑洞风暴' : '方案讨论'}，过程会发到团队群里。你的身份、规则和本轮任务写在用户消息开头，以那里为准。`,
     topicBlock(topic, mode),
     contextBlock(context),
+    dataContextBlock(dataContext),
   );
 }
 
@@ -406,18 +410,7 @@ export function webPlanPrompt({ topic, interjections }) {
 
 /** 解析主席的搜集判断：{ need, questions }。没写第一行时按不需要处理。 */
 export function parseWebPlan(text) {
-  const t = String(text ?? '');
-  const need = /搜集资料\**\s*[:：]\s*\**\s*需要/.test(t) && !/搜集资料\**\s*[:：]\s*\**\s*不需要/.test(t);
-  if (!need) return { need: false, questions: [] };
-  const start = t.search(/要查的问题/);
-  const lines = (start >= 0 ? t.slice(start).split('\n').slice(1) : []);
-  const questions = [];
-  for (const raw of lines) {
-    const m = /^\s*(?:[-*]|\d+[.、)])\s+(.+)$/.exec(raw);
-    if (m) questions.push(m[1].trim());
-    else if (raw.trim() && questions.length) break;
-  }
-  return { need: questions.length > 0, questions: questions.slice(0, 6) };
+  return parsePlan(text, '搜集资料');
 }
 
 /** 联网查证的写法，开场搜集和讨论中核实共用。 */
@@ -479,7 +472,12 @@ export function factsBlock(facts, { forChair = false } = {}) {
       : '## 事实核实结果（联网查证、调研员审查后的定稿；和之前的判断冲突时以这里为准，受影响的结论要改）';
     return [webHead, ...facts.map((f) => `### 第 ${f.round} 轮核实\n**问题**\n${f.questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\n**结果**\n${f.answer}`)].join('\n\n');
   }
-  const head = forChair
+  const withData = facts.some((f) => f.source === 'data' || f.toolCalls);
+  const head = withData
+    ? (forChair
+      ? '## 讨论中的事实核实结果（调研员查代码、实时数据或业务知识得出；方案或背景资料和它冲突时以它为准，汇总里要指出冲突。数据只代表写明的查询条件）'
+      : '## 事实核实结果（调研员刚查代码、实时数据或业务知识得出；和背景资料或之前的判断冲突时以这里为准，受影响的结论要改。数据只代表写明的查询条件）')
+    : forChair
     ? '## 讨论中的代码核实结果（调研员查代码得出；方案或背景资料和它冲突时以它为准，汇总里要指出冲突）'
     : '## 代码核实结果（调研员刚查代码得出；和背景资料或之前的判断冲突时以这里为准，受影响的结论要改）';
   return [head, ...facts.map((f) => `### 第 ${f.round} 轮核实\n**问题**\n${f.questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\n**结果**\n${f.answer}`)].join('\n\n');
@@ -1303,4 +1301,147 @@ export function docLead(doc) {
     if (l.trim()) out.push(l);
   }
   return out.join('\n').trim();
+}
+
+
+// ---------- 实时数据与业务知识 ----------
+
+/** 开场查到的实时数据（调研员审查后的定稿）；所有参与者和主席都拿同一份。 */
+export function dataContextBlock(dataContext) {
+  if (!dataContext?.text) return '';
+  return [
+    '## 实时数据（讨论前用数据工具查的生产数据、日志、监控或部署状态，已经调研员审查；每条都写了查询条件）',
+    '讨论要以这里的数据为准。数据只代表写明的查询条件和时间范围；标了「至少」「不完整」「查不了」的不要当成全部或当成没有。',
+    '',
+    dataContext.text,
+  ].join('\n');
+}
+
+/** 能查实时数据时，参与者怎么提要查数据的问题。 */
+export function dataAskLine() {
+  return `**数据核实**：需要生产数据、日志、监控或部署状态才能回答、又会影响结论的问题，也写进「**${FACT_HEADING}**」，每行一个具体问题，写清对象、范围和时间，例如「近 7 天 hotel 订单里供应商 X 的取消率是多少？」。核实员会用数据工具查、调研员审查后发给所有人。`;
+}
+
+/** 用数据工具查证的写法：开场查数据、讨论中核实、审查共用。 */
+export function dataRules() {
+  return [
+    '## 查数据的要求',
+    '- 只用放行的数据工具，只读；不要尝试任何写操作。先看业务知识（有的话）确认该查哪个库、表、服务，以及时间列是什么时区，再去查。',
+    '- 每条结论都写明用的工具和查询条件（环境、库表或服务、过滤条件、时间范围和时区），写到别人能照着复查。',
+    '- 工具末行写了 limit_reached 或 truncated 的，结果不完整，写「至少 N 条」「结果不完整」，不能当成全部。',
+    '- 报 NO_TOKEN（没有权限）、LOGIN_REQUIRED（登录过期）或其他错误的，写「查不了：原因」，不能写成「没有数据」。',
+    '- 「没查到」只在查询成功、结果完整时成立，而且要附上查询条件。',
+    '- 线上数据、日志、监控、部署这类问题用数据工具查，不要写「代码回答不了」。',
+  ].join('\n');
+}
+
+/** 追加在核实、审查提示词后面：能用的数据工具、业务知识和查数据的规则。 */
+export function evidenceBlock({ toolsNote = '', knowledgeBlock = '' } = {}) {
+  if (!toolsNote && !knowledgeBlock) return '';
+  return join(
+    '## 另外可以用的证据',
+    toolsNote,
+    knowledgeBlock,
+    toolsNote ? dataRules() : '',
+  );
+}
+
+/** 核实员实际执行的查询，交给调研员审查。 */
+export function toolCallsBlock(calls, who = '核实员') {
+  if (!calls?.length) return '';
+  const lines = calls.map((c, i) => {
+    const state = c.denied ? '被拒（不在放行名单）' : c.isError ? '出错' : `返回 ${c.resultChars ?? 0} 字`;
+    return `${i + 1}. ${c.name} ${JSON.stringify(c.input ?? {}).slice(0, 600)} → ${state}`;
+  });
+  return `## ${who}的查询记录（工具、参数和结果大小；审查时重点看查的对象、环境、时间范围和时区对不对，必要时自己重查）\n${lines.join('\n')}`;
+}
+
+/** 开场：主席判断要不要在讨论前查实时数据。 */
+export function dataPlanPrompt({ topic, interjections, toolsNote = '' }) {
+  return join(
+    `【阶段：${STAGE_LABELS.dataplan}】`,
+    [
+      '你是「主席」。一场多 AI 方案讨论马上开始，核实员和调研员可以用数据工具只读查生产数据、日志、监控和部署状态。你先判断：要不要在讨论前查一些实时数据，给参与者当背景。',
+      '只有当结论明显取决于现在的线上事实时才需要，例如数据量和分布、错误率和耗时、配置的当前值、服务现在部署的版本、某类记录有没有。纯粹的取舍、代码怎么写、常识性的问题不需要。',
+    ].join('\n'),
+    `## 议题\n${String(topic ?? '').trim()}`,
+    interjectionBlock(interjections),
+    toolsNote,
+    [
+      '## 输出格式',
+      '第一行只能写「查数据：需要」或「查数据：不需要」。',
+      '写「需要」时，接着写一节「**要查的问题**」，每行一个具体问题（最多 6 个），写清对象、范围和时间，例如「- 近 7 天 hotel 订单按供应商的取消率分布」。',
+      '写「不需要」时，接着用一句话说明原因。不要写别的。',
+    ].join('\n'),
+  );
+}
+
+/** 解析主席的查数据判断：{ need, questions }。 */
+export function parseDataPlan(text) {
+  return parsePlan(text, '查数据');
+}
+
+/** 解析「<关键词>：需要 / 不需要」加「要查的问题」列表；联网搜集和查数据共用。 */
+function parsePlan(text, keyword) {
+  const t = String(text ?? '');
+  const re = (word) => new RegExp(`${keyword}\\**\\s*[:：]\\s*\\**\\s*${word}`);
+  const need = re('需要').test(t) && !re('不需要').test(t);
+  if (!need) return { need: false, questions: [] };
+  const start = t.search(/要查的问题/);
+  const lines = (start >= 0 ? t.slice(start).split('\n').slice(1) : []);
+  const questions = [];
+  for (const raw of lines) {
+    const m = /^\s*(?:[-*]|\d+[.、)])\s+(.+)$/.exec(raw);
+    if (m) questions.push(m[1].trim());
+    else if (raw.trim() && questions.length) break;
+  }
+  return { need: questions.length > 0, questions: questions.slice(0, 6) };
+}
+
+/** 用数据工具查证的初稿（开场查数据，或讨论中本场既没代码也不联网时的核实）。 */
+export function dataCheckPrompt({ round, topic, questions, who = '核实员', maxChars = 4000, opening = false, draft = true }) {
+  const draftNote = draft ? '你写的是初稿：调研员会逐条审查、纠正后，定稿才发给参与者。' : '参与者会直接以你的回答为准。';
+  return join(
+    `【阶段：${opening ? STAGE_LABELS.dataresearch : `第 ${round} 轮${STAGE_LABELS.factcheck}`}】`,
+    opening
+      ? `你是「${who}」。一场多 AI 方案讨论马上开始，主席列出了下面这些需要查实时数据的问题，请用数据工具查清后整理成背景资料。${draftNote}`
+      : `你是「${who}」。讨论参与者提出了下面这些需要核实的问题，他们会以核实结果为准修改方案。${draftNote}`,
+    opening ? `## 议题\n${String(topic ?? '').trim()}` : '',
+    `## ${opening ? '要查的问题' : '待核实的问题'}\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+    [
+      '## 要求',
+      '- 逐条回答，编号和问题一致。每条先写结论（具体的数、状态或有无），再写依据和查询条件。',
+      '- 数据工具回答不了的（例如代码怎么写、业务决策）写「数据回答不了」。',
+      `- 不要提建议，不要评价方案。全文不超过 ${maxChars} 字，只输出回答本身。用中文，使用 Markdown 的加粗和列表，不要使用表格和 # 标题。`,
+    ].join('\n'),
+  );
+}
+
+/** 数据核实的审查：调研员同样能用数据工具，复查核实员的查询，纠正后输出定稿。 */
+export function dataReviewPrompt({ round, topic, questions, draft, checker = '核实员', maxChars = 4000, opening = false }) {
+  return join(
+    `【阶段：${opening ? STAGE_LABELS.datareview : `第 ${round} 轮${STAGE_LABELS.factreview}`}】`,
+    `你是「调研员」，这次负责审查。「${checker}」已经用数据工具查过下面的问题，写了初稿。初稿还没有发给讨论参与者：你审查、纠正之后的定稿才会发出去，主笔和评审会以定稿为准，所以每条结论都必须站得住。`,
+    opening ? `## 议题\n${String(topic ?? '').trim()}` : '',
+    `## ${opening ? '要查的问题' : '待核实的问题'}\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+    `## ${checker}的初稿\n${draft}`,
+    reviewRules(maxChars),
+  );
+}
+
+/** 审查的写法：代码、联网之外的数据审查用；查询记录另外附在后面。 */
+function reviewRules(maxChars) {
+  return [
+    '## 审查要求',
+    '- 逐条复查：查的对象（环境、库表、服务）、过滤条件、时间范围和时区对不对；结果是否完整（有没有用满上限、被截断）；结论是否超出了数据能支撑的范围。拿不准的自己用工具重查。',
+    '- 有错就改，漏了就补；查不了或数据撑不住的结论，改成「查不了：原因」或「数据回答不了」，不要保留。',
+    '- 第一行写审查结论：「**审查**：共 N 条，全部无误」或「**审查**：共 N 条，M 条有更正（第 x、y 条）」。',
+    '- 然后写定稿：逐条回答，编号和问题一致，每条先写结论，再写依据和查询条件。更正过的条目在结论前标「【已更正】」，再用一句话说明初稿错在哪里。参与者看不到初稿，定稿要完整独立，不要写「同初稿」。',
+    `- 不要提建议，不要评价方案。全文不超过 ${maxChars} 字，只输出审查结论和定稿。用中文，使用 Markdown 的加粗和列表，不要使用表格和 # 标题。`,
+  ].join('\n');
+}
+
+/** 数据核实时也能联网（本场无代码、选了核实员）：只用来查公开资料。 */
+export function webAlsoLine() {
+  return `**也可以联网**：需要公开资料（开源软件或云服务的行为、公开标准、厂商文档）时可以用 WebSearch、WebFetch，结论写来源链接。${NO_INTERNAL}公司内部的数据用数据工具查，不要去搜。`;
 }

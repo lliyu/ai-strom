@@ -10,7 +10,9 @@ import {
   limitsFor, splitReply, overLimit, compressPrompt, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
   parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
   webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
+  dataAskLine, webAlsoLine, evidenceBlock, toolCallsBlock, dataPlanPrompt, parseDataPlan, dataCheckPrompt, dataReviewPrompt,
 } from './modes.js';
+import { allowedToolsNote } from './tools/index.js';
 import { describeRepo } from './repos.js';
 import { estimateCost, priceFor } from './pricing.js';
 import { fitHistory, budgetChars, CHAIR_SHARE, PARTICIPANT_SHARE } from './budget.js';
@@ -75,7 +77,7 @@ const who = (list) => list.map((p) => `${p.name} · ${p.role}`).join(' / ');
  * 会话：每位参与者一条会话（sessions），整场讨论接着聊，模型记得自己说过的话；
  * 每轮只发新内容。主席和调研员不用会话：主席只在汇总时拿到完整记录，调研员开场调研和中途核实都是一次性调用。
  */
-function createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts = [], budget = {} }) {
+function createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts = [], budget = {}, data = null }) {
   const emit = (e) => {
     try {
       onEvent(e);
@@ -109,7 +111,30 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   run.web = false;
   run.facts = [...facts]; // [{ round, questions, answer }]，追问时接着原讨论的
   const research = cfg.research ?? null;
-  const factChecking = () => Boolean((run.code || run.web) && research && research.factCheck !== false);
+  /**
+   * 数据工具和业务知识（网页上选的）：{ selection, mcp, knowledge }。核实员和调研员核实、开场查数据时带上；
+   * 参与者不直接用工具，只看审查后的定稿。
+   */
+  run.data = data && (data.mcp || data.knowledge) ? data : null;
+  const hasData = () => Boolean(run.data?.mcp && research);
+  const factChecking = () => Boolean((run.code || run.web || hasData()) && research && research.factCheck !== false);
+  /** 核实、审查调用带上数据工具（MCP）和知识目录（只读）。 */
+  const withEvidence = (callOptions = {}) => {
+    if (!run.data) return callOptions;
+    const k = run.data.knowledge;
+    const tools = [...new Set([...(callOptions.tools ?? []), ...(k?.dirs?.length ? ['Read', 'Grep', 'Glob'] : [])])];
+    return {
+      ...callOptions,
+      tools,
+      addDirs: [...(callOptions.addDirs ?? []), ...(k?.dirs ?? [])],
+      ...(run.data.mcp ? { mcp: run.data.mcp } : {}),
+    };
+  };
+  /** 追加在核实、审查提示词后面的证据说明；没有数据工具和知识时为空。 */
+  const evidence = () => (run.data ? evidenceBlock({ toolsNote: run.data.mcp ? allowedToolsNote(run.data.mcp) : '', knowledgeBlock: run.data.knowledge?.block ?? '' }) : '');
+  const plus = (...parts) => parts.filter(Boolean).join('\n\n');
+  run.evidence = evidence;
+  run.withEvidence = withEvidence;
   const canReadCode = (p) => Boolean(run.code && research && p.readCode === true);
   const toldCode = new Set(); // 本次运行已经拿到完整目录说明的参与者
 
@@ -217,6 +242,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         durationMs: res.durationMs ?? Date.now() - started,
         truncated: Boolean(res.truncated),
         ...(res.turns ? { turns: res.turns } : {}),
+        ...(res.toolCalls ? { toolCalls: res.toolCalls.length, toolDenied: res.toolCalls.filter((c) => c.denied).length } : {}),
         ...(session ? { sessionTurn: session.turns.length } : {}),
         ...(retry ? { retry } : {}),
       });
@@ -231,9 +257,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 发言：调模型，超出字数上限（limit）时让它压缩重写一次，然后发布。
    * 卡片上只露出「要点」，详细内容折叠；「【完整方案】」之后的部分不发到群里。
    */
-  run.speak = async (speaker, { stage, round, system, prompt, callOptions = {}, session, subtitle, quiet = false, limit = null }) => {
+  run.speak = async (speaker, { stage, round, system, prompt, callOptions = {}, session, subtitle, quiet = false, limit = null, onResult }) => {
     const tag = tags.get(speaker.id)?.tag;
-    const noRound = ['research', 'summary', 'triage', 'rewrite', 'doc', 'doccheck', 'webplan', 'webresearch', 'webreview'].includes(stage);
+    const noRound = ['research', 'summary', 'triage', 'rewrite', 'doc', 'doccheck', 'webplan', 'webresearch', 'webreview', 'dataplan', 'dataresearch', 'datareview'].includes(stage);
     log(`${speaker.name} · ${STAGE_LABELS[stage]}${stage === 'research' ? '（只读查看代码，通常要几分钟）' : noRound ? '' : ` 第 ${round} 轮`} …`);
     try {
       let res = await call(speaker, { stage, round, system, prompt, callOptions, session });
@@ -255,15 +281,17 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           log(`⚠️ ${speaker.name} 压缩重写失败，用原回答：${err.message}`);
         }
       }
+      onResult?.(res);
       if (!quiet) {
         const text = stage === 'triage' ? stripTriageLine(res.text) : res.text;
         const parts = splitReply(text);
+        const callsNote = toolCallsNote(res.toolCalls);
         await publisher.post({
           speaker,
           title: `${speaker.name}${speaker.role ? ` · ${speaker.role}` : ''}`,
           subtitle: subtitle ?? `${noRound ? '' : `第 ${round} 轮 · `}${STAGE_LABELS[stage]}${tag ? ` · 代号 ${tag}` : ''}`,
           brief: parts.brief,
-          body: parts.brief ? parts.detail : parts.shown,
+          body: `${parts.brief ? parts.detail : parts.shown}${callsNote}`,
           plan: parts.plan,
           footer: footerOf(res),
           meta: { stage, round, tag, model: res.model, usage: res.usage, durationMs: res.durationMs },
@@ -322,22 +350,20 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   run.codeFor = (p, session) => {
-    if (!run.code && run.web) {
-      const fresh = convo ? run.facts.slice(session?.factsSeen ?? 0) : run.facts;
-      const parts = [fresh.length ? factsBlock(fresh) : '', factChecking() ? webAskLine() : ''].filter(Boolean);
-      return { text: parts.length ? `${parts.join('\n\n')}\n\n` : '', callOptions: {} };
-    }
-    if (!run.code) return { text: '', callOptions: {} };
-    const parts = [];
     const fresh = convo ? run.facts.slice(session?.factsSeen ?? 0) : run.facts;
+    const parts = [];
     if (fresh.length) parts.push(factsBlock(fresh));
     let callOptions = {};
-    if (canReadCode(p)) {
+    if (run.code && canReadCode(p)) {
       const tools = research.tools ?? ['Read', 'Grep', 'Glob'];
       parts.push(codeAccessNote({ repos: run.code.repos, docs: run.code.docs, tools, full: !(convo && toldCode.has(p.id)) }));
       callOptions = { tools, addDirs: run.code.dirs, timeoutMs: research.timeoutMs, ...(p.maxBudgetUsd ? { maxBudgetUsd: p.maxBudgetUsd } : {}) };
     }
-    if (factChecking()) parts.push(factAskLine());
+    if (factChecking()) {
+      if (run.code) parts.push(factAskLine());
+      else if (run.web) parts.push(webAskLine());
+      if (hasData()) parts.push(dataAskLine());
+    }
     return { text: parts.length ? `${parts.join('\n\n')}\n\n` : '', callOptions };
   };
 
@@ -371,12 +397,16 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     const questions = fresh.slice(0, max);
     pendingQuestions = fresh.slice(max);
     if (pendingQuestions.length) log(`待核实的问题有 ${fresh.length} 个，这次先查 ${max} 个，其余留到下一轮`);
+    // 本场无代码：能用数据工具时按数据核实（选了核实员的也可以联网），否则联网核实
+    if (!run.code && hasData()) return run.dataFactCheck({ round, questions });
     if (!run.code && run.web) return run.webFactCheck({ round, questions });
     const tools = research.tools ?? ['Read', 'Grep', 'Glob'];
     const maxChars = research.factCheckMaxChars ?? 4000;
     const where = { repos: run.code.repos, docs: run.code.docs, tools, maxChars };
-    const callOptions = { tools, addDirs: run.code.dirs, maxBudgetUsd: research.maxBudgetUsd, timeoutMs: research.timeoutMs };
+    const callOptions = withEvidence({ tools, addDirs: run.code.dirs, maxBudgetUsd: research.maxBudgetUsd, timeoutMs: research.timeoutMs });
     const checker = research.factChecker ?? null;
+    const calls = {};
+    const keep = (k) => (res) => { if (res.toolCalls?.length) calls[k] = res.toolCalls; };
     let answer = null;
     let review = null;
     let draft = null;
@@ -386,18 +416,20 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         stage: 'factcheck',
         round,
         system: run.shared,
-        prompt: factCheckPrompt({ round, questions, ...where, who: checker.name, draft: true }),
+        prompt: plus(factCheckPrompt({ round, questions, ...where, who: checker.name, draft: true }), evidence()),
         callOptions: { ...callOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
         subtitle: `第 ${round} 轮 · 代码核实初稿 · ${questions.length} 个问题 · 待调研员审查，不发给参与者`,
+        onResult: keep('draft'),
       });
       if (draft) {
         answer = await run.speak(research, {
           stage: 'factreview',
           round,
           system: run.shared,
-          prompt: factReviewPrompt({ round, questions, draft, checker: checker.name, ...where }),
+          prompt: plus(factReviewPrompt({ round, questions, draft, checker: checker.name, ...where }), evidence(), toolCallsBlock(calls.draft, checker.name)),
           callOptions,
           subtitle: `第 ${round} 轮 · 核实审查定稿 · ${questions.length} 个问题`,
+          onResult: keep('review'),
         });
         // 审查失败时不把没审过的初稿发出去：这批问题留到下一轮
         if (answer) review = { checker: checker.model ?? checker.provider, corrections: parseReviewCorrections(answer) };
@@ -410,37 +442,42 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         stage: 'factcheck',
         round,
         system: run.shared,
-        prompt: factCheckPrompt({ round, questions, ...where }),
+        prompt: plus(factCheckPrompt({ round, questions, ...where }), evidence()),
         callOptions,
         subtitle: `第 ${round} 轮 · 代码核实 · ${questions.length} 个问题`,
+        onResult: keep('review'),
       });
     }
-    return run.factDone({ round, questions, answer, review, draft });
+    return run.factDone({ round, questions, answer, review, draft, calls });
   };
 
   /** 本场无代码时联网核实：核实员联网写初稿，调研员联网审查纠正；审查没过不发。 */
   run.webFactCheck = async ({ round, questions }) => {
     const checker = research.factChecker;
-    const webOptions = { tools: research.webTools ?? ['WebSearch', 'WebFetch'], timeoutMs: research.timeoutMs };
+    const webOptions = withEvidence({ tools: research.webTools ?? ['WebSearch', 'WebFetch'], timeoutMs: research.timeoutMs });
     const maxChars = research.factCheckMaxChars ?? 4000;
+    const calls = {};
+    const keep = (k) => (res) => { if (res.toolCalls?.length) calls[k] = res.toolCalls; };
     let answer = null;
     let review = null;
     const draft = await run.speak(checker, {
       stage: 'factcheck',
       round,
       system: run.shared,
-      prompt: webResearchPrompt({ round, questions, who: checker.name, maxChars }),
+      prompt: plus(webResearchPrompt({ round, questions, who: checker.name, maxChars }), evidence()),
       callOptions: { ...webOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
       subtitle: `第 ${round} 轮 · 联网核实初稿 · ${questions.length} 个问题 · 待调研员审查，不发给参与者`,
+      onResult: keep('draft'),
     });
     if (draft) {
       answer = await run.speak(research, {
         stage: 'factreview',
         round,
         system: run.shared,
-        prompt: webReviewPrompt({ round, questions, draft, checker: checker.name, maxChars }),
+        prompt: plus(webReviewPrompt({ round, questions, draft, checker: checker.name, maxChars }), evidence(), toolCallsBlock(calls.draft, checker.name)),
         callOptions: { ...webOptions, maxBudgetUsd: research.maxBudgetUsd },
         subtitle: `第 ${round} 轮 · 联网核实审查定稿 · ${questions.length} 个问题`,
+        onResult: keep('review'),
       });
       if (answer) review = { checker: checker.model ?? checker.provider, corrections: parseReviewCorrections(answer) };
     } else {
@@ -449,16 +486,67 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         stage: 'factcheck',
         round,
         system: run.shared,
-        prompt: webResearchPrompt({ round, questions, who: '调研员', maxChars, draft: false }),
+        prompt: plus(webResearchPrompt({ round, questions, who: '调研员', maxChars, draft: false }), evidence()),
         callOptions: { ...webOptions, maxBudgetUsd: research.maxBudgetUsd },
         subtitle: `第 ${round} 轮 · 联网核实 · ${questions.length} 个问题`,
+        onResult: keep('review'),
       });
     }
-    return run.factDone({ round, questions, answer, review, draft, source: 'web' });
+    return run.factDone({ round, questions, answer, review, draft, source: 'web', calls });
+  };
+
+  /** 本场没有代码、也不联网，但能用数据工具：核实员用数据工具写初稿，调研员审查纠正；没有核实员时调研员直接查。 */
+  run.dataFactCheck = async ({ round, questions }) => {
+    const checker = research.factChecker ?? null;
+    const maxChars = research.factCheckMaxChars ?? 4000;
+    const callOptions = withEvidence({ ...(run.web ? { tools: research.webTools ?? ['WebSearch', 'WebFetch'] } : {}), timeoutMs: research.timeoutMs, maxBudgetUsd: research.maxBudgetUsd });
+    const webLine = run.web ? webAlsoLine() : '';
+    const calls = {};
+    const keep = (k) => (res) => { if (res.toolCalls?.length) calls[k] = res.toolCalls; };
+    let answer = null;
+    let review = null;
+    let draft = null;
+    if (checker) {
+      draft = await run.speak(checker, {
+        stage: 'factcheck',
+        round,
+        system: run.shared,
+        prompt: plus(dataCheckPrompt({ round, questions, who: checker.name, maxChars }), evidence(), webLine),
+        callOptions: { ...callOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
+        subtitle: `第 ${round} 轮 · 数据核实初稿 · ${questions.length} 个问题 · 待调研员审查，不发给参与者`,
+        onResult: keep('draft'),
+      });
+      if (draft) {
+        answer = await run.speak(research, {
+          stage: 'factreview',
+          round,
+          system: run.shared,
+          prompt: plus(dataReviewPrompt({ round, questions, draft, checker: checker.name, maxChars }), evidence(), webLine, toolCallsBlock(calls.draft, checker.name)),
+          callOptions,
+          subtitle: `第 ${round} 轮 · 数据核实审查定稿 · ${questions.length} 个问题`,
+          onResult: keep('review'),
+        });
+        if (answer) review = { checker: checker.model ?? checker.provider, corrections: parseReviewCorrections(answer) };
+      } else {
+        log(`${checker.name}没答出来，这次由调研员直接用数据工具核实`);
+      }
+    }
+    if (!answer && !(checker && draft)) {
+      answer = await run.speak(research, {
+        stage: 'factcheck',
+        round,
+        system: run.shared,
+        prompt: plus(dataCheckPrompt({ round, questions, who: '调研员', maxChars, draft: false }), evidence(), webLine),
+        callOptions,
+        subtitle: `第 ${round} 轮 · 数据核实 · ${questions.length} 个问题`,
+        onResult: keep('review'),
+      });
+    }
+    return run.factDone({ round, questions, answer, review, draft, source: 'data', calls });
   };
 
   /** 核实收尾：失败时问题回到队列（连续失败条数减半），成功时记下结果。 */
-  run.factDone = ({ round, questions, answer, review, draft, source }) => {
+  run.factDone = ({ round, questions, answer, review, draft, source, calls }) => {
     if (!answer) {
       factFailures += 1;
       // 这次查的条数就是当前批次大小
@@ -474,8 +562,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     factFailures = 0;
     factBatch = null;
     for (const q of questions) asked.add(normQ(q));
-    run.facts.push({ round, questions, answer, ...(source ? { source } : {}), ...(review ? { review: { ...review, draft } } : {}) });
-    emit({ type: 'fact_checked', round, questions: questions.length, ...(review ? { reviewed: true, corrections: review.corrections } : {}) });
+    const toolCalls = compactCalls(calls);
+    run.facts.push({ round, questions, answer, ...(source ? { source } : {}), ...(review ? { review: { ...review, draft } } : {}), ...(toolCalls ? { toolCalls } : {}) });
+    emit({ type: 'fact_checked', round, questions: questions.length, ...(source ? { source } : {}), ...(review ? { reviewed: true, corrections: review.corrections } : {}), ...(toolCalls ? { toolCalls: (toolCalls.draft?.length ?? 0) + (toolCalls.review?.length ?? 0) } : {}) });
     if (review?.corrections) log(`调研员审查更正了核实初稿里的 ${review.corrections} 条`);
     return true;
   };
@@ -802,6 +891,74 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /**
+   * 开场查实时数据（网页上选了数据工具时）：主席判断要不要查、列出问题 → 核实员用数据工具写初稿 → 调研员审查纠正。
+   * 没有核实员时调研员直接查。只有审查后的定稿（或调研员直接查的结果）作为背景发给参与者；失败时不带实时数据讨论。
+   * 返回 { text, questions, review?, toolCalls? } 或 null。
+   */
+  run.dataResearch = async ({ topic }) => {
+    if (!hasData()) return null;
+    const planText = await run.speak(cfg.chair, {
+      stage: 'dataplan',
+      round: 0,
+      prompt: dataPlanPrompt({ topic, interjections: heard, toolsNote: allowedToolsNote(run.data.mcp) }),
+      subtitle: '开场 · 要不要先查实时数据',
+    });
+    const plan = parseDataPlan(planText);
+    if (!plan.need) {
+      log(`${cfg.chair.name}判断不需要先查实时数据`);
+      return null;
+    }
+    const checker = research.factChecker ?? null;
+    const maxChars = research.factCheckMaxChars ?? 4000;
+    const callOptions = withEvidence({ timeoutMs: research.timeoutMs, maxBudgetUsd: research.maxBudgetUsd });
+    const calls = {};
+    const keep = (k) => (res) => { if (res.toolCalls?.length) calls[k] = res.toolCalls; };
+    if (!checker) {
+      const text = await run.speak(research, {
+        stage: 'dataresearch',
+        round: 0,
+        prompt: plus(dataCheckPrompt({ topic, questions: plan.questions, who: '调研员', maxChars, opening: true, draft: false }), evidence()),
+        callOptions,
+        subtitle: `开场 · 实时数据 · ${plan.questions.length} 个问题`,
+        onResult: keep('review'),
+      });
+      if (!text) {
+        log('调研员没查出实时数据，这场不带实时数据讨论');
+        return null;
+      }
+      emit({ type: 'data_researched', questions: plan.questions.length });
+      return { text, questions: plan.questions, ...(compactCalls(calls) ? { toolCalls: compactCalls(calls) } : {}) };
+    }
+    const draft = await run.speak(checker, {
+      stage: 'dataresearch',
+      round: 0,
+      prompt: plus(dataCheckPrompt({ topic, questions: plan.questions, who: checker.name, maxChars, opening: true }), evidence()),
+      callOptions: { ...callOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
+      subtitle: `开场 · 实时数据初稿 · ${plan.questions.length} 个问题 · 待调研员审查，不发给参与者`,
+      onResult: keep('draft'),
+    });
+    if (!draft) {
+      log(`${checker.name}没查出实时数据，这场不带实时数据讨论`);
+      return null;
+    }
+    const final = await run.speak(research, {
+      stage: 'datareview',
+      round: 0,
+      prompt: plus(dataReviewPrompt({ topic, questions: plan.questions, draft, checker: checker.name, maxChars, opening: true }), evidence(), toolCallsBlock(calls.draft, checker.name)),
+      callOptions,
+      subtitle: `开场 · 实时数据审查定稿 · ${plan.questions.length} 个问题`,
+      onResult: keep('review'),
+    });
+    if (!final) {
+      log('调研员没能审查实时数据，没审过的初稿不发，这场不带实时数据讨论');
+      return null;
+    }
+    const corrections = parseReviewCorrections(final);
+    emit({ type: 'data_researched', questions: plan.questions.length, corrections });
+    return { text: final, questions: plan.questions, review: { checker: checker.model ?? checker.provider, corrections, draft }, ...(compactCalls(calls) ? { toolCalls: compactCalls(calls) } : {}) };
+  };
+
+  /**
    * 阻断原文存档：每位评审最近一次提出【阻断】的那一轮的阻断原文。之后的轮次里这位评审不再提阻断时，记下从哪一轮起。
    * 交给主席写主文档、判断追问，也存进 state.json。
    */
@@ -895,6 +1052,28 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   return run;
 }
 
+/** 卡片末尾的查询记录：调用了哪些工具、什么参数、结果大小。 */
+export function toolCallsNote(calls) {
+  if (!calls?.length) return '';
+  const lines = calls.map((c) => {
+    const state = c.denied ? '被拒' : c.isError ? '出错' : `${c.resultChars ?? 0} 字`;
+    const input = JSON.stringify(c.input ?? {});
+    return `- ${c.name.replace(/^mcp__/, '').replace('__', ' · ')} \`${input.length > 200 ? `${input.slice(0, 200)}…` : input}\` → ${state}`;
+  });
+  return `\n\n**查询记录**（${calls.length} 次）\n${lines.join('\n')}`;
+}
+
+/** 存进 state 的工具调用：参数截短。 */
+function compactCalls(calls) {
+  if (!calls) return null;
+  const out = {};
+  for (const [k, list] of Object.entries(calls)) {
+    if (!list?.length) continue;
+    out[k] = list.map((c) => ({ name: c.name, input: JSON.stringify(c.input ?? {}).slice(0, 1000), ...(c.isError ? { isError: true } : {}), ...(c.denied ? { denied: true } : {}), resultChars: c.resultChars ?? 0 }));
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 /** 讨论结束后可以续接的状态，写到 runs/<讨论>/state.json。 */
 /** 主席提示词末尾附上的核实结果。 */
 function chairFacts(facts) {
@@ -908,7 +1087,7 @@ function codeSpecOf(code) {
   return { auto: Boolean(code.auto), repos: code.auto ? [] : code.repos.map((r) => ({ name: r.alias, ...(r.ref ? { ref: r.ref } : {}) })) };
 }
 
-function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [], interjections = [] }) {
+function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [], interjections = [], data, dataContext }) {
   return {
     version: STATE_VERSION,
     number: number ?? null,
@@ -920,6 +1099,8 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     shared,
     context: contextOut(context),
     code: codeSpecOf(code),
+    ...(data ? { data } : {}),
+    ...(dataContext ? { dataContext } : {}),
     facts,
     sessions: Object.fromEntries(sessions),
     latest: [...latest.values()],
@@ -957,14 +1138,16 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
  * @param {object} [opts.code]       prepareRepos 的结果：有值时先由调研员读代码，整理背景资料给所有人
  * @param {number} [opts.number]     讨论编号，显示在卡片上，追问时用
  */
-export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject }) {
+export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data }) {
   if (cfg.mode === 'refine' && !subject) throw new Error('打磨模式需要打磨对象（subject）');
   const tags = assignTags(cfg.participants, rng);
   const sessions = new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
   const latest = new Map(); // 主笔 id -> 最新一版方案
   const rounds = [];        // [{ round, stage, entries: [{ id, label, tag, text }] }]
-  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds });
+  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, data: cfg.mode === 'decision' ? data : null });
   const { leads, reviewers, participants, stats, emit, heard, tagOf, convo, ideasPerAgent } = run;
+  const dataOn = Boolean(run.data?.mcp && cfg.research);
+  const knowledgeOn = Boolean(run.data?.knowledge?.dirs?.length);
 
   const researcher = code ? cfg.research : null;
   emit({
@@ -979,6 +1162,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     chair: { ...brief(cfg.chair), part: 'chair' },
     ...(researcher?.factChecker ? { factChecker: { ...brief(researcher.factChecker), part: 'research' } } : {}),
     ...(researcher ? { research: { ...brief(researcher), part: 'research' }, code: { auto: Boolean(code.auto), groups: code.groups, repos: code.auto ? [] : code.repos.map(describeRepo) } } : {}),
+    ...(run.data ? { data: { tools: dataOn ? run.data.mcp.allowed.length : 0, knowledge: run.data.knowledge?.sources ?? [] } } : {}),
   });
 
   const adaptive = Boolean(cfg.adaptive) && (reviewers.length > 0 || cfg.mode === 'decision');
@@ -1008,6 +1192,8 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
       code?.auto ? `**代码上下文**：没有指定仓库，调研员会从已登记的 ${code.repos.length} 个仓库里按议题定位相关代码（读本机当前分支），整理成背景资料发给所有人。想指定仓库可以写 \`仓库:别名\`，不想读代码写 \`仓库:无\`` : null,
       code && !code.auto ? `**代码上下文**：先由调研员只读查看下面的仓库，整理成背景资料发给所有人\n${code.repos.map((r) => `- ${describeRepo(r)}`).join('\n')}` : null,
       !code && cfg.mode === 'decision' ? `**代码上下文**：本场无代码，参与者不能查代码，也不会核实代码事实；涉及代码现状的说法都按未核实处理。${cfg.research?.factChecker ? `\n**联网资料**：主席先判断要不要联网搜集公开资料；需要的话由${cfg.research.factChecker.role ? cfg.research.factChecker.role.replace(/^代码核实 · /, '') : '核实员'}联网查、调研员联网审查纠正后再发给所有人。讨论中的待核实问题也联网查。搜索关键词不带公司内部信息。` : ''}` : null,
+      dataOn ? `**实时数据**：主席先判断要不要在讨论前查生产数据、日志、监控或部署状态；需要的话由核实员用数据工具查、调研员审查后发给所有人。讨论中的待核实问题也可以用数据工具查（只读）。` : null,
+      knowledgeOn ? `**业务知识**：核实和调研时带上这些知识来源：${run.data.knowledge.sources.join('、')}。` : null,
       interjections ? (refine ? '**插话**：在页面下方输入，会在下一轮开始时交给所有模型。' : '**插话**：直接在群里发消息，会在下一轮开始时交给所有模型。') : null,
       refine ? '**写回**：修订版不会自动写回墨稿，要你在页面上确认。' : null,
     ].filter((l) => l !== null).join('\n'),
@@ -1020,8 +1206,8 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
       stage: 'research',
       round: 0,
       system: researchSystem(),
-      prompt: researchPrompt({ topic, mode: cfg.mode, repos: code.repos, docs: code.docs, maxChars: researcher.maxChars, auto: code.auto }),
-      callOptions: { tools: researcher.tools, addDirs: code.dirs, maxBudgetUsd: researcher.maxBudgetUsd, timeoutMs: researcher.timeoutMs },
+      prompt: [researchPrompt({ topic, mode: cfg.mode, repos: code.repos, docs: code.docs, maxChars: researcher.maxChars, auto: code.auto }), knowledgeOn ? run.data.knowledge.block : ''].filter(Boolean).join('\n\n'),
+      callOptions: { tools: researcher.tools, addDirs: [...code.dirs, ...(knowledgeOn ? run.data.knowledge.dirs : [])], maxBudgetUsd: researcher.maxBudgetUsd, timeoutMs: researcher.timeoutMs },
       subtitle: code.auto ? '背景资料 · 按议题定位仓库' : `背景资料 · 读了 ${code.repos.map((r) => r.alias).join('、')}`,
     });
     if (!text) throw new Error('代码调研失败，讨论没有开始');
@@ -1042,8 +1228,11 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const webEnabled = cfg.mode === 'decision' && !context && Boolean(cfg.research?.factChecker);
   if (webEnabled) context = await run.webResearch({ topic });
 
+  // ---------- 实时数据：网页上选了数据工具时，主席判断要不要先查 ----------
+  const dataContext = dataOn ? await run.dataResearch({ topic }) : null;
+
   // 议题和背景资料整场不变，所有人共用同一份系统提示词，后面的调用都能命中缓存
-  run.shared = sharedSystem({ mode: cfg.mode, topic, context, subject });
+  run.shared = sharedSystem({ mode: cfg.mode, topic, context, subject, dataContext });
   // 调研员确认涉及代码后，讨论中才能查代码、核实事实；本场无代码时可以联网核实
   if (context && !context.web) run.code = code;
   run.web = webEnabled;
@@ -1100,7 +1289,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     context: contextOut(context),
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc: doc?.text ? doc : null,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget, blockers, interjections: heard }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget, blockers, interjections: heard, data: run.data?.selection, dataContext }),
   };
 }
 
@@ -1113,7 +1302,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
  * @param {object} opts.state  原讨论的 state.json
  * @returns {Promise<{ handling, answer, stats, state }>}  state 是更新后的，调用方负责写回
  */
-export async function runFollowUp({ cfg, state, question, providers, publisher, interjections, log = () => {}, onEvent = () => {}, code, context: contextMode }) {
+export async function runFollowUp({ cfg, state, question, providers, publisher, interjections, log = () => {}, onEvent = () => {}, code, context: contextMode, data }) {
   if (state?.version !== STATE_VERSION) throw new Error('讨论状态的版本不对，无法追问');
   if (state.expired) throw new Error(`讨论 #${state.number} 已超过保留期，会话已清理，请重新发起讨论`);
   const tags = new Map(Object.entries(state.tags));
@@ -1121,7 +1310,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   const sessions = new Map(Object.entries(state.sessions).map(([id, s]) => [id, { ...s, turns: [...s.turns], seen: 0 }]));
   const latest = new Map(state.latest.map((e) => [e.id, e]));
   const rounds = [...state.rounds];
-  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget });
+  const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget, data: state.mode === 'decision' ? data : null });
   const { leads, participants, stats, emit, heard, ideasPerAgent, tagOf } = run;
   run.shared = state.shared; // 和原讨论完全一样，缓存还能命中
   // 原讨论带了代码背景时，调用方会重新准备代码目录：追问中照样能查代码、核实事实

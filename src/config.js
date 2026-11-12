@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { normalizeDataTools } from './tools/index.js';
+import { normalizeDataTools, hasDataTools } from './tools/index.js';
 import { normalizeKnowledge } from './knowledge.js';
 
 export const CARD_COLORS = [
@@ -122,9 +122,9 @@ export function normalizeConfig(raw, overrides = {}) {
   if (cfg.roleTemplates !== undefined && !Array.isArray(cfg.roleTemplates)) errors.push('roleTemplates 需要是数组：[{ name, persona, modes }]');
 
   applyModePersonas(cfg, errors);
-  normalizeRepos(cfg, errors);
   normalizeDataTools(cfg, errors);
   normalizeKnowledge(cfg, errors);
+  normalizeRepos(cfg, errors);
 
   // 打磨（refine）用的墨稿接口与本地网页
   cfg.novel = { baseUrl: 'http://127.0.0.1:3000', timeoutMs: 60000, ...(cfg.novel ?? {}) };
@@ -174,8 +174,8 @@ function normalizeRepos(cfg, errors) {
     g.docs = (g.docs ?? []).map(expandHome);
     for (const a of g.repos) if (!cfg.repos[a]) errors.push(`repoGroups.${name}：repos 里没有 ${a}`);
   }
-  // 没登记仓库时一般不需要调研员；网页阵容选了核实员时仍要调研员审查联网资料
-  if (!Object.keys(cfg.repos).length && !cfg.research?.factChecker) return;
+  // 没登记仓库时一般不需要调研员；网页阵容选了核实员（审查联网资料）或有数据工具（核实、审查实时数据）时仍要
+  if (!Object.keys(cfg.repos).length && !cfg.research?.factChecker && !hasDataTools(cfg.dataTools)) return;
 
   const r = cfg.research ?? {};
   cfg.research = {

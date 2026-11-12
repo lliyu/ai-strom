@@ -10,6 +10,8 @@ import { RUNS, runOne, runPrepared, followUpOne, log as defaultLog } from '../ru
 import { parseRepoSpecs, resolveRepos, availableRepos } from '../repos.js';
 import { appendInbox } from '../inbox.js';
 import { createNovelClient } from '../novel.js';
+import { hasDataTools, mcpSetup } from '../tools/index.js';
+import { inspectKnowledge } from '../knowledge.js';
 
 /**
  * 本地网页：所有讨论（群里发起的和网页上发起的）都能在这里看、插话、追问；
@@ -245,6 +247,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       dryRun: Boolean(state?.dryRun ?? start?.dryRun),
       code: state?.context && !state.context.web ? { auto: Boolean(state.context.auto), repos: state.context.repos ?? [] } : null,
       web: state?.context?.web ? { questions: state.context.questions ?? [] } : null,
+      data: state?.data ? { tools: Boolean(state.data.tools), knowledge: state.data.knowledge ?? [], questions: state.dataContext?.questions ?? [] } : null,
       canFollowUp: Boolean(state) && !state.expired && progress.status !== 'running' && progress.status !== 'queued',
       progress,
       posts: postsOf(run),
@@ -262,7 +265,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       if (job.kind === 'refine') {
         await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
       } else if (job.kind === 'discuss') {
-        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, number: job.number, repos: job.repos });
+        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, number: job.number, repos: job.repos, data: job.data });
       } else {
         // 群里的讨论在网页上追问：照样发到群里（dry-run 的讨论打印到终端）
         await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number, context: job.context });
@@ -319,7 +322,36 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   }
 
   /** 网页上发起方案讨论或脑洞风暴：只在网页上，不发到群里。 */
-  function startDiscussion({ mode, topic, repos, rounds, lineup }) {
+  /** 页面上选的数据工具和知识来源：{ tools, knowledge: [名字] }。只用于方案讨论；选了用不上的直接 400。 */
+  function dataSelection(mode, data) {
+    if (!data || mode !== 'decision') return undefined;
+    const tools = data.tools === true;
+    const knowledge = Array.isArray(data.knowledge) ? [...new Set(data.knowledge.map(String))] : [];
+    const avail = dataAvailable();
+    if (tools && !avail.tools.count) throw httpError(400, `选了数据工具，但没有可用的工具：${avail.tools.reason}`);
+    const unknown = knowledge.filter((n) => !avail.knowledge.some((k) => k.name === n && k.exists));
+    if (unknown.length) throw httpError(400, `这些知识来源用不上（没登记或目录不存在）：${unknown.join('、')}`);
+    return tools || knowledge.length ? { tools, knowledge } : undefined;
+  }
+
+  /** 能选的数据工具和知识来源。 */
+  function dataAvailable() {
+    let tools = { count: 0, reason: '' };
+    if (!cfg.research) tools.reason = '没有调研员配置（research）';
+    else if (!hasDataTools(cfg.dataTools)) tools.reason = 'config.json 里没有 dataTools，或 local/tools 里没有工具';
+    else {
+      try {
+        const setup = mcpSetup(cfg.dataTools);
+        tools = { count: setup.allowed.length, sources: [...new Set(setup.listed.map((t) => t.server))], reason: setup.allowed.length ? '' : '没有只读工具' };
+      } catch (err) {
+        tools.reason = err.message.split('\n')[0];
+      }
+    }
+    const knowledge = inspectKnowledge(cfg.knowledge ?? {}).map((k) => ({ name: k.name, description: k.description, exists: k.exists, docs: k.docs }));
+    return { tools, knowledge };
+  }
+
+  function startDiscussion({ mode, topic, repos, rounds, lineup, data }) {
     if (mode !== 'decision' && mode !== 'brainstorm') throw httpError(400, 'mode 只能是 decision 或 brainstorm');
     const text = String(topic ?? '').trim();
     if (!text) throw httpError(400, `${mode === 'brainstorm' ? '题目' : '议题'}不能为空`);
@@ -341,9 +373,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
         throw httpError(400, err.message);
       }
     }
+    const picked = dataSelection(mode, data);
     const number = nextNumber(runsDir);
     pending.set(number, { mode, topic: text.slice(0, 8000) });
-    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), repos: repoSpecs, rounds: r, cfg: jobCfg });
+    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
     log(`网页：#${number} ${MODE_LABELS[mode]}排队`);
     return { number };
   }
@@ -413,6 +446,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       roleTemplates: roleTemplates(cfg),
       lineups: { decision: defaultLineup(cfg, 'decision'), brainstorm: defaultLineup(cfg, 'brainstorm'), refine: defaultLineup(cfg, 'refine') },
       maxSeats: MAX_SEATS,
+      // 方案讨论能选的数据工具和知识来源
+      data: dataAvailable(),
     };
   }
 

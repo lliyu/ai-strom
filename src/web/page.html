@@ -69,6 +69,7 @@
   .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .hint { color: var(--muted); font-size: 12px; }
+  .pick { display: inline-flex; gap: 4px; align-items: center; font-size: 13px; }
   .err { color: var(--err); }
   .subtabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-top: 16px; }
   .subtab { background: none; border: none; border-bottom: 2px solid transparent; padding: 6px 12px; cursor: pointer; color: var(--muted); }
@@ -472,25 +473,46 @@ function openForm() {
       <textarea id="topic" placeholder="${f.mode === 'brainstorm' ? '例如：给一款面向独居老人的智能音箱想功能' : '例如：订单服务要不要从单库拆成按用户分库？目前日订单 50 万……'}">${esc(f.topic || '')}</textarea>
       ${f.mode === 'decision' ? `<label>代码仓库</label>
       <input type="text" id="repos" value="${esc(f.repos || '')}" placeholder="不写：调研员按议题自己定位；写「无」：不读代码；或者写别名，逗号分隔，@ 后写分支">
-      <div class="hint" style="margin-top:4px">可用：${esc(repoHint) || '（还没登记仓库）'}</div>` : ''}
+      <div class="hint" style="margin-top:4px">可用：${esc(repoHint) || '（还没登记仓库）'}</div>
+      ${dataHtml(st, f)}` : ''}
       <label>轮数</label>
       <select id="rounds"><option value="auto">自动：评审都没有新意见就结束（最多 ${st.maxRounds || 8} 轮）</option>${[2, 3, 4, 5, 6, 8].map((n) => `<option value="${n}" ${String(f.rounds) === String(n) ? 'selected' : ''}>固定 ${n} 轮</option>`).join('')}</select>
       <div id="lineupBox">${lineupHtml(f.mode)}</div>
       <div class="row"><button class="btn primary" id="startDiscuss">开始</button></div>
     </div>`;
   bindLineup(f.mode, (ok) => { $('startDiscuss').disabled = !ok; });
-  const keep = () => { f.topic = $('topic').value; f.repos = $('repos')?.value ?? f.repos; f.rounds = $('rounds').value; };
+  const keep = () => {
+    f.topic = $('topic').value; f.repos = $('repos')?.value ?? f.repos; f.rounds = $('rounds').value;
+    if ($('dataTools')) f.dataTools = $('dataTools').checked;
+    if (document.querySelector('[data-know]')) f.knowledge = [...document.querySelectorAll('[data-know]:checked')].map((x) => x.dataset.know);
+  };
   $('modeSeg').onclick = (ev) => { const b = ev.target.closest('[data-mode]'); if (!b) return; keep(); f.mode = b.dataset.mode; openForm(); };
   $('startDiscuss').onclick = async () => {
     keep();
     if (!f.topic.trim()) { toast('先写议题'); return; }
     $('startDiscuss').disabled = true;
     try {
-      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ mode: f.mode, topic: f.topic, repos: f.mode === 'decision' ? f.repos : '', rounds: f.rounds, lineup: lineupPayload(f.mode) }) });
+      const data = f.mode === 'decision' ? { tools: Boolean(f.dataTools), knowledge: f.knowledge || [] } : undefined;
+      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ mode: f.mode, topic: f.topic, repos: f.mode === 'decision' ? f.repos : '', rounds: f.rounds, lineup: lineupPayload(f.mode), data }) });
       S.form = { mode: f.mode };
       await loadRuns(); openRun(number);
     } catch (e) { toast(e.message, 6000); $('startDiscuss').disabled = false; }
   };
+}
+
+/** 方案讨论：数据工具和知识来源的勾选。默认能用的都勾上（主席判断要不要查，不需要时不会多花钱）。 */
+function dataHtml(st, f) {
+  const d = st.data || { tools: { count: 0 }, knowledge: [] };
+  const know = d.knowledge.filter((k) => k.exists);
+  if (f.dataTools === undefined) f.dataTools = d.tools.count > 0;
+  if (f.knowledge === undefined) f.knowledge = know.map((k) => k.name);
+  const tools = d.tools.count
+    ? `<span class="pick"><input type="checkbox" id="dataTools" ${f.dataTools ? 'checked' : ''}> 数据工具（${d.tools.count} 个只读工具：${esc((d.tools.sources || []).join('、'))}）</span>`
+    : `<span class="hint">数据工具不可用：${esc(d.tools.reason || '没有登记')}</span>`;
+  const knows = know.map((k) => `<span class="pick" title="${esc(k.description || '')}"><input type="checkbox" data-know="${esc(k.name)}" ${f.knowledge.includes(k.name) ? 'checked' : ''}> 知识：${esc(k.name)}（${k.docs} 篇）</span>`).join('');
+  return `<label>数据与知识</label>
+      <div class="row" style="margin-top:4px">${tools}${knows}</div>
+      <div class="hint" style="margin-top:4px">数据工具：主席先判断要不要在讨论前查生产数据、日志、监控或部署状态，需要的话由核实员查、调研员审查后发给所有人；讨论中的待核实问题也可以查。只读。知识：核实员、调研员查证时先读这些业务知识。</div>`;
 }
 
 // ---------- 一场讨论 ----------
@@ -622,7 +644,7 @@ function renderRun() {
     : docs.length || !r.summary ? [['talk', '讨论'], docTab] : [['talk', '讨论'], ['conclusion', '结论（旧版汇总）']];
   $('main').innerHTML = `
     <div class="head"><h2>#${r.number} · ${title}</h2>${chips}</div>
-    <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整议题</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : ''}${r.followUps.length ? ` · 追问 ${r.followUps.length} 次` : ''}</div>
+    <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整议题</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : ''}${r.data ? ` · ${[r.data.tools ? '数据工具' : '', r.data.knowledge.length ? `知识：${esc(r.data.knowledge.join('、'))}` : ''].filter(Boolean).join(' · ')}` : ''}${r.followUps.length ? ` · 追问 ${r.followUps.length} 次` : ''}</div>
     <div class="subtabs">${tabs.map(([k, l]) => `<button class="subtab ${S.sub === k ? 'on' : ''}" data-sub="${k}">${l}</button>`).join('')}</div>
     <div id="pane"></div>`;
   const pane = $('pane');
