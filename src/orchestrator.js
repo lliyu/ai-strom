@@ -747,9 +747,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         const proposals = [...latest.values()].sort(byTag);
         // 评审互见：上一轮其他评审提的【阻断】原文（只取那几行），评审只对不同意或能补充证据的表态
         const lastCritiques = rounds.find((x) => x.round === round - 1 && x.stage === 'critique')?.entries ?? [];
-        const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: blockerLines(e.text) })).filter((x) => x.lines.length);
+        // 评审互见只认行首【阻断】：「本轮没有【阻断】」这类否定句不再转给其他评审
+        const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: capLines(lineStartBlockers(e.text)) })).filter((x) => x.lines.length);
+        const resolved = run.blockerHistory().resolved;
         const critiques = reviewers.length
-          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items }))
+          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items }))
           : [];
         markScoped(critiques);
         if (adaptive && reviewers.length && !newInterjections && reviewersDone(critiques)) {
@@ -1112,7 +1114,21 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    *   dropped  最后一次一个【阻断】都没写（没写结论、或写了继续却没有阻断）：之前的阻断照录，标明从哪一轮起未再提
    * done / dropped 照旧写 clearedAt（阻断那一轮之后第一次发言的轮次），兼容旧的读取方。没有提过阻断的评审不进存档。
    */
-  run.blockerArchive = () => blockerArchiveOf(rounds, reviewers.map((p) => ({ id: p.id, tag: tagOf(p) })));
+  run.rulings = []; // 追问里人按裁决定稿过时，各覆盖到第几轮（追问开始时从讨论状态里取）
+  run.blockerHistory = () => blockerHistoryOf(rounds, reviewers.map((p) => ({ id: p.id, tag: tagOf(p) })), { rulings: run.rulings });
+  run.blockerArchive = () => run.blockerHistory().archive;
+  /**
+   * 交给主席（和新会话追问的参与者）的存档：现状之外附上更早已经解决的阻断（最近 8 条，status 为 resolved）。
+   * 最后一次发言才解决的已经在现状里标了「没有意见了」，不重复。待裁决卡片和讨论状态只用现状。
+   */
+  run.chairBlockers = () => {
+    const { archive, resolved } = run.blockerHistory();
+    const shown = new Set(archive.filter((b) => b.status === 'done').map((b) => `${b.id}:${b.round}`));
+    const extra = resolved.filter((r) => !shown.has(`${r.id}:${r.round}`))
+      .sort((a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0)).slice(0, 8)
+      .map((r) => ({ ...r, status: 'resolved' }));
+    return [...archive, ...extra];
+  };
 
   /** 熔断或到上限时，另发一张阻断存档卡片；正常收敛时不发（主文档里已经写了）。 */
   run.postBlockers = async (ending) => {
@@ -1391,7 +1407,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const written = await run.writeDoc({
     round: lastRound + 1,
     reason: '讨论结束',
-    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted, blockers })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
+    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted, blockers: run.chairBlockers() })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
   const docs = written ?? [];
   if (!docs.length) await run.postDocFallback({ round: lastRound + 1, ending, number });
@@ -1582,6 +1598,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   const latest = new Map(state.latest.map((e) => [e.id, e]));
   const rounds = [...state.rounds];
   const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget, data: state.mode === 'decision' || state.mode === 'quick' ? data : null });
+  run.rulings = (state.followUps ?? []).filter((f) => f.handling === 'verdict').map((f) => f.ruledAfter);
   const { leads, participants, stats, emit, heard, ideasPerAgent, tagOf } = run;
   // 快问的追问固定走直接回答：不经过主席分流，由回答的一方只靠现在的快问文档回答，再更新文档
   const quick = state.mode === 'quick' || state.mode === 'redraft';
@@ -1612,7 +1629,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
       const total = budgetChars({ window, share: PARTICIPANT_SHARE, tokensPerChar: run.budget.tokenRatios[p.provider] });
       const own = latest.get(p.id);
       const others = run.latestOthers(p);
-      const build = (facts, omitted) => freshBlock({ doc: currentDoc, blockers: run.blockerArchive(), own, others, facts, omitted, interjections: [...pastInterjections, ...heard] });
+      const build = (facts, omitted) => freshBlock({ doc: currentDoc, blockers: run.chairBlockers(), own, others, facts, omitted, interjections: [...pastInterjections, ...heard] });
       const fit = fitHistory({ facts: run.facts, budgetChars: total - build([], '').length - (run.shared?.length ?? 0) });
       return build(fit.facts, fit.note);
     };
@@ -1644,7 +1661,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     stage: 'triage',
     round: state.lastRound,
     system: run.shared,
-    prompt: run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: hist, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length), omitted, blockers: run.blockerArchive(), canVerify: run.canCheck() })}${chairFacts(checked)}`, { rounds: state.rounds, facts: run.facts, stage: 'triage' }),
+    prompt: run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${chairSystem(state.mode)}\n\n${triagePrompt({ rounds: hist, finals: [...latest.values()].sort(byTag), summary: state.summary, question, followUps: state.followUps, isDoc: Boolean(state.docs?.length), omitted, blockers: run.chairBlockers(), canVerify: run.canCheck() })}${chairFacts(checked)}`, { rounds: state.rounds, facts: run.facts, stage: 'triage' }),
   });
   // 主席判断失败时不放弃这次追问：按重新讨论处理，让参与者直接回应追问
   if (!triage && !quick) log('⚠️ 主席没能判断这次追问，按重新讨论处理');
@@ -1717,13 +1734,13 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         round: r0,
         reason,
         check: false,
-        prompt: (factor) => run.fitChair(({ facts: checked, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, ruling: pick.ruling, final, finals, interjections: heard, omitted, blockers: run.blockerArchive() })}${chairFacts(checked)}`, { facts: run.facts, factor }),
+        prompt: (factor) => run.fitChair(({ facts: checked, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, ruling: pick.ruling, final, finals, interjections: heard, omitted, blockers: run.chairBlockers() })}${chairFacts(checked)}`, { facts: run.facts, factor }),
       }
       : {
         round: r0,
         reason: `补写（${reason}）`,
         check: false,
-        prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals, interjections: heard, omitted, blockers: run.blockerArchive(), earlier: earlierOf(state.summary, [...followUps, { question, answer: `人的裁决：${pick.ruling}${final ? `\n\n定稿方案：\n${final.plan}` : '\n\n（由主席按裁决合并定稿）'}` }]) })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
+        prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals, interjections: heard, omitted, blockers: run.chairBlockers(), earlier: earlierOf(state.summary, [...followUps, { question, answer: `人的裁决：${pick.ruling}${final ? `\n\n定稿方案：\n${final.plan}` : '\n\n（由主席按裁决合并定稿）'}` }]) })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
       });
     const doc = firstDoc(out);
     if (out?.length) docs.push(...out);
@@ -1732,7 +1749,8 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
       await run.postDocFallback({ round: r0, ending, number: state.number });
     }
     answer = doc?.text ? doc.note : pick.ruling;
-    followUps.push({ question, handling, ruling: pick.ruling, target: pick.target, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
+    // ruledAfter：这次裁决覆盖到第几轮，之前的阻断之后算人已经裁决过
+    followUps.push({ question, handling, ruling: pick.ruling, target: pick.target, ruledAfter: state.lastRound, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
     await run.postEnd({ title: `追问已按裁决定稿 · 讨论${no}`, subtitle: `${final ? `${final.tag}按裁决定稿` : '主席按裁决合并定稿'}，未经评审 · ${stats.calls} 次模型调用` });
   } else if (handling === 'verify') {
     // ---------- 核实型：按主席列的问题核实（有代码读代码，无代码联网），主席把结论合进主文档。不进入多轮讨论 ----------
@@ -1790,7 +1808,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     // 有主文档就改它；还没有的旧讨论按全部记录补写一份
     const noCode = noCodeOf(state.mode, run.code ? state.context : null);
     await run.postBlockers(it.ending);
-    const blockers = run.blockerArchive();
+    const blockers = run.chairBlockers();
     const out = await run.writeDoc(current
       ? {
         previous: current,
@@ -2025,34 +2043,63 @@ function contextOut(context) {
   return { auto: Boolean(context.auto), repos: context.repos.map(describeRepo), text: context.text };
 }
 
-/** 阻断原文存档（规则见 run.blockerArchive 上的说明）。rounds：讨论记录；reviewers：[{ id, tag }]。 */
-export function blockerArchiveOf(rounds, reviewers) {
-  return reviewers.map((p) => {
+/**
+ * 阻断的来龙去脉（规则见 run.blockerArchive 上的说明）。rounds：讨论记录；reviewers：[{ id, tag }]；
+ * rulings：人按裁决定稿过的追问各覆盖到第几轮（这些轮次里的阻断算人已经裁决）。
+ * 每位评审的发言按「解决点」切段：他自己写了「没有意见了」的那一轮，或者人的裁决。每段里最近一次行首阻断算已解决（resolved），
+ * 往前找当前阻断时不越过最近的解决点（archive）：已经解决的阻断不会再被翻出来。
+ */
+export function blockerHistoryOf(rounds, reviewers, { rulings = [] } = {}) {
+  const archive = [];
+  const resolved = [];
+  const rules = [...new Set(rulings.filter(Number.isFinite))].sort((a, b) => a - b);
+  for (const p of reviewers) {
     const mine = rounds.filter((x) => (x.stage === 'critique' || x.stage === 'feedback') && x.entries.some((e) => e.id === p.id))
       .map((x) => {
         const text = x.entries.find((e) => e.id === p.id).text;
         return { round: x.round, text, verdict: parseVerdict(text), lines: capLines(lineStartBlockers(text)) };
       });
     const last = mine.at(-1);
-    if (!last) return null;
+    if (!last) continue;
     const base = { id: p.id, tag: p.tag };
-    const found = [...mine].reverse().find((x) => x.verdict !== 'done' && x.lines.length);
     const cleared = (from) => mine.find((x) => x.round > from.round)?.round;
-    if (last.verdict !== 'done') {
-      if (found === last) return { ...base, round: last.round, lines: last.lines, status: 'open' };
-      if (hasBlocker(last.text)) {
-        return { ...base, round: last.round, lines: blockerLines(last.text), status: 'unknown', ...(found ? { prev: { round: found.round, lines: found.lines } } : {}) };
-      }
-      return found ? { ...base, round: found.round, lines: found.lines, status: 'dropped', clearedAt: cleared(found) } : null;
+    let seg = [];
+    let lastClose = null; // 最后一次切段：{ by, at, found }
+    const close = (by, at) => {
+      const found = [...seg].reverse().find((x) => x.lines.length) ?? null;
+      if (found) resolved.push({ ...base, round: found.round, lines: found.lines, by, resolvedAt: at });
+      lastClose = { by, at, found };
+      seg = [];
+    };
+    let r = 0;
+    for (const x of mine) {
+      while (r < rules.length && rules[r] < x.round) close('ruling', rules[r++]);
+      if (x.verdict === 'done') close('reviewer', x.round);
+      else seg.push(x);
     }
-    return found ? { ...base, round: found.round, lines: found.lines, status: 'done', statusRound: last.round, clearedAt: cleared(found) } : null;
-  }).filter(Boolean);
+    while (r < rules.length) close('ruling', rules[r++]);
+    // 现状只看最后一次发言
+    if (last.verdict === 'done') {
+      const f = lastClose?.by === 'reviewer' && lastClose.at === last.round ? lastClose.found : null;
+      if (f) archive.push({ ...base, round: f.round, lines: f.lines, status: 'done', statusRound: last.round, clearedAt: cleared(f) });
+      continue;
+    }
+    if (!seg.length) continue; // 最后一次发言之后人已经裁决过：没有待处理的
+    const found = [...seg].reverse().find((x) => x.lines.length);
+    if (found === last) archive.push({ ...base, round: last.round, lines: last.lines, status: 'open' });
+    else if (hasBlocker(last.text)) archive.push({ ...base, round: last.round, lines: blockerLines(last.text), status: 'unknown', ...(found ? { prev: { round: found.round, lines: found.lines } } : {}) });
+    else if (found) archive.push({ ...base, round: found.round, lines: found.lines, status: 'dropped', clearedAt: cleared(found) });
+  }
+  return { archive, resolved };
 }
+
+/** 阻断原文存档：见 blockerHistoryOf。 */
+export const blockerArchiveOf = (rounds, reviewers, opts) => blockerHistoryOf(rounds, reviewers, opts).archive;
 
 /** 存档的行数和长度限制：最多 10 行，每行最多 300 字。 */
 const capLines = (lines) => lines.slice(0, 10).map((l) => (l.length > 300 ? `${l.slice(0, 300)}…` : l));
 
-/** 发言里带【阻断】的那几行（不管在不在行首），原文照抄。评审互见和格式未识别的存档用。 */
+/** 发言里带【阻断】的那几行（不管在不在行首），原文照抄。格式未识别的存档用。 */
 export function blockerLines(text) {
   return capLines(String(text ?? '').split('\n').map((l) => l.trim()).filter((l) => hasBlocker(l)));
 }

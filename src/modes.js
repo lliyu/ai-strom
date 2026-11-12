@@ -838,14 +838,31 @@ export function peersBlock(peers = []) {
   ].join('\n');
 }
 
+/**
+ * 已经解决的阻断：评审后来写了「没有意见了」，或者人已经裁决过。不要再提，除非认为当时的解决办法本身有问题。
+ * 太多时只放最近的几条。
+ */
+export function resolvedBlock(resolved = []) {
+  if (!resolved.length) return '';
+  const recent = [...resolved].sort((a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0)).slice(0, 8);
+  return [
+    '## 已经解决的阻断（匿名）',
+    ...recent.map((x) => `### ${x.tag} 第 ${x.round} 轮提出（${x.by === 'ruling' ? '人已经裁决过' : `第 ${x.resolvedAt} 轮评审结论：${VERDICT_DONE}`}）\n${x.lines.join('\n')}`),
+    ...(resolved.length > recent.length ? [`（更早的 ${resolved.length - recent.length} 条没有列出，同样不要再提）`] : []),
+    '',
+    '这些阻断不要再提。只有你认为当时的解决办法本身有问题时才能再提：照样标【阻断】，问题开头写「重提」，说明原来的解决办法错在哪里、依据是什么（新的核实结果、代码坐标或资料），不能只重复原来的理由。',
+  ].join('\n');
+}
+
 /** 评审：不出自己的方案，只给主笔的方案挑问题，并分级。 */
-export function critiquePrompt({ topic, round, proposals, peers = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false }) {
+export function critiquePrompt({ topic, round, proposals, peers = [], resolved = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false }) {
   const refine = mode === 'refine';
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.critique}】`,
     scopeBlock(scope, { once: convo }),
     `## 待评审的${refine ? '修改' : ''}方案（匿名）\n${planned(proposals)}`,
     peersBlock(peers),
+    resolvedBlock(resolved),
     interjectionBlock(interjections),
     [
       ...followUpLines(convo, round),
@@ -997,12 +1014,22 @@ export function blockerEntryText(b, bullet = (l) => l) {
   ].join('\n');
 }
 
-/** 阻断原文存档：状态按每位评审最后一次发言的评审结论，原文取最近一次写在行首的【阻断】。 */
+/**
+ * 阻断原文存档：状态按每位评审最后一次发言的评审结论，原文取最近一次写在行首的【阻断】。
+ * status 为 resolved 的是更早已经解决的阻断（评审后来写了「没有意见了」或人裁决过），单独放一小节，不算待裁决。
+ */
 export function blockersBlock(blockers = []) {
-  if (!blockers.length) return '';
+  const current = blockers.filter((b) => b.status !== 'resolved');
+  const resolved = blockers.filter((b) => b.status === 'resolved');
+  if (!current.length && !resolved.length) return '';
   return [
     '## 阻断原文存档（每位评审的状态按他最后一次发言的评审结论；原文取最近一次写在行首的【阻断】，照录）',
-    ...blockers.map((b) => `### ${b.tag}（${blockerStatusText(b)}）\n${blockerEntryText(b)}`),
+    ...(current.length ? current.map((b) => `### ${b.tag}（${blockerStatusText(b)}）\n${blockerEntryText(b)}`) : ['（评审最后都没有待处理的阻断）']),
+    ...(resolved.length ? [
+      '',
+      '### 已经解决的阻断（不算待裁决，供写「考虑过但没采用的做法」和判断评审有没有重提时参考）',
+      ...resolved.map((b) => `#### ${b.tag} 第 ${b.round} 轮提出（${b.by === 'ruling' ? '人已经裁决过' : `第 ${b.resolvedAt} 轮评审结论：${VERDICT_DONE}`}）\n${b.lines.join('\n')}`),
+    ] : []),
   ].join('\n');
 }
 

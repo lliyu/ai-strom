@@ -79,6 +79,7 @@ test('裁决型：被选中的主笔按裁决定稿，不进入评审；主席�
   assert.match(update.prompt, /定稿（按人的裁决，未经评审）/);
   assert.match(update.prompt, /完整方案-A3/);
   assert.equal(out.state.followUps.at(-1).target, tagA);
+  assert.equal(out.state.followUps.at(-1).ruledAfter, state.lastRound, '记下裁决覆盖到第几轮');
   assert.equal(out.state.docs.length, 2);
 });
 
