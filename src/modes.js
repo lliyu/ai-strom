@@ -155,15 +155,16 @@ export function overLimit(text, { max, plan: planMax, brief: briefMax, tolerance
 }
 
 /** 超出上限时让发言者压缩重写。会话模式下原回答已经在会话里，非会话模式要贴回去。 */
-export function compressPrompt({ over, original, limit }) {
+export function compressPrompt({ over, original, limit, items = false }) {
   return join(
     `【压缩重写】你刚才的回答超出了字数上限：${over}。`,
     original ? `## 你刚才的回答\n${original}` : '',
     [
       `请压缩后完整重写一遍：结构、结论和立场都不变，删掉复述、铺垫、举例和次要细节，每条只留一句话。`,
+      items ? '保留【阻断】【建议】等级别标记、每条的改法和依据，以及最后的「评审结论」行；依据不计入字数。' : '',
       `要点不超过 3 行${limit.brief ? `、${limit.brief} 字` : ''}，给人看的部分不超过 ${limit.max} 字${limit.plan ? `，「${PLAN_MARKER}」之后的完整方案不超过 ${limit.plan} 字` : ''}。`,
       '只输出重写后的全文，不要解释。',
-    ].join('\n'),
+    ].filter(Boolean).join('\n'),
   );
 }
 
@@ -180,6 +181,163 @@ export function hasBlocker(text) {
 export function isBlockerLine(line) {
   const rest = String(line ?? '').replace(/^(?:\s|[-*+•]\s|\d+[.、)）]\s*|\*\*|__)+/u, '');
   return /^[【\[]\s*阻断\s*[】\]]/.test(rest);
+}
+
+// ---------- 条目化发言（配置 items 开关控制）：「【级别】问题 ｜改法：… ｜依据：… ｜影响：…」 ----------
+//
+// 诊断和评审类发言每个问题写成一行条目；页面读取时用 parseItems 拆开，不落盘。
+// 依据不计入字数上限（压缩时最容易被删的就是它）；写入时检查格式，不合格合并重写一次，并防止立场漂移。
+
+/** 条目的级别：评审、修订、代码核实、核对主文档各用各的。 */
+export const ITEM_LEVELS = ['阻断', '建议', '改', '采纳', '不采纳', '确认', '推翻', '查不到', '漏', '错', '不清'];
+const ITEM_HEAD = new RegExp(`^(?:\\s|[-*+•]\\s|\\d+[.、)）]\\s*|\\*\\*|__)*[【\\[]\\s*(${ITEM_LEVELS.join('|')})\\s*[】\\]]\\s*(?:\\*\\*)?\\s*`, 'u');
+/** 标签段：只在「｜」后面紧跟已知标签时才切，正文里别的竖线不切。 */
+const ITEM_LABELS = { 改法: 'fix', 解决: 'fix', 怎么改: 'fix', 依据: 'evidence', 影响: 'impact', 后果: 'impact' };
+const ITEM_SPLIT = new RegExp(`\\s*[｜|]\\s*(?=(?:${Object.keys(ITEM_LABELS).join('|')})\\s*[:：])`, 'u');
+const ITEM_SEGMENT = new RegExp(`^(${Object.keys(ITEM_LABELS).join('|')})\\s*[:：]\\s*([\\s\\S]*)$`, 'u');
+const clean = (s) => String(s ?? '').replace(/\*\*/g, '').replace(/[\s；;。]+$/u, '').trim();
+
+/** 依据的类别：code 代码坐标 / verify 某轮核实 / source 资料 / guess 推断。 */
+export function evidenceKind(text) {
+  const t = clean(text);
+  if (!t) return null;
+  if (/^推断/.test(t)) return 'guess';
+  if (/[\w.@-]+:[^\s:：，,]+:\d+/.test(t)) return 'code';
+  if (/第\s*[\d一二三四五六七八九十]+\s*轮[^\n]{0,6}核实/.test(t)) return 'verify';
+  return 'source';
+}
+
+/**
+ * 解析一行条目；不是条目返回 null。
+ * 新格式按「｜标签：」切段；没有标签的旧箭头格式（「【阻断】问题 → 后果 → 怎么改」）按位置拆，legacy 为 true。
+ */
+export function parseItemLine(line) {
+  const m = ITEM_HEAD.exec(String(line ?? ''));
+  if (!m) return null;
+  const level = m[1];
+  const [headRaw, ...segs] = String(line).slice(m[0].length).split(ITEM_SPLIT);
+  const item = { level, head: clean(headRaw), fix: null, evidence: null, impact: null, legacy: false };
+  for (const s of segs) {
+    const sm = ITEM_SEGMENT.exec(s.trim());
+    if (!sm) continue;
+    const key = ITEM_LABELS[sm[1]];
+    const val = clean(sm[2]);
+    if (val) item[key] = item[key] ? `${item[key]}；${val}` : val;
+  }
+  if (!segs.length && (level === '阻断' || level === '建议')) {
+    const parts = item.head.split(/\s*→\s*/u).map((x) => clean(x.replace(/^\s*(?:后果|影响|怎么改|改法|解决)\s*[:：]\s*/u, ''))).filter(Boolean);
+    if (parts.length >= 2) {
+      item.head = parts[0];
+      item.legacy = true;
+      if (parts.length >= 3) {
+        item.impact = parts[1];
+        item.fix = parts.slice(2).join(' → ');
+      } else item.fix = parts[1];
+    }
+  }
+  // 核实审查里更正过的条目：级别后面跟「【已更正】」
+  if (/^[【\[]\s*已更正\s*[】\]]/.test(item.head)) {
+    item.corrected = true;
+    item.head = clean(item.head.replace(/^[【\[]\s*已更正\s*[】\]]/, ''));
+  }
+  if (!item.head) return null;
+  item.evidenceKind = evidenceKind(item.evidence);
+  return item;
+}
+
+/** 一段发言里的全部条目：[{ level, head, fix, evidence, impact, evidenceKind, legacy, section }]；section 是所在的加粗小节标题。代码块里的不算。 */
+export function parseItems(text) {
+  const out = [];
+  let section = null;
+  let fence = false;
+  for (const line of String(text ?? '').split('\n')) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      fence = !fence;
+      continue;
+    }
+    if (fence) continue;
+    const item = parseItemLine(line);
+    if (item) {
+      out.push({ ...item, section });
+      continue;
+    }
+    const head = /^[ \t]*\*\*([^*\n]+)\*\*/.exec(line);
+    if (head && !/^\s*[-*+•]\s/.test(line)) section = clean(head[1]).replace(/[（(][^）)]*[）)]$/u, '').replace(/[:：]$/u, '').trim() || null;
+    else if (/^\s*#{1,6}\s/.test(line)) section = clean(line.replace(/^\s*#+\s*/, '')) || null;
+  }
+  return out;
+}
+
+/** 去掉依据段（从「｜依据：」到下一个「｜」或行尾），字数统计用：依据不计入上限。 */
+export function stripEvidence(text) {
+  return String(text ?? '').replace(/[｜|]\s*依据\s*[:：][^｜|\n]*/gu, '');
+}
+
+/** 行首阻断行的条数（同一行只算一次）。 */
+export function blockerCount(text) {
+  return String(text ?? '').split('\n').filter(isBlockerLine).length;
+}
+
+/**
+ * 写入时检查（只在 items 开关打开时用）：返回不合格项 [{ kind, note }]，合格返回空数组。
+ * verdict：要求写评审结论行；stance：主笔要写「立场变化」；blockers：【阻断】要带改法和依据；limit：字数上限（依据不计）。
+ */
+export function replyIssues(text, { limit = null, verdict = false, stance = false, blockers = false } = {}) {
+  const issues = [];
+  const { shown } = splitReply(text);
+  if (verdict && parseVerdict(text) === null) issues.push({ kind: 'verdict', note: `缺最后一行「${VERDICT_LINE}：${VERDICT_CONTINUE} / ${VERDICT_DONE}」` });
+  if (blockers) {
+    const bad = parseItems(shown).filter((it) => it.level === '阻断' && (!it.fix || !it.evidence));
+    for (const it of bad) {
+      const miss = [!it.fix && '改法', !it.evidence && '依据'].filter(Boolean).join('和');
+      issues.push({ kind: 'blocker', note: `【阻断】「${it.head.slice(0, 30)}${it.head.length > 30 ? '…' : ''}」缺${miss}` });
+    }
+  }
+  if (stance && parseStanceChange(text) === null) issues.push({ kind: 'stance', note: '缺「**立场变化**」（无 / 小幅 / 较大，一句话说明）' });
+  const over = limit ? overLimit(stripEvidence(text), limit) : null;
+  if (over) issues.push({ kind: 'over', note: `超出字数上限：${over}（依据不计入）` });
+  return issues;
+}
+
+/** 不合格时的合并重写：只补缺项或压缩，内容和立场不变。会话模式下原回答已经在会话里。 */
+export function fixReplyPrompt({ issues, original, limit }) {
+  return join(
+    '【补全重写】你刚才的回答有几处不合要求：',
+    issues.map((x) => `- ${x.note}`).join('\n'),
+    original ? `## 你刚才的回答\n${original}` : '',
+    [
+      '请完整重写一遍，只补缺项或压缩，内容和立场不变：评审结论不能改，【阻断】的条数和每条的意思不能变，不要新增或删掉问题。',
+      '缺依据又没有实据的，写「依据：推断」。缺改法的，补一句能直接执行的改法。',
+      issues.some((x) => x.kind === 'over') && limit
+        ? `压缩时删复述、铺垫和举例，保留级别标记、改法和依据（依据不计字数）；要点不超过 3 行${limit.brief ? `、${limit.brief} 字` : ''}，给人看的部分不超过 ${limit.max} 字${limit.plan ? `，「${PLAN_MARKER}」之后的完整方案不超过 ${limit.plan} 字` : ''}。`
+        : '',
+      '只输出重写后的全文，不要解释。',
+    ].filter(Boolean).join('\n'),
+  );
+}
+
+/**
+ * 重写保护：重写后评审结论变了，或者行首阻断变少了，就用第一次的原文。返回 null 表示可以用重写稿，否则返回原因。
+ */
+export function rewriteDrift(before, after) {
+  const v0 = parseVerdict(before);
+  const v1 = parseVerdict(after);
+  if (v0 !== null && v1 !== v0) return `评审结论从「${v0 === 'done' ? VERDICT_DONE : VERDICT_CONTINUE}」变成了「${v1 === null ? '没写' : v1 === 'done' ? VERDICT_DONE : VERDICT_CONTINUE}」`;
+  const b0 = blockerCount(splitReply(before).shown);
+  const b1 = blockerCount(splitReply(after).shown);
+  if (b1 < b0) return `行首【阻断】从 ${b0} 条变成 ${b1} 条`;
+  return null;
+}
+
+/** 条目的写法说明，各阶段共用。 */
+function itemFormat({ levels, need = '', fix = '改法' }) {
+  return [
+    `每个问题写成一行条目，格式固定：「- 【级别】问题 ｜${fix}：… ｜依据：… ｜影响：…」。级别只用 ${levels}。`,
+    `- 「【级别】问题」必写；后面的段按「${fix}、依据、影响」的顺序，用全角竖线「｜」隔开，没有的段整段省掉，不写「影响：无」。一行一条，不嵌套。`,
+    need,
+    '- 依据只写四类之一：代码坐标「仓库别名:路径:行号」、「第 N 轮核实第 K 条」、资料（写明是哪条联网资料或实时数据）、「推断」。没有实据就写「依据：推断」，如果这一轮要求列「待核实的事实」，把它也列进去。',
+    '- 依据不计入字数上限，不要为了省字删掉依据。',
+  ].filter(Boolean).join('\n');
 }
 
 /** 要点一节的写法，所有发言共用。 */
@@ -535,7 +693,10 @@ export function factsBlock(facts, { forChair = false } = {}) {
 }
 
 /** 调研员在讨论中途回答待核实的问题。系统提示词沿用讨论的共享提示词（有议题和背景资料）。 */
-export function factCheckPrompt({ round, questions, repos, docs = [], tools = ['Read', 'Grep', 'Glob'], maxChars = 4000, who = '调研员', draft = false }) {
+/** 条目化时代码核实的写法。 */
+const FACT_ITEM_RULE = '- 逐条回答，编号和问题一致，每条一行：「1. 【确认】结论 ｜依据：仓库别名:仓内相对路径:行号」。级别只用三种：【确认】问题里的说法或前提成立；【推翻】不成立（结论里写清实际是什么）；【查不到】代码里找不到或代码回答不了（依据写查了哪里）。依据必须是源码坐标，不计入字数。';
+
+export function factCheckPrompt({ round, questions, repos, docs = [], tools = ['Read', 'Grep', 'Glob'], maxChars = 4000, who = '调研员', draft = false, items = false }) {
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.factcheck}】`,
     [
@@ -548,7 +709,7 @@ export function factCheckPrompt({ round, questions, repos, docs = [], tools = ['
     `## 待核实的问题\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
     [
       '## 要求',
-      '- 逐条回答，编号和问题一致。每条先写结论（是 / 否 / 具体的值或行为），再写依据，依据带源码坐标「仓库别名:仓内相对路径:行号」。',
+      items ? FACT_ITEM_RULE : '- 逐条回答，编号和问题一致。每条先写结论（是 / 否 / 具体的值或行为），再写依据，依据带源码坐标「仓库别名:仓内相对路径:行号」。',
       '- 讲清实际行为和适用条件，不要只复述字段名或常量。',
       '- 结论和背景资料不一致或比它更完整时，明确写「背景资料有误：……」或「背景资料不完整：……」。',
       '- 代码里确实找不到的写「代码里找不到」，并说明查了哪里；不要推测。',
@@ -649,7 +810,8 @@ export function parseVerdict(text) {
 
 /** 没有评审时，看主笔的「立场变化」：都写「无」就算收敛。 */
 export function parseStanceChange(text) {
-  const m = /立场变化\**[^\n]{0,4}\n?\s*[（(【]?\s*\**(无|小幅|较大)/.exec(String(text ?? ''));
+  // 立场写在下一行的列表项里（「**立场变化**\n- 小幅：…」）也认
+  const m = /立场变化\**[^\n]{0,4}\n?\s*(?:[-*+•]\s*)?[（(【]?\s*\**(无|小幅|较大)/.exec(String(text ?? ''));
   return m?.[1] ?? null;
 }
 
@@ -676,7 +838,7 @@ export function peersBlock(peers = []) {
 }
 
 /** 评审：不出自己的方案，只给主笔的方案挑问题，并分级。 */
-export function critiquePrompt({ topic, round, proposals, peers = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope }) {
+export function critiquePrompt({ topic, round, proposals, peers = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false }) {
   const refine = mode === 'refine';
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.critique}】`,
@@ -693,15 +855,17 @@ export function critiquePrompt({ topic, round, proposals, peers = [], interjecti
       '每个问题标级别：',
       `- 【阻断】不解决的话${refine ? '这版修改就不该采用' : '方案不成立、会出错或无法落地'}`,
       '- 【建议】改了更好，不改也行（最多 2 条）',
-      `按下面的结构${limits ? `，全文不超过 ${limits.critique} 字` : ''}：`,
-      briefLine('还有几条阻断级问题、最要紧的是哪条'),
-      '然后按方案代号分组，每个问题一行：「【阻断】问题 → 后果 → 怎么改」。没有新问题的方案写「无新问题」。',
+      `按下面的结构${limits ? `，全文不超过 ${limits.critique} 字${items ? '（依据不计）' : ''}` : ''}：`,
+      items ? `${briefLine('还有几条阻断级问题、最要紧的是哪条')}。要点里只用文字说，不写【阻断】【建议】这类标记` : briefLine('还有几条阻断级问题、最要紧的是哪条'),
+      items
+        ? `然后按方案代号分组：每组单独一行加粗的方案代号（例如「**方案 A**」），下面是条目，条目不要直接接在要点后面。没有新问题的方案在代号下写「无新问题」。\n${itemFormat({ levels: '【阻断】【建议】', need: '- 【阻断】必须写改法和依据。' })}`
+        : '然后按方案代号分组，每个问题一行：「【阻断】问题 → 后果 → 怎么改」。没有新问题的方案写「无新问题」。',
       askVerdict ? verdictInstruction(round, mode, { graded: true }) : '',
     ].filter(Boolean).join('\n'),
   );
 }
 
-export function reviewPrompt({ topic, round, own, others, critiques = [], interjections, context, convo = false, mode, limits = limitsFor(mode) }) {
+export function reviewPrompt({ topic, round, own, others, critiques = [], interjections, context, convo = false, mode, limits = limitsFor(mode), items = false }) {
   const hasOthers = others.length > 0;
   const plan = mode === 'refine' ? '修改方案' : '方案';
   return join(
@@ -714,8 +878,14 @@ export function reviewPrompt({ topic, round, own, others, critiques = [], interj
       '你的回答分两部分。',
       `第一部分发到${mode === 'refine' ? '页面上给作者' : '群里给人'}看，只写这一轮的变化，不要复述整个${plan}，也不要复述评审意见和别人的方案${limits ? `，不超过 ${limits.review} 字` : ''}：`,
       briefLine(`你现在的结论，以及这一轮改了什么（没改就说为什么坚持）`),
-      '**改了什么**（每条一行：「原来… → 现在… · 原因」；没改写「无变化」）',
-      critiques.length ? '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「采纳」或「不采纳：理由」）' : '',
+      items
+        ? '**改了什么**（每条一行：「- 【改】原来… → 现在… ｜依据：…」；依据只写代码坐标「仓库别名:路径:行号」、「第 N 轮核实第 K 条」、资料或「推断」，不计入字数；没改写「无变化」）'
+        : '**改了什么**（每条一行：「原来… → 现在… · 原因」；没改写「无变化」）',
+      critiques.length
+        ? (items
+          ? '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「- 【采纳】评审 N 的「问题开头几个字」 ｜改法：…」或「- 【不采纳】评审 N 的「…」 ｜依据：…」；不采纳必须带依据）'
+          : '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「采纳」或「不采纳：理由」）')
+        : '',
       hasOthers ? '**对其他方案的看法**（只写会影响结论的分歧或值得借鉴的地方，一两行，引用方案代号；没有就不写）' : '',
       '**立场变化**（无 / 小幅 / 较大，一句话说明）',
       '',
@@ -735,7 +905,7 @@ function finalsBlock(finals, title = '各主笔的最终方案') {
  * 核实审查：核实员（例如 Sonnet）先读代码写初稿，调研员（Opus）逐条复查、纠正，定稿才发给主笔和评审。
  * 参与者看不到初稿，所以定稿要完整独立。
  */
-export function factReviewPrompt({ round, questions, draft, checker = '核实员', repos, docs = [], tools = ['Read', 'Grep', 'Glob'], maxChars = 4000 }) {
+export function factReviewPrompt({ round, questions, draft, checker = '核实员', repos, docs = [], tools = ['Read', 'Grep', 'Glob'], maxChars = 4000, items = false }) {
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.factreview}】`,
     [
@@ -750,7 +920,9 @@ export function factReviewPrompt({ round, questions, draft, checker = '核实员
       '- 逐条复查：结论对不对，引用的源码坐标是否存在、是否真的支撑结论，有没有漏掉适用条件或例外。拿不准的自己到代码里查，不要因为初稿写得肯定就相信。',
       '- 有错就改，漏了就补。初稿没有依据、你也查不到的结论，改成「代码里找不到」（说明查了哪里）或「代码回答不了」，不要保留。',
       '- 第一行写审查结论：「**审查**：共 N 条，全部无误」或「**审查**：共 N 条，M 条有更正（第 x、y 条）」。',
-      '- 然后写定稿：逐条回答，编号和问题一致。每条先写结论（是 / 否 / 具体的值或行为），再写依据，依据带源码坐标「仓库别名:仓内相对路径:行号」。更正过的条目在结论前标「【已更正】」，再用一句话说明初稿错在哪里。',
+      items
+        ? `- 然后写定稿。${FACT_ITEM_RULE.slice(2)}更正过的条目在级别后面加「【已更正】」，并在结论里用一句话说明初稿错在哪里。`
+        : '- 然后写定稿：逐条回答，编号和问题一致。每条先写结论（是 / 否 / 具体的值或行为），再写依据，依据带源码坐标「仓库别名:仓内相对路径:行号」。更正过的条目在结论前标「【已更正】」，再用一句话说明初稿错在哪里。',
       '- 结论和背景资料不一致或比它更完整时，明确写「背景资料有误：……」或「背景资料不完整：……」。',
       `- 参与者看不到初稿，定稿要完整独立，不要写「同初稿」。不要提建议，不要评价方案。全文不超过 ${maxChars} 字，只输出审查结论和定稿。`,
     ].join('\n'),
@@ -1150,6 +1322,7 @@ function docRules(mode) {
       '## 写法',
       '这份文档给作者读：先看修改说明决定接不接受，再从「修改稿」附录里复制全文。',
       '- 修改说明只写会影响判断的改动，按重要程度排序；措辞上的小改动合成一条带过。',
+      '- 修改说明对照的是作者给的章节原文：作者只看过原文，没看过你中间的修改稿，不要写「上一稿」「第一版修改稿」「之前改成了」这类说法，直接写原文哪里改成了什么。',
       '- 挑刺里成立的意见吸收进修改稿；不采纳的写进「没采纳的意见」。',
       '- 不要出现「方案 A」「评审 1」这些代号。不要写「变更记录」，程序会自动生成。',
       `- 修改后的完整章节放在「${DOC_MARK.doc}」之后的附录里，标记写「【附录：修改稿】」：完整写出整章，没改的段落也照抄，保持原文的分段，不要加标题、批注或解释，不要省略。`,
@@ -1338,7 +1511,7 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
 }
 
 /** 主笔核对主文档：在自己的会话里，对照自己参与过的讨论。 */
-export function docCheckPrompt({ doc, attachments, own }) {
+export function docCheckPrompt({ doc, attachments, own, items = false }) {
   return join(
     `【阶段：${STAGE_LABELS.doccheck}】`,
     `## 主文档\n${doc}`,
@@ -1351,7 +1524,9 @@ export function docCheckPrompt({ doc, attachments, own }) {
       '- 读者看不懂的地方（用了代号、缺少前提）；',
       '- 读起来费力的地方：没有提炼出结论、只是堆着碎点的部分，同一件事在几处重复，最要紧的结论或拍板项没有排在前面、没有标出来。能删、能并的直接指出来。',
       '要求补充遗漏时，同时说清补在哪一层（正文写结论，还是附录写细节），不要为了完整把细节都塞进正文。',
-      '措辞、格式和次要细节不用提。每条一行，写清应该怎么改，不超过 600 字。',
+      items
+        ? '措辞、格式和次要细节不用提。每条一行：「- 【漏 / 错 / 不清】问题 ｜改法：…」，【漏】是漏掉的信息，【错】是写错或把没达成一致的写成定论，【不清】是看不懂或读起来费力；不超过 600 字。'
+        : '措辞、格式和次要细节不用提。每条一行，写清应该怎么改，不超过 600 字。',
       '没有重要问题时只写一行「没有问题」。',
     ].join('\n'),
   );
@@ -1687,7 +1862,7 @@ export function quickAnswerPrompt({ knowledge = '', canRead = false } = {}) {
 }
 
 /** 快问第二步：另一位 AI 挑刺。 */
-export function quickChallengePrompt({ answer, knowledge = '', canRead = false }) {
+export function quickChallengePrompt({ answer, knowledge = '', canRead = false, items = false }) {
   return join(
     `【阶段：${STAGE_LABELS.challenge}】`,
     `## 另一位 AI 的回答（匿名）\n${answer}`,
@@ -1698,7 +1873,9 @@ export function quickChallengePrompt({ answer, knowledge = '', canRead = false }
       '- 提问人可能没考虑到的盲点、风险、反例，或者更简单的做法；',
       '- 回答依赖、但没说出来的前提。',
       '只写成立且会改变判断的问题，每条写清为什么、会怎样；回答没问题的地方不用夸。没有实质问题就直接说没有。',
-      '开头写「**要点**」，不超过 3 行；正文不超过 800 字。',
+      items
+        ? `开头写「**要点**」，不超过 3 行，只用文字说，不写【阻断】【建议】这类标记；然后单独一行「**问题**」，下面是条目；正文不超过 800 字（依据不计）。\n${itemFormat({ levels: '【阻断】（不改回答就错了或会误导提问人）【建议】（改了更好）', need: '- 【阻断】必须写改法和依据。' })}`
+        : '开头写「**要点**」，不超过 3 行；正文不超过 800 字。',
     ].join('\n'),
   );
 }
@@ -1751,7 +1928,7 @@ export function redraftPrompt() {
 }
 
 /** 改稿第二步：另一位 AI 对照原文挑刺。 */
-export function redraftChallengePrompt({ notes, draft }) {
+export function redraftChallengePrompt({ notes, draft, items = false }) {
   return join(
     `【阶段：${STAGE_LABELS.challenge}】`,
     notes ? `## 改稿的一方说明的改动（匿名）\n${notes}` : '',
@@ -1763,7 +1940,9 @@ export function redraftChallengePrompt({ notes, draft }) {
       '- 作者的要求没做到或做过头的地方；',
       '- 还能明显更好的地方（给出具体改法，指明是哪一段）。',
       '只写成立且值得改的问题，每条指明位置（引用原句开头几个字）；没有实质问题就直接说没有。',
-      '开头写「**要点**」，不超过 3 行；正文不超过 800 字。',
+      items
+        ? `开头写「**要点**」，不超过 3 行，只用文字说，不写【阻断】【建议】这类标记；然后单独一行「**问题**」，下面是条目；正文不超过 800 字（依据不计）。\n${itemFormat({ levels: '【阻断】（不改这版就不该采用）【建议】（改了更好）', need: '- 【阻断】必须写改法和依据。问题里指明位置（引用原句开头几个字）；依据可以引用原文或设定里的句子，算作资料。' })}`
+        : '开头写「**要点**」，不超过 3 行；正文不超过 800 字。',
     ].join('\n'),
   );
 }

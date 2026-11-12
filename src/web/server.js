@@ -6,7 +6,7 @@ import { normalizeConfig, ConfigError } from '../config.js';
 import { lineupConfig, modelPool, roleTemplates, defaultLineup, tierLineup, MAX_SEATS, readsCode } from '../lineup.js';
 import { nextNumber, saveState, removeSessionFiles } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX, SETTING_MAX } from '../modes.js';
-import { groupKeys, critiqueDigest, blockerSummary, docSections } from './digest.js';
+import { groupKeys, critiqueDigest, blockerSummary, docSections, itemDigest } from './digest.js';
 import { listMemory, appendEntries, deleteEntry, isDomain, memoCandidates, ENTRY_MAX_CHARS } from '../memory.js';
 import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
 import { claudeSessionFile, DEFAULT_CLAUDE_CWD } from '../providers/claude-cli.js';
@@ -121,6 +121,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
         ...(meta.tag ? { tag: meta.tag } : {}),
       };
       if (p.stage === 'critique') Object.assign(p, critiqueDigest(p));
+      Object.assign(p, itemDigest(p));
       return p;
     });
     groupKeys(posts).forEach((g, i) => Object.assign(posts[i], g));
@@ -287,6 +288,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       // 这场带了哪些记忆；这场已经存进记忆的结论（结论页标「已存入」）
       memory: state?.memory ?? start?.memory ?? null,
       memorySaved: savedFrom(number),
+      // 条目化发言（第二期试跑）是按场开的
+      items: Boolean(state?.items ?? start?.items),
       subject: subject && subject.fields ? { type: subject.type, id: subject.id, title: subject.title, current: subject.current, background: subject.background, fields: subject.fields, version: subject.version } : subject,
       summary: state?.summary ?? null,
       conclusion: lastDiscuss?.answer ?? state?.summary ?? null,
@@ -469,7 +472,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return mem;
   }
 
-  function startDiscussion({ mode, tier, topic, material, setting, memory, repos, rounds, lineup, data }) {
+  function startDiscussion({ mode, tier, topic, material, setting, memory, repos, rounds, lineup, data, items }) {
     if (!['decision', 'brainstorm', 'quick', 'redraft'].includes(mode)) throw httpError(400, 'mode 只能是 quick、redraft、decision 或 brainstorm');
     const light = mode === 'quick' || mode === 'redraft'; // 两位、一轮
     if (tier !== undefined && tier !== null && tier !== '' && !(tier === 'meeting' && mode === 'decision')) throw httpError(400, 'tier 只能是 meeting（方案讨论的小会）');
@@ -491,7 +494,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     // 快问、小会不传阵容时用各自的默认阵容（方案讨论默认阵容里挑人）
     const seats = lineup ?? (light || meeting ? tierLineup(cfg, meeting ? 'meeting' : mode) : undefined);
     if ((light || meeting) && !seats) throw httpError(400, `配置里的参与者不够组成${meeting ? '小会' : MODE_LABELS[mode]}，请在阵容里选`);
-    const jobCfg = jobConfig(mode, r, seats, meeting ? { ...cfg, maxRounds: MEETING_MAX_ROUNDS } : cfg);
+    if (items !== undefined && items !== null && typeof items !== 'boolean') throw httpError(400, 'items 只能是 true 或 false');
+    // 条目化发言按场开关（试跑用）；不传就用配置里的 items
+    const base = { ...cfg, ...(meeting ? { maxRounds: MEETING_MAX_ROUNDS } : {}), ...(typeof items === 'boolean' ? { items } : {}) };
+    const jobCfg = jobConfig(mode, r, seats, base);
     // 仓库：不写 = 方案讨论自动定位；「无」= 不读代码；否则是别名列表。先校验，写错了不排队
     let repoSpecs;
     const repoText = light ? '无' : String(repos ?? '').trim(); // 快问、改稿不读代码
@@ -592,6 +598,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       repos,
       groups,
       maxRounds: cfg.maxRounds,
+      items: cfg.items,
       participants: { decision: people('decision'), brainstorm: people('brainstorm'), refine: people('refine') },
       // 新建页的档位：快问、小会的默认阵容（从方案讨论的默认阵容里挑），材料框的上限
       tiers: { quick: tierLineup(cfg, 'quick'), meeting: tierLineup(cfg, 'meeting'), redraft: tierLineup(cfg, 'redraft'), meetingMaxRounds: MEETING_MAX_ROUNDS },

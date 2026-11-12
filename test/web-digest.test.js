@@ -161,7 +161,8 @@ test('阻断区块：只看最后一次含评审的运行；每位评审取最�
   assert.deepEqual([s.part, s.source, s.reviewers, s.blocking, s.unknown], [1, '追问 1', 3, 1, 1]);
   const [r1, r2, r3] = s.rows;
   assert.deepEqual([r1.tag, r1.round, r1.lines], ['评审 1', 6, ['- 【阻断】回滚没有数据预案']]);
-  assert.deepEqual(r2.dropped, { round: 5, lines: ['- 【阻断】接口不兼容'] });
+  assert.deepEqual([r2.dropped.round, r2.dropped.lines], [5, ['- 【阻断】接口不兼容']]);
+  assert.deepEqual(r1.items.map((it) => [it.level, it.head]), [['阻断', '回滚没有数据预案']], '阻断行同时解析成条目');
   assert.equal(r3.verdict, null);
   assert.equal(blockerSummary([{ part: 0, stage: 'review' }]), null);
 });

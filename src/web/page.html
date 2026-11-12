@@ -181,6 +181,24 @@
   .blkbox { scroll-margin-top: 130px; }
   .blkbox.alert { border-color: var(--err); }
   .brow { margin-top: 8px; } .brow ul { margin: 4px 0 0; padding-left: 20px; }
+  /* 第二期：条目化发言。要点下列出条目标题，点开看改法、依据和影响 */
+  .itl { margin: 6px 0 2px; display: grid; gap: 2px; }
+  .itl .sec { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .it > summary, .it.flat { list-style: none; display: flex; gap: 6px; align-items: baseline; color: var(--ink); }
+  .it > summary, .post .it > summary { cursor: pointer; color: var(--ink); font-size: 14px; }
+  .it > summary::-webkit-details-marker { display: none; }
+  .it > summary::before, .it.flat::before { content: '▸'; color: var(--muted); font-size: 11px; width: 10px; flex: none; }
+  .it[open] > summary::before { content: '▾'; } .it.flat::before { content: ''; }
+  .lvb { font-size: 11px; font-weight: 700; padding: 0 6px; border-radius: 4px; white-space: nowrap; background: var(--line); color: var(--ink); flex: none; }
+  .lvb.bad { background: var(--del-bg); color: var(--del-ink); } .lvb.good { background: var(--ins-bg); color: var(--ins-ink); }
+  .it .ib { padding: 2px 0 6px 16px; font-size: 13px; } .it .ib > div { margin-top: 2px; } .it .ib b { color: var(--muted); font-weight: 600; margin-right: 6px; }
+  .unv { font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 4px; padding: 0 4px; margin-left: 4px; white-space: nowrap; }
+  .cp { font-size: 11px; border: 1px solid var(--line); background: none; border-radius: 4px; color: var(--muted); cursor: pointer; padding: 0 5px; margin-left: 4px; }
+  .mism { font-size: 12px; color: var(--warn); margin-top: 4px; }
+  /* 只看阻断：只留有行首阻断的发言和阻断条目，折叠的轮也展开 */
+  .only-block .post:not(.has-blocker), .only-block .divider, .only-block .grp:not(:has(.has-blocker)) { display: none; }
+  .only-block .grp.closed > .gb { display: block; } .only-block .grp.closed > .gh .caret::before { content: '▾'; }
+  .only-block .it:not(.lv-阻断), .only-block .itl .sec { display: none; }
   .banner { padding: 8px 12px; border-radius: 8px; background: var(--soft); font-size: 13px; margin-top: 14px; }
   .banner.warn { background: color-mix(in srgb, var(--warn) 15%, var(--panel)); }
   .divider { margin: 22px 0 4px; color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
@@ -628,6 +646,7 @@ function openForm() {
     tier === 'decision' || tier === 'brainstorm' ? `<label>轮数</label>
       <select id="rounds"><option value="auto">自动：评审都没有新意见就结束（最多 ${st.maxRounds || 8} 轮）</option>${[2, 3, 4, 5, 6, 8].map((n) => `<option value="${n}" ${String(f.rounds) === String(n) ? 'selected' : ''}>固定 ${n} 轮</option>`).join('')}</select>` : '',
     `<div id="lineupBox">${lineupHtml(tier)}</div>`,
+    tier !== 'brainstorm' ? `<label style="display:flex;gap:6px;align-items:baseline;font-weight:400;cursor:pointer"><input type="checkbox" id="itemsOn" ${(f.items ?? st.items) ? 'checked' : ''}>条目化发言（试跑）：评审和挑刺写成「【级别】问题 ｜改法 ｜依据 ｜影响」，写入时检查格式</label>` : '',
   ].filter(Boolean).join('');
   $('main').innerHTML = `
     <div class="head"><h2>新讨论</h2><span class="chip web">只在网页上，不发到群里</span></div>
@@ -651,6 +670,7 @@ function openForm() {
   const keep = () => {
     f.topic = $('topic').value; f.material = $('material').value; f.setting = $('setting')?.value ?? f.setting; f.repos = $('repos')?.value ?? f.repos; f.rounds = $('rounds')?.value ?? f.rounds;
     f.advOpen = document.querySelector('details.adv')?.open;
+    if ($('itemsOn')) f.items = $('itemsOn').checked;
     if ($('dataTools')) f.dataTools = $('dataTools').checked;
     if (document.querySelector('[data-know]')) f.knowledge = [...document.querySelectorAll('[data-know]:checked')].map((x) => x.dataset.know);
     if (document.querySelector('[data-memdom]')) f.memory = [...document.querySelectorAll('[data-memdom]:checked')].map((x) => x.dataset.memdom);
@@ -664,7 +684,7 @@ function openForm() {
     $('startDiscuss').disabled = true;
     try {
       const data = mode === 'decision' || tier === 'quick' ? { tools: tier !== 'quick' && Boolean(f.dataTools), knowledge: f.knowledge || [] } : undefined;
-      const body = { mode, ...(tier === 'meeting' ? { tier: 'meeting' } : {}), topic: f.topic, material: f.material, ...(tier === 'redraft' ? { setting: f.setting || '' } : {}), memory: S.status?.memory ? f.memory || [] : [], repos: mode === 'decision' ? f.repos : '', rounds: tier === 'decision' || tier === 'brainstorm' ? f.rounds : undefined, lineup: lineupPayload(tier), data };
+      const body = { mode, ...(tier === 'meeting' ? { tier: 'meeting' } : {}), topic: f.topic, material: f.material, ...(tier === 'redraft' ? { setting: f.setting || '' } : {}), memory: S.status?.memory ? f.memory || [] : [], repos: mode === 'decision' ? f.repos : '', rounds: tier === 'decision' || tier === 'brainstorm' ? f.rounds : undefined, lineup: lineupPayload(tier), data, ...(tier !== 'brainstorm' && f.items !== undefined ? { items: f.items } : {}) };
       const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify(body) });
       S.form = { tier, ...(f.memoryTouched ? { memory: f.memory, memoryTouched: true } : {}) };
       await loadRuns(); openRun(number);
@@ -786,21 +806,61 @@ function postHead(p) {
   const sub = p.tag ? String(p.subtitle || '').replace(/\s*·\s*代号\s*[^·]+$/, '') : p.subtitle;
   return `<div class="ph">${p.tag ? `<span class="tagc">${esc(p.tag)}</span>` : ''}<span class="who">${esc(p.title)}</span><span class="sub">${esc(sub)}</span></div>`;
 }
+// ---------- 条目（第二期）：后端读取时解析好的 items，这里只负责显示 ----------
+const LV_BAD = new Set(['阻断', '推翻', '错', '漏', '不采纳']);
+const LV_GOOD = new Set(['采纳', '确认', '改']);
+const CODE_COORD = /[\w.@-]+:[^\s:：，,]+:\d+(?:[-–]\d+)?(?:,\s?\d+(?:[-–]\d+)?)*/g; // 行号可以是范围或逗号分隔的几处
+function evidenceHtml(it) {
+  if (!it.evidence) return '';
+  const text = inline(it.evidence).replace(CODE_COORD, (c) => `${c}<button class="cp" data-copycoord="${esc(c)}" title="复制坐标">复制</button>`);
+  return `<div><b>依据</b>${text}${it.evidenceKind === 'guess' ? '<span class="unv">未核实</span>' : ''}</div>`;
+}
+function itemHtml(it) {
+  const lv = `<span class="lvb ${LV_BAD.has(it.level) ? 'bad' : LV_GOOD.has(it.level) ? 'good' : ''}">${esc(it.level)}${it.corrected ? '·已更正' : ''}</span>`;
+  const head = `${lv}<span>${inline(it.head)}${it.evidenceKind === 'guess' ? '<span class="unv">推断</span>' : ''}</span>`;
+  const parts = [it.fix && `<div><b>改法</b>${inline(it.fix)}</div>`, evidenceHtml(it), it.impact && `<div><b>影响</b>${inline(it.impact)}</div>`].filter(Boolean);
+  return parts.length
+    ? `<details class="it lv-${esc(it.level)}"><summary>${head}</summary><div class="ib">${parts.join('')}</div></details>`
+    : `<div class="it flat lv-${esc(it.level)}">${head}</div>`;
+}
+function itemsHtml(p) {
+  if (!p.items?.length) return '';
+  let sec = null;
+  const rows = p.items.map((it) => {
+    const label = it.section && it.section !== sec ? `<div class="sec">${esc(it.section)}</div>` : '';
+    sec = it.section;
+    return label + itemHtml(it);
+  }).join('');
+  const mism = p.itemsMismatch ? `<div class="mism">要点与条目不一致：要点说 ${p.itemsMismatch.brief} 条阻断，正文有 ${p.itemsMismatch.body} 条行首阻断（以正文为准）</div>` : '';
+  return `<div class="itl">${rows}</div>${mism}`;
+}
+function postClass(p) { return `post ${p.error ? 'error' : ''} ${p.bodyBlockers || p.blockerLines?.length ? 'has-blocker' : ''}`; }
+
 function postHtml(p) {
   const color = COLORS[p.speaker?.color] || 'var(--line)';
   const plan = p.plan ? `<details class="plan"><summary>${p.stage === 'redraft' ? '修改稿全文' : '当前完整方案'}</summary><div class="body">${md(p.plan)}</div></details>` : '';
   if (p.brief) {
     // 有要点：只露出要点，详细内容折叠（主席的汇总默认展开）
-    return `<div class="post ${p.error ? 'error' : ''}" style="--c:${color}" data-seq="${p.seq}">
+    return `<div class="${postClass(p)}" style="--c:${color}" data-seq="${p.seq}">
     ${postHead(p)}
     <div class="body brief">${md(p.brief)}</div>
+    ${itemsHtml(p)}
     ${p.body ? `<details ${p.stage === 'summary' ? 'open' : ''}><summary>详细内容</summary><div class="body">${md(p.body)}</div></details>` : ''}
+    ${plan}
+    ${p.footer ? `<div class="foot">${esc(p.footer)}</div>` : ''}</div>`;
+  }
+  // 没有要点、但解析出了条目（例如代码核实）：条目在前，原文折叠
+  if (p.items?.length && p.itemsOk) {
+    return `<div class="${postClass(p)}" style="--c:${color}" data-seq="${p.seq}">
+    ${postHead(p)}
+    ${itemsHtml(p)}
+    <details><summary>原文</summary><div class="body">${md(p.body)}</div></details>
     ${plan}
     ${p.footer ? `<div class="foot">${esc(p.footer)}</div>` : ''}</div>`;
   }
   const long = (p.body || '').length > 1400;
   const docLink = p.stage === 'doc' ? '<button class="btn" data-sub="doc" style="margin-top:6px">查看主文档</button>' : '';
-  return `<div class="post ${p.error ? 'error' : ''} ${long ? 'fold' : ''}" style="--c:${color}" data-seq="${p.seq}">
+  return `<div class="${postClass(p)} ${long ? 'fold' : ''}" style="--c:${color}" data-seq="${p.seq}">
     ${postHead(p)}
     <div class="body">${md(p.body)}</div>${docLink}
     ${long ? '<button class="more">展开全文</button>' : ''}
@@ -829,8 +889,19 @@ function groupStats(posts) {
     const done = known.filter((p) => p.verdict === 'done').length;
     if (known.length) out.push(`评审 ${done}/${crit.length} 没有意见${known.length < crit.length ? `（${crit.length - known.length} 位未识别）` : ''}`);
     const n = crit.filter((p) => p.blocked).length;
-    if (n) out.push(`<span class="bad">${n} 位提了阻断</span>`);
+    const lines = crit.reduce((k, p) => k + (p.bodyBlockers || 0), 0);
+    if (n) out.push(`<span class="bad">${n} 位提了阻断${lines ? `（${lines} 条）` : ''}</span>`);
   }
+  // 采纳 / 不采纳、被推翻的核实：相关发言全部解析成功才给数字；都没写条目（旧讨论）就不显示
+  const tally = (list, levels, fmt) => {
+    if (!list.length || !list.some((p) => p.items?.length)) return;
+    if (!list.every((p) => p.itemsOk)) { out.push(`${fmt[0]}未识别`); return; }
+    const c = levels.map((l) => list.reduce((k, p) => k + p.items.filter((it) => it.level === l).length, 0));
+    out.push(fmt[1](...c));
+  };
+  const okp = posts.filter((p) => !p.error);
+  tally(okp.filter((p) => p.stage === 'review'), ['采纳', '不采纳'], ['采纳数', (a, b) => `采纳 ${a} · 不采纳 ${b}`]);
+  tally(okp.filter((p) => p.stage === 'factcheck' || p.stage === 'factreview'), ['推翻'], ['核实结果', (x) => (x ? `<span class="bad">推翻 ${x} 处</span>` : '核实无推翻')]);
   const checks = posts.filter((p) => p.stage === 'factcheck').length;
   if (checks) out.push('含代码核实');
   if (posts.some((p) => p.stage === 'interjection')) out.push('含插话');
@@ -939,7 +1010,9 @@ function renderTools() {
   if (S.sub !== 'talk') { box.innerHTML = ''; return; }
   const blocks = blocksOf(S.run.posts).filter((b) => b.key);
   box.innerHTML = `<select id="jump" title="跳到某一轮"><option value="">跳到…</option>${blocks.map((b) => `<option value="${esc(b.id)}">${partLabel(b.part)}${esc(b.label)}</option>`).join('')}</select>
-    <button data-allgrp="1">全部展开</button><button data-allgrp="0">全部收起</button>`;
+    <button data-allgrp="1">全部展开</button><button data-allgrp="0">全部收起</button>
+    <label class="hint" style="display:inline-flex;gap:4px;align-items:center;cursor:pointer"><input type="checkbox" id="onlyBlock" ${S.onlyBlock ? 'checked' : ''}>只看阻断</label>`;
+  $('onlyBlock').onchange = (ev) => { S.onlyBlock = ev.target.checked; $('posts')?.classList.toggle('only-block', S.onlyBlock); };
   $('jump').onchange = (ev) => { if (ev.target.value) jumpTo(ev.target.value); ev.target.value = ''; };
 }
 // 点阻断数：结束后跳到结论页的阻断区块；进行中跳到最新一轮评审
@@ -994,6 +1067,23 @@ function renderProgress() {
 }
 // ---------- 结论页：一句话结论 → 要点 → 要拍板的事 → 下一步 → 风险，下面是结束状态和阻断区块 ----------
 const stripMark = (l) => String(l).replace(/^\s*(?:[-*+•]\s+|\d+[.、)）]\s*)/, '');
+// 阻断区块复制成 Markdown，转给别人看；条目拆开写改法、依据、影响
+function blockerMarkdown(b, rows, title) {
+  const r = S.run;
+  const out = [`## ${title}（#${r?.number ?? ''}${b.round ? ` 第 ${b.round} 轮` : ''}）`];
+  for (const x of rows) {
+    out.push('', `### ${x.tag || x.name} · ${x.name}`);
+    if (x.items?.length === x.lines.length) {
+      for (const it of x.items) {
+        out.push(`- 【${it.level}】${it.head}`);
+        if (it.fix) out.push(`  - 改法：${it.fix}`);
+        if (it.evidence) out.push(`  - 依据：${it.evidence}${it.evidenceKind === 'guess' ? '（未核实）' : ''}`);
+        if (it.impact) out.push(`  - 影响：${it.impact}`);
+      }
+    } else out.push(...x.lines.map((l) => `- ${stripMark(l).replace(/^\s*[-*+•]\s*/, '')}`));
+  }
+  return out.join('\n');
+}
 function blockerBoxHtml(b, o) {
   if (!b) return '';
   const title = b.beforeVerdict ? '裁决前评审仍提的阻断' : '评审最后仍提的阻断';
@@ -1001,14 +1091,19 @@ function blockerBoxHtml(b, o) {
   const rows = b.rows.filter((x) => x.blocked);
   const unknown = b.rows.filter((x) => x.verdict === null && !x.blocked);
   const dropped = b.rows.filter((x) => x.dropped);
-  const row = (x, lines, round) => `<div class="brow"><span class="tagc">${esc(x.tag || x.name)}</span> ${esc(x.name)}${round ? ` · 第 ${round} 轮` : ''}<ul>${lines.map((l) => `<li>${inline(stripMark(l))}</li>`).join('')}</ul></div>`;
+  // 条目全部解析出来时按条目显示（点开看改法、依据、影响），否则显示原文行
+  const row = (x, lines, round, items) => `<div class="brow"><span class="tagc">${esc(x.tag || x.name)}</span> ${esc(x.name)}${round ? ` · 第 ${round} 轮` : ''}${items?.length === lines.length
+    ? `<div class="itl">${items.map(itemHtml).join('')}</div>`
+    : `<ul>${lines.map((l) => `<li>${inline(stripMark(l))}</li>`).join('')}</ul>`}</div>`;
+  S.blockerMd = blockerMarkdown(b, rows, title);
   const body = rows.length
-    ? rows.map((x) => row(x, x.lines, x.round)).join('')
+    ? rows.map((x) => row(x, x.lines, x.round, x.items)).join('')
     : `<div class="hint">${unknown.length === b.reviewers ? '解析不出评审结论和行首【阻断】，未识别。' : '最近一次评审都没有提行首【阻断】。'}</div>`;
   const note = ENDING_WARN.has(o?.ending) && rows.length === 0 ? '<div class="hint" style="margin-top:6px">这场以「' + esc(ENDING_LABEL[o.ending]) + '」结束：网页只认行首的【阻断】，列出的可能比程序认定的少，以结束原因为准。</div>' : '';
-  return `<div class="card blkbox ${rows.length && !b.beforeVerdict ? 'alert' : ''}" id="blockerBox"><h3>${title}<span class="hint">${esc(from)}</span></h3>${body}
+  const copy = rows.length ? '<button class="cp" data-copyblk="1" style="margin-left:8px">复制为 Markdown</button>' : '';
+  return `<div class="card blkbox ${rows.length && !b.beforeVerdict ? 'alert' : ''}" id="blockerBox"><h3>${title}<span class="hint">${esc(from)}</span>${copy}</h3>${body}
     ${unknown.length && unknown.length < b.reviewers ? `<div class="hint" style="margin-top:6px">未识别：${unknown.map((x) => esc(x.tag || x.name)).join('、')}（没写评审结论，也没有行首【阻断】）</div>` : ''}
-    ${dropped.length ? `<details style="margin-top:8px"><summary>后来没再提（${dropped.length} 位）</summary>${dropped.map((x) => row(x, x.dropped.lines, x.dropped.round)).join('')}<div class="hint">之前提过、最近一次没再提，不代表已经解除。</div></details>` : ''}${note}</div>`;
+    ${dropped.length ? `<details style="margin-top:8px"><summary>后来没再提（${dropped.length} 位）</summary>${dropped.map((x) => row(x, x.dropped.lines, x.dropped.round, x.dropped.items)).join('')}<div class="hint">之前提过、最近一次没再提，不代表已经解除。</div></details>` : ''}${note}</div>`;
 }
 // 「存入记忆」：文档里提议的结论逐条勾选，确认后才写进记忆；已经存过的标出来
 function memoCardHtml(r, s) {
@@ -1107,7 +1202,7 @@ function renderRun() {
       <div class="statline" id="statline"></div>
       <div class="subtabs">${tabs.map(([k, l]) => `<button class="subtab ${S.sub === k ? 'on' : ''}" data-sub="${k}">${l}</button>`).join('')}<span class="tools" id="tools"></span></div>
     </div>
-    <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整${r.mode === 'quick' ? '问题' : '议题'}</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.material ? `<details><summary>材料（${r.material.length} 字）</summary><div class="pre">${esc(r.material)}</div></details>` : ''}${[r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : '', r.data?.tools ? '数据工具' : '', r.data?.knowledge?.length ? `知识：${esc(r.data.knowledge.join('、'))}` : '', r.followUps.length ? `追问 ${r.followUps.length} 次` : ''].filter(Boolean).join(' · ')}</div>
+    <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整${r.mode === 'quick' ? '问题' : '议题'}</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.material ? `<details><summary>材料（${r.material.length} 字）</summary><div class="pre">${esc(r.material)}</div></details>` : ''}${[r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : '', r.data?.tools ? '数据工具' : '', r.data?.knowledge?.length ? `知识：${esc(r.data.knowledge.join('、'))}` : '', r.followUps.length ? `追问 ${r.followUps.length} 次` : '', r.items ? '条目化发言（试跑）' : ''].filter(Boolean).join(' · ')}</div>
     <div id="pane"></div>
     <div class="progress" id="progress"><div class="bar"></div><div class="composer"></div></div>`;
   renderStat(); renderTools(); renderProgress();
@@ -1128,7 +1223,7 @@ function renderRun() {
   };
   const pane = $('pane');
   if (S.sub === 'talk') {
-    pane.innerHTML = `<div id="posts">${postsHtml(r.posts)}</div>`;
+    pane.innerHTML = `<div id="posts" class="${S.onlyBlock ? 'only-block' : ''}">${postsHtml(r.posts)}</div>`;
   } else if (S.sub === 'concl') {
     pane.innerHTML = conclHtml(r, status);
   } else if (S.sub === 'conclusion') {
@@ -1225,7 +1320,7 @@ function carryOn(tier) {
 
 // ---------- 事件 ----------
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],[data-upgrade],[data-mem],[data-memdel],[data-memsave],[data-draftview],[data-copydraft],[data-carry],.more');
+  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],[data-upgrade],[data-mem],[data-memdel],[data-memsave],[data-draftview],[data-copydraft],[data-carry],[data-copycoord],[data-copyblk],.more');
   if (!t) return;
   if (t.matches('.more')) { const post = t.closest('.post'); post.classList.remove('fold'); t.remove(); return; }
   ev.preventDefault();
@@ -1236,6 +1331,8 @@ document.addEventListener('click', (ev) => {
   if (t.dataset.draftview) { S.draftView = t.dataset.draftview; renderRun(); return; }
   if (t.dataset.copydraft) { copyText(S.draftText || '').then(() => toast('修改稿已复制')).catch(() => toast('复制失败，切到「修改稿全文」手动选中复制')); return; }
   if (t.dataset.carry) { carryOn(t.dataset.carry); return; }
+  if (t.dataset.copycoord) { copyText(t.dataset.copycoord).then(() => toast('坐标已复制')).catch(() => toast('复制失败')); return; }
+  if (t.dataset.copyblk) { copyText(S.blockerMd || '').then(() => toast('阻断已复制为 Markdown')).catch(() => toast('复制失败')); return; }
   if (t.dataset.memdel) {
     if (!confirm('删除这条记忆？之后的讨论不会再带上它。')) return;
     api('/api/memory/delete', { method: 'POST', body: JSON.stringify({ domain: S.memSel, id: t.dataset.memdel }) })

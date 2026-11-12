@@ -7,7 +7,7 @@ import {
   triagePrompt, parseTriage, stripTriageLine, followUpPrompt, parseVerdictPick, parseVerifyQuestions, finalPrompt, freshBlock, HANDLING_LABELS,
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
   docSystem, docPrompt, docUpdatePrompt, docRewritePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead, docTitle, docNoOf,
-  limitsFor, splitReply, overLimit, compressPrompt, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
+  limitsFor, splitReply, overLimit, compressPrompt, replyIssues, fixReplyPrompt, rewriteDrift, stripEvidence, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
   parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
   webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
   dataAskLine, webAlsoLine, evidenceBlock, toolCallsBlock, dataPlanPrompt, parseDataPlan, dataCheckPrompt, dataReviewPrompt,
@@ -269,22 +269,78 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /**
+   * 写入时检查（条目化开关打开时）：评审缺结论行、【阻断】缺改法或依据、主笔缺「立场变化」、超字数（依据不计）。
+   * 有任何一项不合格，合并成一次重写，只补缺项或压缩；重写后评审结论变了或行首阻断变少了，用第一次的原文。
+   * 仍不合格照常发布。每次检查都记一条 reply_check 事件，试跑时用来统计重写率。
+   */
+  run.checkReply = async (speaker, res, { stage, round, system, callOptions, session, limit, check }) => {
+    const issues = replyIssues(res.text, { limit, ...check });
+    const record = (result, extra = {}) => emit({ type: 'reply_check', speaker: speaker.id, stage, round, issues: issues.map((x) => x.kind), result, ...extra });
+    if (!issues.length) {
+      record('ok');
+      return res;
+    }
+    log(`${speaker.name} 的发言不合要求（${issues.map((x) => x.note).join('；')}），要求补全重写`);
+    let fixed;
+    try {
+      fixed = await call(speaker, {
+        stage, round, system, callOptions, session, retry: 'fix',
+        prompt: fixReplyPrompt({ issues, original: session ? null : res.text, limit }),
+      });
+    } catch (err) {
+      log(`⚠️ ${speaker.name} 补全重写失败，用原回答：${err.message}`);
+      record('rewrite-failed', { error: err.message.slice(0, 200) });
+      return res;
+    }
+    if (!fixed.text?.trim()) {
+      record('rewrite-empty');
+      return res;
+    }
+    const drift = rewriteDrift(res.text, fixed.text);
+    if (drift) {
+      log(`⚠️ ${speaker.name} 重写后${drift}，用第一次的原文`);
+      record('kept-original', { drift });
+      return res;
+    }
+    // 重写时偶尔会丢掉完整方案：那就沿用第一次写的
+    const before = splitReply(res.text).plan;
+    const after = splitReply(fixed.text).plan;
+    const text = before && !after ? `${fixed.text.trim()}\n\n${PLAN_MARKER_LINE}\n${before}` : fixed.text;
+    const left = replyIssues(text, { limit, ...check });
+    if (left.length) log(`${speaker.name} 重写后仍不合要求（${left.map((x) => x.note).join('；')}），照常发布`);
+    record(left.length ? 'still-failing' : 'rewritten', left.length ? { left: left.map((x) => x.kind) } : {});
+    return { ...fixed, text };
+  };
+
+  /** 哪些发言要做写入时检查：评审（结论行、阻断）、主笔修订（立场变化）、快问和改稿的挑刺（阻断）。 */
+  run.checkOf = (stage) => {
+    if (!cfg.items) return null;
+    if (stage === 'critique') return { verdict: Boolean(run.verdictAsked), blockers: true };
+    if (stage === 'review') return { stance: true };
+    if (stage === 'challenge') return { blockers: true };
+    return null;
+  };
+
+  /**
    * 发言：调模型，超出字数上限（limit）时让它压缩重写一次，然后发布。
    * 卡片上只露出「要点」，详细内容折叠；「【完整方案】」之后的部分不发到群里。
    */
-  run.speak = async (speaker, { stage, round, system, prompt, callOptions = {}, session, subtitle, quiet = false, limit = null, onResult }) => {
+  run.speak = async (speaker, { stage, round, system, prompt, callOptions = {}, session, subtitle, quiet = false, limit = null, check = null, onResult }) => {
     const tag = tags.get(speaker.id)?.tag;
     const noRound = ['research', 'summary', 'triage', 'rewrite', 'doc', 'doccheck', 'webplan', 'webresearch', 'webreview', 'dataplan', 'dataresearch', 'datareview'].includes(stage);
     log(`${speaker.name} · ${STAGE_LABELS[stage]}${stage === 'research' ? '（只读查看代码，通常要几分钟）' : noRound ? '' : ` 第 ${round} 轮`} …`);
     try {
       let res = await call(speaker, { stage, round, system, prompt, callOptions, session });
-      const over = limit ? overLimit(res.text, limit) : null;
+      // 条目化开着、这类发言要检查格式时：合并检查、最多重写一次（代替单纯的压缩重写）
+      const checking = cfg.items && check;
+      if (checking) res = await run.checkReply(speaker, res, { stage, round, system, callOptions, session, limit, check });
+      const over = !checking && limit ? overLimit(cfg.items ? stripEvidence(res.text) : res.text, limit) : null;
       if (over) {
         log(`${speaker.name} 超出字数上限（${over}），要求压缩重写`);
         try {
           const shorter = await call(speaker, {
             stage, round, system, callOptions, session, retry: 'compress',
-            prompt: compressPrompt({ over, original: session ? null : res.text, limit }),
+            prompt: compressPrompt({ over, original: session ? null : res.text, limit, items: cfg.items }),
           });
           if (shorter.text?.trim()) {
             // 压缩时偶尔会丢掉完整方案：那就沿用第一次写的
@@ -338,7 +394,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       const intro = session && session.turns.length ? '' : `${participantSystem(p, { mode: cfg.mode })}\n\n`;
       const fresh = run.freshFor(p, session);
       const code = run.codeFor(p, session);
-      const text = await run.speak(p, { stage, round, system: run.shared, prompt: `${intro}${fresh}${code.text}${promptFor(p)}`, session, limit: run.limitOf(stage), callOptions: code.callOptions });
+      const text = await run.speak(p, { stage, round, system: run.shared, prompt: `${intro}${fresh}${code.text}${promptFor(p)}`, session, limit: run.limitOf(stage), check: run.checkOf(stage), callOptions: code.callOptions });
       if (text != null && session) {
         session.seen = seenNow;
         session.factsSeen = factsNow;
@@ -431,7 +487,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         stage: 'factcheck',
         round,
         system: run.shared,
-        prompt: plus(factCheckPrompt({ round, questions, ...where, who: checker.name, draft: true }), evidence()),
+        prompt: plus(factCheckPrompt({ round, questions, ...where, who: checker.name, draft: true, items: cfg.items }), evidence()),
         callOptions: { ...callOptions, maxBudgetUsd: checker.maxBudgetUsd ?? research.maxBudgetUsd },
         subtitle: `第 ${round} 轮 · 代码核实初稿 · ${questions.length} 个问题 · 待调研员审查，不发给参与者`,
         onResult: keep('draft'),
@@ -441,7 +497,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           stage: 'factreview',
           round,
           system: run.shared,
-          prompt: plus(factReviewPrompt({ round, questions, draft, checker: checker.name, ...where }), evidence(), toolCallsBlock(calls.draft, checker.name)),
+          prompt: plus(factReviewPrompt({ round, questions, draft, checker: checker.name, ...where, items: cfg.items }), evidence(), toolCallsBlock(calls.draft, checker.name)),
           callOptions,
           subtitle: `第 ${round} 轮 · 核实审查定稿 · ${questions.length} 个问题`,
           onResult: keep('review'),
@@ -457,7 +513,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         stage: 'factcheck',
         round,
         system: run.shared,
-        prompt: plus(factCheckPrompt({ round, questions, ...where }), evidence()),
+        prompt: plus(factCheckPrompt({ round, questions, ...where, items: cfg.items }), evidence()),
         callOptions,
         subtitle: `第 ${round} 轮 · 代码核实 · ${questions.length} 个问题`,
         onResult: keep('review'),
@@ -606,6 +662,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 会话模式下每位评审成功收到一次后就不再重复；非会话模式每轮都要带上。
    */
   run.iterate = async ({ from, to, adaptive, scope }) => {
+    run.verdictAsked = adaptive;
     let lastRound = from - 1;
     const scoped = new Set(); // 已经在会话里收到讨论范围的评审
     const scopeFor = (p) => (scope && reviewerIds.has(p.id) && !(convo && scoped.has(p.id)) ? scope : undefined);
@@ -658,7 +715,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         const lastCritiques = rounds.find((x) => x.round === round - 1 && x.stage === 'critique')?.entries ?? [];
         const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: blockerLines(e.text) })).filter((x) => x.lines.length);
         const critiques = reviewers.length
-          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p) }))
+          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items }))
           : [];
         markScoped(critiques);
         if (adaptive && reviewers.length && !newInterjections && reviewersDone(critiques)) {
@@ -674,6 +731,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           convo,
           mode: cfg.mode,
           limits,
+          items: cfg.items,
         }));
       }
       // 「无变化」：沿用上一版完整方案；没写这个标记、发言失败或写了别的内容，都算有变化
@@ -825,7 +883,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         round,
         system: run.shared,
         // 非会话模式（或会话还没开始）没有身份和讨论记忆：带上身份和自己最后的方案
-        prompt: `${convo ? '' : `${participantSystem(p, { mode: cfg.mode })}\n\n`}${docCheckPrompt({ doc: combined(), attachments: allAttachments(), own: convo ? null : (latest.get(p.id).plan ?? latest.get(p.id).text) })}`,
+        prompt: `${convo ? '' : `${participantSystem(p, { mode: cfg.mode })}\n\n`}${docCheckPrompt({ doc: combined(), attachments: allAttachments(), own: convo ? null : (latest.get(p.id).plan ?? latest.get(p.id).text), items: cfg.items })}`,
         session: convo ? sessions.get(p.id) : null,
         quiet: true,
       }));
@@ -1146,6 +1204,8 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     topic,
     ...(material ? { material } : {}),
     ...(memory ? { memory } : {}),
+    // 条目化发言是按场开的（试跑）：追问沿用发起时的设置
+    ...(cfg.items ? { items: true } : {}),
     mode: cfg.mode,
     createdAt: createdAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -1212,6 +1272,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     rounds: cfg.rounds,
     adaptive: Boolean(cfg.adaptive),
     number: number ?? null,
+    ...(cfg.items ? { items: true } : {}),
     ...(material ? { material } : {}),
     ...(memoryOut(memory) ? { memory: memoryOut(memory) } : {}),
     ...(subject ? { subject: { type: subject.type, id: subject.id, title: subject.title } } : {}),
@@ -1390,6 +1451,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
     rounds: 1,
     adaptive: false,
     number: number ?? null,
+    ...(cfg.items ? { items: true } : {}),
     ...(material ? { material } : {}),
     ...(setting ? { setting } : {}),
     ...(memoryOut(memory) ? { memory: memoryOut(memory) } : {}),
@@ -1419,7 +1481,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
   const say = async (p, stage, task) => {
     const k = run.knowledgeFor(p);
     const session = convo ? sessions.get(p.id) : null;
-    const text = await run.speak(p, { stage, round: 1, system: run.shared, prompt: `${participantSystem(p, { mode: cfg.mode })}\n\n${task(k)}`, session, callOptions: k.callOptions });
+    const text = await run.speak(p, { stage, round: 1, system: run.shared, prompt: `${participantSystem(p, { mode: cfg.mode })}\n\n${task(k)}`, session, check: run.checkOf(stage), callOptions: k.callOptions });
     if (text != null) rounds.push({ round: 1, stage, entries: [{ id: p.id, label: tags.get(p.id).label, tag: tagOf(p), text: splitReply(text).shown }] });
     return text;
   };
@@ -1434,7 +1496,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
   latest.set(answerer.id, { id: answerer.id, label: tags.get(answerer.id).label, tag: tagOf(answerer), text: shown, ...(draft ? { plan: draft } : {}) });
 
   // ---------- 挑刺 ----------
-  const challenge = await say(critic, 'challenge', (k) => (redraft ? redraftChallengePrompt({ notes: parts.plan ? shown : '', draft }) : quickChallengePrompt({ answer: shown, knowledge: k.text, canRead: k.canRead })));
+  const challenge = await say(critic, 'challenge', (k) => (redraft ? redraftChallengePrompt({ notes: parts.plan ? shown : '', draft, items: cfg.items }) : quickChallengePrompt({ answer: shown, knowledge: k.text, canRead: k.canRead, items: cfg.items })));
   if (challenge == null) log(`⚠️ ${critic.name}挑刺失败，只按${redraft ? '修改稿' : '回答'}定稿`);
   const critique = challenge == null ? null : splitReply(challenge).shown;
 
@@ -1497,6 +1559,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
 export async function runFollowUp({ cfg, state, question, providers, publisher, interjections, log = () => {}, onEvent = () => {}, code, context: contextMode, data }) {
   if (state?.version !== STATE_VERSION) throw new Error('讨论状态的版本不对，无法追问');
   if (state.expired) throw new Error(`讨论 #${state.number} 已超过保留期，会话已清理，请重新发起讨论`);
+  if (state.items && !cfg.items) cfg = { ...cfg, items: true };
   const tags = new Map(Object.entries(state.tags));
   // 追问里的插话从头算，seen 归零
   const sessions = new Map(Object.entries(state.sessions).map(([id, s]) => [id, { ...s, turns: [...s.turns], seen: 0 }]));

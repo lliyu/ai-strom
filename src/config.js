@@ -71,6 +71,8 @@ export function normalizeConfig(raw, overrides = {}) {
     cfg.rounds = 1;
   }
   cfg.concurrency = Number(cfg.concurrency ?? 3);
+  // 条目化发言（页面第二期，试跑中）：诊断和评审类发言写成「【级别】问题 ｜改法 ｜依据 ｜影响」，写入时检查格式
+  cfg.items = cfg.items === true;
   // 会话：每位参与者整场讨论在同一条会话里，记得自己之前说过的话。false 时每轮都是新会话
   cfg.conversation = cfg.conversation !== false;
   // 追问时参与者接着原会话（resume），还是各开一条新会话、由程序拼出讨论现状（fresh）

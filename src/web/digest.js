@@ -1,4 +1,4 @@
-import { isBlockerLine, parseVerdict } from '../modes.js';
+import { isBlockerLine, parseVerdict, parseItems, parseItemLine } from '../modes.js';
 
 /**
  * 网页读取时派生的结构化信息：发言分组、评审结论与阻断、主文档切段、阻断区块。
@@ -65,6 +65,12 @@ export function critiqueDigest({ brief, body, error }) {
   return { verdict, blockerLines, blocked: verdict !== 'done' && blockerLines.length > 0 };
 }
 
+/** 阻断行逐行解析成条目；有一行解析不出就整组返回空（页面退回显示原文行）。 */
+function itemsOfLines(lines) {
+  const items = lines.map(parseItemLine);
+  return items.every(Boolean) ? items : [];
+}
+
 /**
  * 阻断区块：统计最后一次含评审发言的运行（part），每位评审取这次运行里最近一次评审发言（失败卡片不算）。
  * posts 已带 critiqueDigest 的字段。laterVerdict：这次运行之后还有按裁决定稿的追问。
@@ -91,8 +97,9 @@ export function blockerSummary(posts, { laterVerdict = false } = {}) {
       verdict: last.verdict,
       blocked: last.blocked,
       lines: last.blocked ? last.blockerLines : [],
+      items: last.blocked ? itemsOfLines(last.blockerLines) : [],
       // 以前提过、最近一次没再提的：不写「已解除」，没有证据表明阻断真的解除了
-      dropped: !last.blocked && earlier ? { round: earlier.round ?? null, lines: earlier.blockerLines } : null,
+      dropped: !last.blocked && earlier ? { round: earlier.round ?? null, lines: earlier.blockerLines, items: itemsOfLines(earlier.blockerLines) } : null,
     };
   });
   const lastRound = Math.max(...mine.map((p) => p.round ?? 0));
@@ -106,6 +113,44 @@ export function blockerSummary(posts, { laterVerdict = false } = {}) {
     rows: reviewers,
     beforeVerdict: Boolean(laterVerdict),
   };
+}
+
+// ---------- 条目（第二期）：读取时解析，不落盘 ----------
+
+/** 要写条目的阶段：评审、修订、快问和改稿的挑刺、代码核实、核对主文档。 */
+const ITEM_STAGES = new Set(['critique', 'review', 'challenge', 'factcheck', 'factreview', 'doccheck']);
+const CN_NUM = { 零: 0, 一: 1, 两: 2, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+
+/** 要点里说了几条阻断：「1 条阻断」「阻断 2 条」各处相加；只说「没有阻断」为 0；没提到返回 null。 */
+export function briefBlockerCount(brief) {
+  const t = String(brief ?? '').replace(/[【】\[\]*]/g, '');
+  const nums = [...t.matchAll(/(\d+|[零一两二三四五六七八九十])\s*(?:条|个|处)\s*阻断|阻断\s*(?:问题)?\s*(\d+|[零一两二三四五六七八九十])\s*(?:条|个|处)/g)]
+    .map((m) => m[1] ?? m[2]).map((x) => (/^\d+$/.test(x) ? Number(x) : CN_NUM[x]));
+  if (nums.length) return nums.reduce((a, b) => a + b, 0);
+  return /(没有|无|不再有|没)\s*(?:新的?|任何)?\s*阻断/.test(t) ? 0 : null;
+}
+
+/**
+ * 一条发言的条目字段：items（正文里的条目，要点不算）、bodyBlockers（正文里的行首阻断行数，不依赖条目解析）、
+ * itemsOk（这条发言算不算解析成功：有条目，或者明说了没有问题 / 没有变化）、itemsMismatch（要点里说的阻断数和正文对不上）。
+ * 不是要写条目的阶段、或失败卡片，返回空对象。
+ */
+export function itemDigest({ stage, brief, body, error }) {
+  if (error || !ITEM_STAGES.has(stage)) return {};
+  const text = String(body ?? '');
+  const items = parseItems(text);
+  let fence = false;
+  const bodyBlockers = text.split('\n').filter((l) => {
+    if (/^\s*(```|~~~)/.test(l)) fence = !fence;
+    return !fence && isBlockerLine(l);
+  }).length;
+  const none = /无新问题|无变化|没有问题|没有实质问题/.test(`${brief ?? ''}\n${text}`);
+  const out = { items, bodyBlockers, itemsOk: items.length > 0 || none };
+  if (stage === 'critique' || stage === 'challenge') {
+    const said = briefBlockerCount(brief);
+    if (said !== null && items.length && said !== bodyBlockers) out.itemsMismatch = { brief: said, body: bodyBlockers };
+  }
+  return out;
 }
 
 // ---------- 主文档切段 ----------

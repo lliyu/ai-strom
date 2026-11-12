@@ -45,6 +45,8 @@ export function createMockProvider(spec = {}) {
       if (stage === '核对主文档') return { text: '没有问题', model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 4 } };
       if (stage === '改稿') return { text: `**要点**：改了开头（mock）\n\n- 开头更快进入冲突\n\n【完整方案】\n${mockRedraft(`${system ?? ''}\n${prompt ?? ''}`)}`, model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
       if (stage.includes('主文档') || stage === '快问定稿' || stage === '改稿定稿') return { text: mockDoc(stage, prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
+      const itemized = mockItems(stage, prompt ?? '');
+      if (itemized) return { text: itemized, model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 30 } };
       return {
         text: `**${who}** 的${stage}（mock）\n\n- 要点一\n- 要点二\n\n提示词长度 ${prompt?.length ?? 0} 字。`,
         model: model ?? 'mock',
@@ -53,6 +55,43 @@ export function createMockProvider(spec = {}) {
       };
     },
   };
+}
+
+/**
+ * 条目化发言开着时（提示词里有条目格式）：评审、修订、挑刺、代码核实按条目写。
+ * 评审第 2 轮提一条阻断并要求继续，之后只剩建议、没有意见了，mock 讨论两三轮就收敛。
+ */
+function mockItems(stage, prompt) {
+  if (!/｜改法：… ｜依据：…|｜依据：仓库别名|【改】原来… → 现在…/.test(prompt)) return null;
+  const round = Number(/第 (\d+) 轮/.exec(stage)?.[1] ?? 0);
+  const verdict = /评审结论：继续讨论/.test(prompt);
+  if (stage.includes('评审意见')) {
+    const blocking = round <= 2;
+    return [
+      blocking ? '**要点**：方案 A 还有 1 条阻断，预算会超扣（mock）' : '**要点**：没有阻断了，只剩一条建议（mock）',
+      '**方案 A**',
+      blocking ? '- 【阻断】并发扣减时预算会超扣（mock） ｜改法：扣减时加行锁 ｜依据：推断 ｜影响：活动亏钱' : '',
+      '- 【建议】补一个超扣告警（mock） ｜改法：扣减后比对余额',
+      verdict ? `评审结论：${blocking ? '继续讨论' : '没有意见了'}` : '',
+    ].filter(Boolean).join('\n');
+  }
+  if (stage.includes('互评与修订')) {
+    return [
+      '**要点**：采纳阻断，扣减改成加锁（mock）',
+      '**改了什么**',
+      '- 【改】不加锁 → 扣减时加行锁 ｜依据：推断',
+      /对评审意见的回应/.test(prompt) ? '**对评审意见的回应**\n- 【采纳】评审 1 的「并发扣减时预算会超扣」 ｜改法：扣减时加行锁' : '',
+      '**立场变化**：小幅，加了锁（mock）',
+      '',
+      '【完整方案】',
+      'mock 完整方案：扣减时加行锁。',
+    ].filter((l) => l !== '').join('\n');
+  }
+  if (stage === '挑刺') {
+    return ['**要点**：有一个要紧的前提没说（mock）', '**问题**', '- 【阻断】回答默认了预算充足（mock） ｜改法：先问清预算 ｜依据：推断 ｜影响：建议可能做不到'].join('\n');
+  }
+  if (stage.includes('核实')) return '1. 【确认】mock 核实的结论 ｜依据：mock:src/a.js:1';
+  return null;
 }
 
 /** mock 的主文档：初稿或更新后的完整版本，版本号从提示词里取。 */
