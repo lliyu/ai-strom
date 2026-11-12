@@ -113,7 +113,7 @@ export function blockerSummary(posts, { laterVerdict = false } = {}) {
 /** 各模式主文档的段：key -> 认这一段的标题规则；required 缺任何一个就不切，显示全文。 */
 const DOC_SECTIONS = {
   decision: {
-    sections: { points: /^要点/, decisions: /拍板/, next: /^下一步/, risks: /^风险/ },
+    sections: { points: /^要点/, decisions: /拍板/, next: /^下一步/, risks: /^风险/, memo: /知识库/ },
     required: ['points', 'decisions', 'next'],
   },
   brainstorm: {

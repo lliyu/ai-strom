@@ -247,12 +247,13 @@ export function interjectionBlock(items) {
  * 所有参与者和主席共用的系统提示词：整场讨论里内容不变，放在最前面方便命中缓存。
  * 这里不写任何发言者的身份，身份和本轮任务在消息正文开头。
  */
-export function sharedSystem({ mode, topic, context, subject, dataContext, material }) {
+export function sharedSystem({ mode, topic, context, subject, dataContext, material, memory }) {
   if (mode === 'quick') {
     return join(
       '这是一次快问：一位 AI 先回答下面的问题，另一位 AI 挑刺，最后由回答的一方定稿成一份短文档给提问人。过程只在提问人的网页上显示，不发到群里。你的身份、规则和本次任务写在用户消息开头，以那里为准。',
       topicBlock(topic, mode),
       materialBlock(material),
+      memory,
     );
   }
   if (mode === 'refine') {
@@ -266,6 +267,7 @@ export function sharedSystem({ mode, topic, context, subject, dataContext, mater
     `这是一场多 AI ${mode === 'brainstorm' ? '脑洞风暴' : '方案讨论'}，过程会发到团队群里。你的身份、规则和本轮任务写在用户消息开头，以那里为准。`,
     topicBlock(topic, mode),
     materialBlock(material),
+    memory,
     contextBlock(context),
     dataContextBlock(dataContext),
   );
@@ -1083,6 +1085,7 @@ const DOC_OUTLINE = {
     '## 考虑过但没采用的做法（每个一两句：是什么、为什么不选）',
     '## 风险与未核实的前提（按影响从大到小排，只写会改变结论或让方案做不成的）',
     '## 下一步（按先后顺序，只写接下来最近要做的几步；拍板项已经在上面，不要再列一遍）',
+    '## 可存入知识库的结论（最多 5 条以后的讨论会反复用到的结论或事实，每条一句完整的话，不含只对这次有效的细节，也不要和记忆里已有的重复；没有就写「无」。人确认后才会存）',
   ],
   brainstorm: [
     '# 标题（题目是什么）',
@@ -1102,7 +1105,7 @@ const DOC_OUTLINE = {
     '## 你可能没考虑到的（挑刺里成立的盲点、风险、反例和更简单的做法，按重要程度排序，每条写清会怎样；没有就写「无」）',
     '## 需要你补充的（回答依赖、但问题里没给的信息，每条写清补上之后结论可能怎样变；没有就写「无」）',
     '## 下一步（提问人接下来最该做的几件事，按先后顺序）',
-    '## 可存入知识库的结论（最多 3 条以后会反复用到的结论，每条一句完整的话，不含只对这次有效的细节；没有就写「无」）',
+    '## 可存入知识库的结论（最多 3 条以后会反复用到的结论，每条一句完整的话，不含只对这次有效的细节，也不要和记忆里已有的重复；没有就写「无」。提问人确认后才会存）',
   ],
   refine: [
     '# 标题（打磨的是哪一份、改成什么样）',

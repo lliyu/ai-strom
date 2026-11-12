@@ -219,7 +219,10 @@
   <main><div class="wrap" id="main"><div class="welcome">左边「讨论」里是群里和网页上的全部讨论；「脑洞 / 梗概 / 总纲」里挑一项可以做作品打磨。</div></div></main>
 </div>
 <script>
-const TABS = [['runs', '讨论'], ['idea', '脑洞'], ['premise', '梗概'], ['outline', '总纲']];
+const TABS = [['runs', '讨论'], ['memory', '记忆'], ['idea', '脑洞'], ['premise', '梗概'], ['outline', '总纲']];
+const MEM_LABEL = { work: '工作', personal: '个人', novel: '小说' };
+// 各档位默认带的记忆域：只带一个，不跨域；个人域从不默认勾选（个人内容会发给所选模型的服务）
+const memDefault = (tier) => (tier === 'brainstorm' ? ['novel'] : ['work']);
 const TYPE_LABEL = { idea: '脑洞', premise: '梗概', outline: '总纲' };
 const MODE_LABEL = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨', quick: '快问' };
 const MODE_SHORT = { decision: '方案', brainstorm: '脑洞', refine: '打磨', quick: '快问' };
@@ -379,6 +382,12 @@ function renderList() {
       <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span> <span class="chip">${r.tier === 'meeting' ? '小会' : MODE_SHORT[r.mode] || r.mode}</span> <span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.followUps ? ` 追问 ${r.followUps} 次` : ''}${r.hasRevision ? ' · 有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.mock ? ' · mock' : ''}</div>
       ${r.requirement ? `<div class="p">要求：${esc(r.requirement)}</div>` : ''}</div>`).join('');
     if (!rows.length) html = `<div class="empty">${S.q.trim() || S.filter.mode || S.filter.days || S.filter.archived ? '没有符合条件的讨论' : '还没有讨论'}</div>`;
+  } else if (S.tab === 'memory') {
+    const ds = S.memory?.domains || [];
+    html = ds.map((d) => `<div class="item ${S.memSel === d.id ? 'on' : ''}" data-mem="${d.id}">
+      <div class="t">${esc(d.label)}</div>
+      <div class="m">${d.profile ? `档案 ${d.profile.length} 字` : '还没有档案'} · 结论 ${d.entries.length} 条</div></div>`).join('');
+    if (!ds.length) html = `<div class="empty">${S.memory && !S.memory.dir ? '没有配置记忆目录（config.json 的 memory.path）' : '读取中…'}</div>`;
   } else {
     const rows = S.items.filter((i) => i.type === S.tab && match(i.title, i.preview, i.project, i.meta));
     html = rows.map((i) => `<div class="item ${S.sel?.type === i.type && S.sel?.id === i.id ? 'on' : ''}" data-type="${i.type}" data-id="${esc(i.id)}">
@@ -389,6 +398,24 @@ function renderList() {
   }
   $('list').innerHTML = html;
 }
+// ---------- 记忆：各域的档案和已确认的结论，能查看和删除 ----------
+async function loadMemory() {
+  try { S.memory = await api('/api/memory'); } catch (e) { toast(e.message); }
+  if (S.tab === 'memory') renderList();
+}
+function openMemory(id) {
+  closeStream(); S.run = null; S.sel = null; S.memSel = id; renderList();
+  const d = (S.memory?.domains || []).find((x) => x.id === id);
+  if (!d) return;
+  const entries = [...d.entries].reverse();
+  $('main').innerHTML = `
+    <div class="head"><h2>记忆 · ${esc(d.label)}</h2><span class="chip">档案 ${d.profile.length} 字</span><span class="chip">结论 ${d.entries.length} 条</span></div>
+    <div class="meta">目录：${esc(d.path || '')}。发起讨论时勾选这个域，档案和最近的结论会限长放进所有模型的提示词${id === 'personal' ? '；个人内容会发给所选模型所在的服务' : ''}。</div>
+    <div class="card"><h3>档案<span class="hint">profile.md，自己写：身份、偏好、长期约束……ai-storm 只读</span></h3>${d.profile ? md(d.profile) : `<div class="hint">还没有。在 ${esc(d.path || '')}/profile.md 写一份就行，Markdown 格式。</div>`}</div>
+    <div class="card"><h3>已确认的结论<span class="hint">conclusions.md，在讨论的结论页勾选后追加；新的在前</span></h3>
+      ${entries.length ? entries.map((e) => `<div class="brow" style="display:flex;gap:10px;align-items:baseline"><div style="flex:1">${inline(e.text)} <span class="hint">${e.source === '手工' ? '手工' : `<a href="#" data-run="${e.source.slice(1)}">${esc(e.source)}</a>`} · ${esc(e.at)}</span></div><button class="btn" data-memdel="${e.id}" style="font-size:12px;padding:1px 10px">删除</button></div>`).join('') : '<div class="hint">还没有。讨论或快问结束后，在结论页的「存入记忆」里勾选。</div>'}</div>`;
+}
+
 async function loadItems() {
   try { S.items = (await api('/api/novel/items')).items; S.itemsError = null; } catch (e) { S.items = []; S.itemsError = e.message; }
   renderList();
@@ -588,6 +615,7 @@ function openForm() {
       <textarea id="topic" placeholder="${tier === 'brainstorm' ? '例如：给一款面向独居老人的智能音箱想功能' : tier === 'quick' ? '例如：周末两个人去杭州还是苏州？预算两千' : '例如：订单服务要不要从单库拆成按用户分库？目前日订单 50 万……'}">${esc(f.topic || '')}</textarea>
       <label>材料（可选）<span class="hint" id="matCount" style="font-weight:400;margin-left:8px"></span></label>
       <textarea id="material" style="min-height:80px" placeholder="贴上相关的原文：章节、日志、文档片段、之前的结论……最多 ${max} 字，不占${what}的字数。">${esc(f.material || '')}</textarea>
+      ${memoryPickHtml(tier, f)}
       <details class="adv" style="margin-top:12px" ${f.advOpen ? 'open' : ''}><summary>高级选项${tier === 'quick' ? '：知识来源、阵容' : mode === 'decision' ? '：仓库、数据与知识、阵容' : '：轮数、阵容'}</summary>${adv}</details>
       <div class="row"><button class="btn primary" id="startDiscuss">开始</button></div>
     </div>`;
@@ -599,7 +627,9 @@ function openForm() {
     f.advOpen = document.querySelector('details.adv')?.open;
     if ($('dataTools')) f.dataTools = $('dataTools').checked;
     if (document.querySelector('[data-know]')) f.knowledge = [...document.querySelectorAll('[data-know]:checked')].map((x) => x.dataset.know);
+    if (document.querySelector('[data-memdom]')) f.memory = [...document.querySelectorAll('[data-memdom]:checked')].map((x) => x.dataset.memdom);
   };
+  document.querySelectorAll('[data-memdom]').forEach((x) => { x.onchange = () => { f.memoryTouched = true; keep(); $('memHint').innerHTML = memoryHint(f.memory); }; });
   $('modeSeg').onclick = (ev) => { const b = ev.target.closest('[data-tier]'); if (!b) return; keep(); f.tier = b.dataset.tier; openForm(); };
   $('startDiscuss').onclick = async () => {
     keep();
@@ -608,12 +638,28 @@ function openForm() {
     $('startDiscuss').disabled = true;
     try {
       const data = mode === 'decision' || tier === 'quick' ? { tools: tier !== 'quick' && Boolean(f.dataTools), knowledge: f.knowledge || [] } : undefined;
-      const body = { mode, ...(tier === 'meeting' ? { tier: 'meeting' } : {}), topic: f.topic, material: f.material, repos: mode === 'decision' ? f.repos : '', rounds: tier === 'decision' || tier === 'brainstorm' ? f.rounds : undefined, lineup: lineupPayload(tier), data };
+      const body = { mode, ...(tier === 'meeting' ? { tier: 'meeting' } : {}), topic: f.topic, material: f.material, memory: S.status?.memory ? f.memory || [] : [], repos: mode === 'decision' ? f.repos : '', rounds: tier === 'decision' || tier === 'brainstorm' ? f.rounds : undefined, lineup: lineupPayload(tier), data };
       const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify(body) });
-      S.form = { tier };
+      S.form = { tier, ...(f.memoryTouched ? { memory: f.memory, memoryTouched: true } : {}) };
       await loadRuns(); openRun(number);
     } catch (e) { toast(e.message, 6000); $('startDiscuss').disabled = false; }
   };
+}
+
+/** 新建页的记忆勾选：默认只带一个域（快问、方案讨论带工作，脑洞带小说），个人域要自己勾。 */
+function memoryPickHtml(tier, f) {
+  const ms = S.status?.memory;
+  if (!ms) return '';
+  if (!f.memoryTouched) f.memory = memDefault(tier);
+  return `<label>记忆</label>
+    <div class="row" style="margin-top:4px">${ms.map((m) => `<span class="pick" title="${m.profileChars || m.entries ? `档案 ${m.profileChars} 字，结论 ${m.entries} 条` : '还没有内容'}"><input type="checkbox" data-memdom="${m.id}" ${f.memory.includes(m.id) ? 'checked' : ''}> ${esc(m.label)}${m.profileChars || m.entries ? `（${m.entries} 条）` : '（空）'}</span>`).join('')}</div>
+    <div class="hint" id="memHint" style="margin-top:4px">${memoryHint(f.memory)}</div>`;
+}
+function memoryHint(sel = []) {
+  const parts = ['档案和最近的结论限长放进所有模型的提示词，开场卡片会列出来。'];
+  if (sel.length > 1) parts.push('选了多个域，会一起带上。');
+  if (sel.includes('personal')) parts.push('<span class="err">个人记忆会发给所选模型所在的服务。</span>');
+  return parts.join('');
 }
 
 /** 方案讨论：数据工具和知识来源的勾选。默认能用的都勾上（主席判断要不要查，不需要时不会多花钱）。 */
@@ -938,6 +984,36 @@ function blockerBoxHtml(b, o) {
     ${unknown.length && unknown.length < b.reviewers ? `<div class="hint" style="margin-top:6px">未识别：${unknown.map((x) => esc(x.tag || x.name)).join('、')}（没写评审结论，也没有行首【阻断】）</div>` : ''}
     ${dropped.length ? `<details style="margin-top:8px"><summary>后来没再提（${dropped.length} 位）</summary>${dropped.map((x) => row(x, x.dropped.lines, x.dropped.round)).join('')}<div class="hint">之前提过、最近一次没再提，不代表已经解除。</div></details>` : ''}${note}</div>`;
 }
+// 「存入记忆」：文档里提议的结论逐条勾选，确认后才写进记忆；已经存过的标出来
+function memoCardHtml(r, s) {
+  const items = s.memoItems || [];
+  if (!items.length) return '';
+  S.memoItems = items;
+  const ms = S.status?.memory;
+  const saved = new Map((r.memorySaved || []).map((x) => [x.text, x.domain]));
+  const who = r.mode === 'quick' ? '回答的一方' : '主席';
+  const rows = items.map((t, i) => (saved.has(t)
+    ? `<div class="brow">✓ ${inline(t)} <span class="hint">已存入「${esc(MEM_LABEL[saved.get(t)] || saved.get(t))}」</span></div>`
+    : `<div class="brow"><label style="display:flex;gap:8px;align-items:baseline;cursor:pointer">${ms ? `<input type="checkbox" data-memitem="${i}" checked>` : '•'}<span>${inline(t)}</span></label></div>`)).join('');
+  const left = items.filter((t) => !saved.has(t)).length;
+  const def = r.memory?.domains?.[0]?.id || (r.mode === 'brainstorm' ? 'novel' : 'work');
+  const bar = !ms ? '<div class="hint" style="margin-top:6px">没有配置记忆目录，不能存（config.json 的 memory.path）。</div>'
+    : left ? `<div class="row">存进 <select id="memDomain">${ms.map((m) => `<option value="${m.id}" ${m.id === def ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select><button class="btn primary" data-memsave="${r.number}">存入记忆</button><span class="hint">之后发起讨论时勾选这个域就会带上；在左边「记忆」里能查看和删除。</span></div>` : '';
+  return `<div class="card" id="memoBox"><h3>存入记忆<span class="hint">${who}提议的、以后可能反复用到的结论；你勾选确认后才会存</span></h3>${rows}${bar}</div>`;
+}
+async function saveMemo(btn) {
+  const number = Number(btn.dataset.memsave);
+  const items = [...document.querySelectorAll('[data-memitem]:checked')].map((x) => S.memoItems[Number(x.dataset.memitem)]).filter(Boolean);
+  if (!items.length) { toast('先勾选要存的结论'); return; }
+  const domain = $('memDomain').value;
+  btn.disabled = true;
+  try {
+    const res = await api('/api/memory/save', { method: 'POST', body: JSON.stringify({ number, domain, items }) });
+    toast(`存入「${MEM_LABEL[domain]}」${res.saved.length} 条${res.skipped.length ? `，${res.skipped.length} 条已经有了` : ''}`);
+    await refreshRun(number); loadStatus(); loadMemory();
+  } catch (e) { toast(e.message); btn.disabled = false; }
+}
+
 function conclHtml(r, status) {
   const live = status === 'running' || status === 'queued';
   const secs = r.docSections || [];
@@ -963,7 +1039,7 @@ function conclHtml(r, status) {
     const QUICK_TITLE = { answer: '回答', blind: '你可能没考虑到的', need: '需要你补充的', next: '下一步', memo: '可存入知识库的结论' };
     return `${head}
       ${s.oneLiner ? `<div class="card oneliner">${md(s.oneLiner)}</div>` : ''}
-      ${(s.order || []).map((k) => sec(s[k], QUICK_TITLE[k])).join('')}
+      ${(s.order || []).map((k) => (k === 'memo' ? memoCardHtml(r, s) : sec(s[k], QUICK_TITLE[k]))).join('')}
       <div class="row"><button class="btn primary" data-upgrade="1" title="把问题和这份结果带进新建页，按方案讨论或小会再讨论一次">升级为讨论</button><button class="btn" data-sub="doc">看全文（第 ${s.version} 版）</button>
         <span class="hint">${r.expired ? '已超过保留期，不能再追问，可以升级为讨论。' : '在下面追问补充信息，回答的一方会直接回答并更新这份文档。'}</span></div>`;
   }
@@ -971,7 +1047,7 @@ function conclHtml(r, status) {
   const decisions = d ? `<div class="card"><h3>${esc(d.title)}</h3>${d.lead ? md(d.lead) : ''}${d.parts.map((p) => `<div class="dsub ${p.pick ? 'pick' : ''}"><h4>${esc(p.title)}</h4>${md(p.text)}</div>`).join('')}</div>` : '';
   return `${head}
     ${s.oneLiner ? `<div class="card oneliner">${md(s.oneLiner)}</div>` : ''}
-    ${sec(s.points, '要点')}${decisions}${sec(s.next, '下一步')}${sec(s.risks)}
+    ${sec(s.points, '要点')}${decisions}${sec(s.next, '下一步')}${sec(s.risks)}${memoCardHtml(r, s)}
     ${tail}`;
 }
 
@@ -1081,14 +1157,15 @@ function upgradeQuick() {
   const max = S.status?.materialMax || 30000;
   let material = [r.material ? `## 原来的材料\n${r.material}` : '', `## 快问 #${r.number} 的结果${doc ? `（第 ${doc.version} 版）` : ''}\n${doc?.text || r.summary || ''}`].filter(Boolean).join('\n\n');
   if (material.length > max) material = `${material.slice(0, max - 20)}\n（超出上限，已截断）`;
-  S.form = { tier: 'meeting', topic: r.topic, material, advOpen: false };
+  const mem = (r.memory?.domains || []).map((d) => d.id);
+  S.form = { tier: 'meeting', topic: r.topic, material, advOpen: false, ...(mem.length ? { memory: mem, memoryTouched: true } : {}) };
   openForm();
   toast('已把问题和快问结果带进来，确认档位后点「开始」');
 }
 
 // ---------- 事件 ----------
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],[data-upgrade],.more');
+  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],[data-upgrade],[data-mem],[data-memdel],[data-memsave],.more');
   if (!t) return;
   if (t.matches('.more')) { const post = t.closest('.post'); post.classList.remove('fold'); t.remove(); return; }
   ev.preventDefault();
@@ -1096,7 +1173,15 @@ document.addEventListener('click', (ev) => {
   if (t.dataset.allgrp) { for (const b of blocksOf(S.run.posts).filter((x) => x.key)) setOpen(b.id, t.dataset.allgrp === '1'); return; }
   if (t.dataset.blkjump) { blockerJump(); return; }
   if (t.dataset.upgrade) { upgradeQuick(); return; }
-  if (t.dataset.tab) { S.tab = t.dataset.tab; renderTabs(); renderList(); if (S.tab === 'runs') loadRuns(); }
+  if (t.dataset.memdel) {
+    if (!confirm('删除这条记忆？之后的讨论不会再带上它。')) return;
+    api('/api/memory/delete', { method: 'POST', body: JSON.stringify({ domain: S.memSel, id: t.dataset.memdel }) })
+      .then(async () => { toast('已删除'); await loadMemory(); openMemory(S.memSel); loadStatus(); }).catch((e) => toast(e.message));
+    return;
+  }
+  if (t.dataset.memsave) { saveMemo(t); return; }
+  if (t.dataset.mem) { openMemory(t.dataset.mem); return; }
+  if (t.dataset.tab) { S.tab = t.dataset.tab; renderTabs(); renderList(); if (S.tab === 'runs') loadRuns(); if (S.tab === 'memory') loadMemory(); }
   else if (t.dataset.run) openRun(Number(t.dataset.run));
   else if (t.dataset.type) openItem(t.dataset.type, t.dataset.id);
   else if (t.dataset.sub) { hideNewMsg(); S.sub = t.dataset.sub; renderRun(); }
@@ -1130,7 +1215,7 @@ document.addEventListener('keydown', (ev) => {
   setSide(!document.body.classList.contains('side-off'));
 });
 renderTabs();
-loadStatus().then(() => Promise.all([loadItems(), loadRuns()]));
+loadStatus().then(() => Promise.all([loadItems(), loadRuns(), loadMemory()]));
 setInterval(loadStatus, 10000);
 setInterval(loadRuns, 10000);
 </script>

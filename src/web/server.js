@@ -7,6 +7,7 @@ import { lineupConfig, modelPool, roleTemplates, defaultLineup, tierLineup, MAX_
 import { nextNumber, saveState, removeSessionFiles } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX } from '../modes.js';
 import { groupKeys, critiqueDigest, blockerSummary, docSections } from './digest.js';
+import { listMemory, appendEntries, deleteEntry, isDomain, memoCandidates, ENTRY_MAX_CHARS } from '../memory.js';
 import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
 import { claudeSessionFile, DEFAULT_CLAUDE_CWD } from '../providers/claude-cli.js';
 import { parseRepoSpecs, resolveRepos, availableRepos } from '../repos.js';
@@ -179,7 +180,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
         degraded.add(key);
         log(`网页：#${run.number} 第 ${d.version} 版主文档未能提取结论（缺：${s.missing.join('、') || '大纲'}），结论页显示全文`);
       }
-      return { docNo: d.docNo ?? 1, version: d.version, ...s };
+      return { docNo: d.docNo ?? 1, version: d.version, ...s, ...(s.memo ? { memoItems: memoCandidates(s.memo.text) } : {}) };
     });
   }
 
@@ -281,6 +282,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       topic: state?.topic ?? start?.topic ?? row.topic ?? '',
       tier: row.info?.tier ?? null,
       material: state?.material ?? start?.material ?? null,
+      // 这场带了哪些记忆；这场已经存进记忆的结论（结论页标「已存入」）
+      memory: state?.memory ?? start?.memory ?? null,
+      memorySaved: savedFrom(number),
       subject: subject && subject.fields ? { type: subject.type, id: subject.id, title: subject.title, current: subject.current, background: subject.background, fields: subject.fields, version: subject.version } : subject,
       summary: state?.summary ?? null,
       conclusion: lastDiscuss?.answer ?? state?.summary ?? null,
@@ -307,6 +311,36 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       blockers: blockersOf(run, posts),
       docSections: sectionsOf(run, mode),
     };
+  }
+
+  // ---------- 记忆 ----------
+
+  const memoryDir = () => cfg.memory?.path ?? null;
+  /** 这场讨论存进记忆的结论：[{ domain, text }]。 */
+  function savedFrom(number) {
+    if (!memoryDir()) return [];
+    return listMemory(memoryDir()).flatMap((d) => d.entries.filter((e) => e.source === `#${number}`).map((e) => ({ domain: d.id, text: e.text })));
+  }
+  /** 新建页和记忆页用：各域的档案字数、结论条数（status 里只给概况，/api/memory 给全文）。 */
+  function memoryOverview() {
+    return listMemory(memoryDir()).map((d) => ({ id: d.id, label: d.label, path: d.path, profileChars: d.profile.length, entries: d.entries.length }));
+  }
+  /** 人在结论页勾选后存进记忆：只有这里会写记忆文件。 */
+  function saveMemory({ number, domain, items }) {
+    if (!memoryDir()) throw httpError(409, '记忆目录没有配置（config.json 的 memory.path）');
+    if (!isDomain(domain)) throw httpError(400, 'domain 只能是 work、personal 或 novel');
+    if (!Array.isArray(items) || !items.length || items.some((t) => typeof t !== 'string')) throw httpError(400, 'items 需要是非空的文字列表');
+    if (items.length > 10) throw httpError(400, '一次最多存 10 条');
+    if (number !== undefined && number !== null && !store.discussion(number)) throw httpError(404, `没有 #${number} 这场讨论`);
+    const out = appendEntries(memoryDir(), domain, items.map((t) => t.slice(0, ENTRY_MAX_CHARS * 2)), { source: number ? `#${number}` : undefined });
+    log(`网页：记忆「${domain}」存入 ${out.saved.length} 条${out.skipped.length ? `，${out.skipped.length} 条已经有了` : ''}${number ? `（来自 #${number}）` : ''}`);
+    return out;
+  }
+  function removeMemory({ domain, id }) {
+    if (!memoryDir()) throw httpError(409, '记忆目录没有配置');
+    if (!deleteEntry(memoryDir(), domain, String(id ?? ''))) throw httpError(404, '没有这条记忆');
+    log(`网页：记忆「${domain}」删掉一条`);
+    return { ok: true };
   }
 
   /** 下载主文档的某一版：Markdown，正文后面接附录。 */
@@ -336,7 +370,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       if (job.kind === 'refine') {
         await runner.runPrepared(job.cfg ?? cfgFor('refine'), { ...common, lark: false, topic: job.topic, number: job.number, subject: job.subject });
       } else if (job.kind === 'discuss') {
-        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, material: job.material, number: job.number, repos: job.repos, data: job.data });
+        await runner.runOne(job.cfg ?? cfgFor(job.mode, job.rounds), { ...common, lark: false, topic: job.topic, material: job.material, memory: job.memory, number: job.number, repos: job.repos, data: job.data });
       } else {
         // 群里的讨论在网页上追问：照样发到群里（dry-run 的讨论打印到终端）
         await runner.followUpOne(cfgFor(job.mode), { ...common, lark: job.lark, dryRun: job.dryRun, question: job.question, number: job.number, context: job.context });
@@ -425,13 +459,16 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
    * 网页上发起：快问（quick）、方案讨论（decision，tier 为 meeting 时是小会）、脑洞风暴（brainstorm）。
    * material 是「材料」框里的内容，单独限长，不占议题的字数上限。
    */
-  function startDiscussion({ mode, tier, topic, material, repos, rounds, lineup, data }) {
+  function startDiscussion({ mode, tier, topic, material, memory, repos, rounds, lineup, data }) {
     if (!['decision', 'brainstorm', 'quick'].includes(mode)) throw httpError(400, 'mode 只能是 quick、decision 或 brainstorm');
     if (tier !== undefined && tier !== null && tier !== '' && !(tier === 'meeting' && mode === 'decision')) throw httpError(400, 'tier 只能是 meeting（方案讨论的小会）');
     const meeting = tier === 'meeting';
     const text = String(topic ?? '').trim();
     if (!text) throw httpError(400, `${mode === 'brainstorm' ? '题目' : mode === 'quick' ? '问题' : '议题'}不能为空`);
     const mat = String(material ?? '').trim();
+    // 记忆：按域勾选（work / personal / novel）
+    const mem = Array.isArray(memory) ? [...new Set(memory.map(String))] : [];
+    if (mem.some((d) => !isDomain(d))) throw httpError(400, 'memory 只能是 work、personal、novel 的组合');
     if (mat.length > MATERIAL_MAX) throw httpError(400, `材料最多 ${MATERIAL_MAX} 字，现在 ${mat.length} 字`);
     let r;
     if (mode === 'quick' || meeting) r = mode === 'quick' ? undefined : 'auto';
@@ -457,7 +494,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     }
     const picked = dataSelection(mode, data);
     const number = nextNumber(store, { mode, topic: text.slice(0, 8000), channel: 'web', ...(meeting ? { info: { tier: 'meeting' } } : {}) });
-    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), material: mat || undefined, repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
+    enqueue({ kind: 'discuss', number, mode, topic: text.slice(0, 8000), material: mat || undefined, memory: mem.length ? mem : undefined, repos: repoSpecs, rounds: r, cfg: jobCfg, data: picked });
     log(`网页：#${number} ${meeting ? '小会' : MODE_LABELS[mode]}排队`);
     return { number };
   }
@@ -545,6 +582,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       // 新建页的档位：快问、小会的默认阵容（从方案讨论的默认阵容里挑），材料框的上限
       tiers: { quick: tierLineup(cfg, 'quick'), meeting: tierLineup(cfg, 'meeting'), meetingMaxRounds: MEETING_MAX_ROUNDS },
       materialMax: MATERIAL_MAX,
+      memory: memoryDir() ? memoryOverview() : null,
       // 自选阵容：可选的模型、角色模板、各模式的默认阵容
       models: modelPool(cfg).map((m) => ({ id: m.id, name: m.name, provider: m.provider, model: m.model ?? null, color: m.color ?? 'grey', readsCode: readsCode(cfg, m) })),
       roleTemplates: roleTemplates(cfg),
@@ -566,6 +604,9 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       return res.end(fs.readFileSync(PAGE));
     }
     if (req.method === 'GET' && url.pathname === '/api/status') return json(res, status());
+    if (req.method === 'GET' && url.pathname === '/api/memory') return json(res, { dir: memoryDir(), domains: listMemory(memoryDir()) });
+    if (req.method === 'POST' && url.pathname === '/api/memory/save') return json(res, saveMemory(await body(req)));
+    if (req.method === 'POST' && url.pathname === '/api/memory/delete') return json(res, removeMemory(await body(req)));
     if (req.method === 'GET' && url.pathname === '/api/novel/items') return json(res, { items: await novel.list() });
     if (req.method === 'GET' && url.pathname === '/api/novel/item') return json(res, await novel.get(url.searchParams.get('type'), url.searchParams.get('id')));
     if (req.method === 'GET' && url.pathname === '/api/runs') {

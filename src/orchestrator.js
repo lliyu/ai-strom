@@ -1134,12 +1134,13 @@ function codeSpecOf(code) {
   return { auto: Boolean(code.auto), repos: code.auto ? [] : code.repos.map((r) => ({ name: r.alias, ...(r.ref ? { ref: r.ref } : {}) })) };
 }
 
-function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [], interjections = [], data, dataContext, material }) {
+function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [], interjections = [], data, dataContext, material, memory }) {
   return {
     version: STATE_VERSION,
     number: number ?? null,
     topic,
     ...(material ? { material } : {}),
+    ...(memory ? { memory } : {}),
     mode: cfg.mode,
     createdAt: createdAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -1186,8 +1187,8 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
  * @param {object} [opts.code]       prepareRepos 的结果：有值时先由调研员读代码，整理背景资料给所有人
  * @param {number} [opts.number]     讨论编号，显示在卡片上，追问时用
  */
-export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data, material }) {
-  if (cfg.mode === 'quick') return runQuick({ cfg, topic, providers, publisher, log, rng, onEvent, number, data, material });
+export async function runDiscussion({ cfg, topic, providers, publisher, interjections, log = () => {}, rng = Math.random, onEvent = () => {}, code, number, subject, data, material, memory }) {
+  if (cfg.mode === 'quick') return runQuick({ cfg, topic, providers, publisher, log, rng, onEvent, number, data, material, memory });
   if (cfg.mode === 'refine' && !subject) throw new Error('打磨模式需要打磨对象（subject）');
   const tags = assignTags(cfg.participants, rng);
   const sessions = new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
@@ -1207,6 +1208,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     adaptive: Boolean(cfg.adaptive),
     number: number ?? null,
     ...(material ? { material } : {}),
+    ...(memoryOut(memory) ? { memory: memoryOut(memory) } : {}),
     ...(subject ? { subject: { type: subject.type, id: subject.id, title: subject.title } } : {}),
     participants: participants.map(brief),
     chair: { ...brief(cfg.chair), part: 'chair' },
@@ -1237,6 +1239,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
       refine ? `**打磨对象**：${subjectName}` : `**${cfg.mode === 'brainstorm' ? '题目' : '议题'}**`,
       refine ? `**作者的要求**：${topic.trim() || '（没有额外要求）'}` : topic.trim(),
       material ? `\n**材料**：${material.length} 字，所有参与者都能看到（网页上「完整议题」旁边可以展开）。` : null,
+      memoryLine(memory),
       '',
       `**流程**：${flowText}。`,
       reviewers.length ? `**主笔**：${who(leads)}\n**评审**：${who(reviewers)}（只提意见，不出方案）` : null,
@@ -1283,7 +1286,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const dataContext = dataOn ? await run.dataResearch({ topic }) : null;
 
   // 议题和背景资料整场不变，所有人共用同一份系统提示词，后面的调用都能命中缓存
-  run.shared = sharedSystem({ mode: cfg.mode, topic, context, subject, dataContext, material });
+  run.shared = sharedSystem({ mode: cfg.mode, topic, context, subject, dataContext, material, memory: memory?.block });
   // 调研员确认涉及代码后，讨论中才能查代码、核实事实；本场无代码时可以联网核实
   if (context && !context.web) run.code = code;
   run.web = webEnabled;
@@ -1342,16 +1345,24 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc,
     docs,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !docs.length, budget: run.budget, blockers, interjections: heard, data: run.data?.selection, dataContext, material }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !docs.length, budget: run.budget, blockers, interjections: heard, data: run.data?.selection, dataContext, material, memory: memoryOut(memory) }),
   };
 }
+
+/** 开场卡片里的一行：这次带了哪些记忆（域、档案字数、结论条数）。 */
+function memoryLine(memory) {
+  if (!memory?.domains?.length) return null;
+  return `**记忆**：${memory.domains.map((d) => `${d.label}（${[d.profileChars ? `档案 ${d.profileChars} 字` : '', d.entries ? `结论 ${d.entries} 条` : '', d.omitted ? `另有 ${d.omitted} 条放不下` : ''].filter(Boolean).join('，')}）`).join('、')}，所有参与者都能看到。`;
+}
+/** 存进讨论状态和运行事件的记忆摘要（不存正文：正文已经在共用的系统提示词里）。 */
+const memoryOut = (memory) => (memory?.domains?.length ? { domains: memory.domains } : null);
 
 /**
  * 快问：一位回答（主笔）→ 一位挑刺（评审）→ 回答的一方吸收挑刺、按快问大纲定稿成短文档，共 3 次调用。
  * 不反问、不核实、不查代码；网页上选了知识来源时，索引写进提示词，能读本机文件的模型（claude-cli）可以打开正文。
  * 产出和方案讨论一样存成主文档的版本和讨论状态，结束原因记为「直接回答」：结论页、追问、升级为讨论共用一条管线。
  */
-export async function runQuick({ cfg, topic, providers, publisher, log = () => {}, rng = Math.random, onEvent = () => {}, number, data, material }) {
+export async function runQuick({ cfg, topic, providers, publisher, log = () => {}, rng = Math.random, onEvent = () => {}, number, data, material, memory }) {
   const tags = assignTags(cfg.participants, rng);
   const sessions = new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
   const latest = new Map();
@@ -1372,6 +1383,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
     adaptive: false,
     number: number ?? null,
     ...(material ? { material } : {}),
+    ...(memoryOut(memory) ? { memory: memoryOut(memory) } : {}),
     participants: participants.map(brief),
     chair: { ...brief(cfg.chair), part: 'chair' },
     ...(run.data ? { data: { tools: 0, knowledge: sources } } : {}),
@@ -1386,12 +1398,13 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
       material ? `\n**材料**：${material.length} 字` : null,
       '',
       `**流程**：${answerer.name}先回答，${critic.name}挑刺，最后由${answerer.name}定稿成一份短文档（回答、你可能没考虑到的、需要你补充的、下一步），共 3 次模型调用。不会停下来反问：缺的信息写在结果里，用追问补充。`,
+      memoryLine(memory),
       sources.length ? `**知识来源**：${sources.join('、')}（索引写进提示词；${participants.filter((p) => run.readsFiles(p)).map((p) => p.name).join('、') || '没有模型'}能打开正文）` : null,
       `**内容去向**：问题和材料会发给这两位模型所在的服务（${[...new Set(participants.map((p) => p.provider))].join('、')}），不发到群里。`,
     ].filter((l) => l !== null).join('\n'),
   });
 
-  run.shared = sharedSystem({ mode: 'quick', topic, material });
+  run.shared = sharedSystem({ mode: 'quick', topic, material, memory: memory?.block });
   const say = async (p, stage, task) => {
     const k = run.knowledgeFor(p);
     const session = convo ? sessions.get(p.id) : null;
@@ -1440,7 +1453,7 @@ export async function runQuick({ cfg, topic, providers, publisher, log = () => {
     context: null,
     doc,
     docs,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context: null, code: null, facts: [], sessions, latest, rounds, lastRound: 1, summary, docs, ending, docFailed: !docs.length, budget: run.budget, blockers: [], interjections: [], data: run.data?.selection, material }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context: null, code: null, facts: [], sessions, latest, rounds, lastRound: 1, summary, docs, ending, docFailed: !docs.length, budget: run.budget, blockers: [], interjections: [], data: run.data?.selection, material, memory: memoryOut(memory) }),
   };
 }
 

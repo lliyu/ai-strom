@@ -145,6 +145,13 @@ export function normalizeConfig(raw, overrides = {}) {
     const expanded = dbPath.startsWith('~/') ? path.join(os.homedir(), dbPath.slice(2)) : dbPath;
     cfg.db = { ...(cfg.db ?? {}), path: expanded === ':memory:' || path.isAbsolute(expanded) ? expanded : path.join(ROOT, expanded) };
   }
+  // 记忆目录：memory.path，或环境变量 AI_STORM_MEMORY，默认 local/memory（不进仓库）；跑测试时默认不用，免得写进本机的记忆
+  const memPath = cfg.memory?.path ?? process.env.AI_STORM_MEMORY ?? (process.env.NODE_TEST_CONTEXT ? null : 'local/memory');
+  if (memPath !== null && (typeof memPath !== 'string' || !memPath)) errors.push('memory.path 需要是目录路径');
+  else {
+    const expanded = memPath && memPath.startsWith('~/') ? path.join(os.homedir(), memPath.slice(2)) : memPath;
+    cfg.memory = { ...(cfg.memory ?? {}), path: expanded ? (path.isAbsolute(expanded) ? expanded : path.join(ROOT, expanded)) : null };
+  }
   if (!['127.0.0.1', 'localhost', '::1'].includes(cfg.web.host)) errors.push('web.host 只能是本机地址（127.0.0.1 / localhost / ::1），页面没有登录');
 
   const ij = cfg.lark.interjection;
