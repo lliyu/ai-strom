@@ -952,18 +952,56 @@ function noCodeBlock(noCode) {
 const VERDICT_RULES = [
   '这次主文档要让人能直接裁决：',
   '- 「要点」里写清讨论怎么结束的、有几条待裁决的分歧，列出最多 5 条分歧的标题。',
-  '- 「分歧与需要拍板的问题」逐条写待裁决项：引用阻断原文（见「阻断原文存档」），写双方的理由和证据、你倾向哪一边和为什么、可选项和各自的代价。',
+  '- 「分歧与需要拍板的问题」逐条写待裁决项：引用阻断原文（见「阻断原文存档」：标「仍在阻断」的是待裁决项；标「格式未识别」的由你看原文判断是不是真的阻断；标「没有意见了」或「未再提」的不算待裁决），写双方的理由和证据、你倾向哪一边和为什么、可选项和各自的代价。',
   '- 被代码核实结果否定、评审却仍然坚持的阻断，不算待裁决：单独写一节「已核实不成立」，写明是哪次核实、核实结论是什么。这一判断由你做，拿不准就仍然列为待裁决。',
   '- 没有核实过的前提写进「风险与未核实的前提」。',
   '- 「方案」写你推荐的方案，开头标明「推荐方案（未经评审）」：评审没有看过这个组合，每处注明取自哪种做法（用内容命名，不用代号），涉及代码事实的地方引用核实结果。',
 ].join('\n');
 
-/** 阻断原文存档：每位评审最近一次提出阻断的那一轮，原文。 */
+/**
+ * 行首阻断行（网页和阻断存档共用）：几段文字里满足 isBlockerLine 的行，同一行只算一次（去掉列表符号和加粗后比较），保留原文。
+ */
+export function lineStartBlockers(...texts) {
+  const seen = new Set();
+  const out = [];
+  for (const text of texts) {
+    for (const raw of String(text ?? '').split('\n')) {
+      if (!isBlockerLine(raw)) continue;
+      const line = raw.trim();
+      const norm = line.replace(/^(?:[-*+•]\s+|\d+[.、)）]\s*)/u, '').replace(/\*\*/g, '').trim();
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      out.push(line);
+    }
+  }
+  return out;
+}
+
+/** 阻断存档里还算待裁决的：仍在阻断（open）和格式未识别（unknown）。旧状态没有 status 时看 clearedAt。 */
+export const isPendingBlocker = (b) => (b.status ? b.status === 'open' || b.status === 'unknown' : !b.clearedAt);
+
+/** 存档条目的状态说明，主席、卡片、兜底清单共用。 */
+export function blockerStatusText(b) {
+  if (b.status === 'unknown') return `第 ${b.round} 轮；格式未识别：评审结论不是「${VERDICT_DONE}」，但【阻断】不在行首，可能是否定句、引用或格式不规范的阻断，请自行判断`;
+  if (b.status === 'done') return `第 ${b.round} 轮；第 ${b.statusRound} 轮评审结论：${VERDICT_DONE}`;
+  if (b.status === 'dropped' || (!b.status && b.clearedAt)) return `第 ${b.round} 轮；第 ${b.clearedAt} 轮起未再提阻断`;
+  return `第 ${b.round} 轮；仍在阻断`;
+}
+
+/** 一条存档的正文：原文行；未识别的另附更早一次写在行首的阻断。 */
+export function blockerEntryText(b, bullet = (l) => l) {
+  return [
+    ...b.lines.map(bullet),
+    ...(b.prev ? [`更早第 ${b.prev.round} 轮写在行首的阻断：`, ...b.prev.lines.map(bullet)] : []),
+  ].join('\n');
+}
+
+/** 阻断原文存档：状态按每位评审最后一次发言的评审结论，原文取最近一次写在行首的【阻断】。 */
 export function blockersBlock(blockers = []) {
   if (!blockers.length) return '';
   return [
-    '## 阻断原文存档（每位评审最近一次提出【阻断】的那一轮，原文照录）',
-    ...blockers.map((b) => `### ${b.tag}（第 ${b.round} 轮${b.clearedAt ? `；第 ${b.clearedAt} 轮起已不再提阻断` : ''}）\n${b.lines.join('\n')}`),
+    '## 阻断原文存档（每位评审的状态按他最后一次发言的评审结论；原文取最近一次写在行首的【阻断】，照录）',
+    ...blockers.map((b) => `### ${b.tag}（${blockerStatusText(b)}）\n${blockerEntryText(b)}`),
   ].join('\n');
 }
 

@@ -1,4 +1,4 @@
-import { isBlockerLine, parseVerdict, parseItems, parseItemLine } from '../modes.js';
+import { isBlockerLine, parseVerdict, parseItems, parseItemLine, lineStartBlockers } from '../modes.js';
 
 /**
  * 网页读取时派生的结构化信息：发言分组、评审结论与阻断、主文档切段、阻断区块。
@@ -37,22 +37,8 @@ export function groupKeys(posts) {
 
 // ---------- 评审结论与阻断 ----------
 
-/** 要点和正文里的行首阻断行，同一行只算一次（去掉列表符号和加粗后比较），保留原文。 */
-export function blockerLinesOf(...texts) {
-  const seen = new Set();
-  const out = [];
-  for (const text of texts) {
-    for (const raw of String(text ?? '').split('\n')) {
-      if (!isBlockerLine(raw)) continue;
-      const line = raw.trim();
-      const norm = line.replace(/^(?:[-*+•]\s+|\d+[.、)）]\s*)/u, '').replace(/\*\*/g, '').trim();
-      if (seen.has(norm)) continue;
-      seen.add(norm);
-      out.push(line);
-    }
-  }
-  return out;
-}
+/** 要点和正文里的行首阻断行，同一行只算一次，保留原文（和阻断存档共用 modes.js 的 lineStartBlockers）。 */
+export const blockerLinesOf = lineStartBlockers;
 
 /**
  * 一条评审发言的派生字段：verdict（done / continue / null 未识别）、blockerLines、blocked。

@@ -8,6 +8,7 @@ import {
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
   docSystem, docPrompt, docUpdatePrompt, docRewritePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead, docTitle, docNoOf,
   limitsFor, splitReply, overLimit, compressPrompt, replyIssues, fixReplyPrompt, rewriteDrift, stripEvidence, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
+  lineStartBlockers, isPendingBlocker, blockerStatusText, blockerEntryText,
   parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
   webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
   dataAskLine, webAlsoLine, evidenceBlock, toolCallsBlock, dataPlanPrompt, parseDataPlan, dataCheckPrompt, dataReviewPrompt,
@@ -1069,22 +1070,21 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /**
-   * 阻断原文存档：每位评审最近一次提出【阻断】的那一轮的阻断原文。之后的轮次里这位评审不再提阻断时，记下从哪一轮起。
-   * 交给主席写主文档、判断追问，也存进讨论状态。
+   * 阻断原文存档：交给主席写主文档、判断追问，熔断或到上限时发待裁决卡片，也存进讨论状态。
+   * 状态只看这位评审最后一次发言的评审结论；原文取最近一次写在行首、且那一轮结论不是「没有意见了」的【阻断】
+   * （行首规则和网页共用，「本轮没有【阻断】」这类否定句不会再顶掉真实阻断）：
+   *   open     结论不是「没有意见了」，最后一次发言有行首阻断：仍在阻断，待裁决
+   *   unknown  结论不是「没有意见了」，有【阻断】但不在行首：格式未识别，照录最后一次的原文，待裁决（熔断用的是任意位置的【阻断】，卡片要能解释熔断）
+   *   done     最后一次写了「没有意见了」：之前的阻断照录，标明这次结论，不算待裁决
+   *   dropped  最后一次一个【阻断】都没写（没写结论、或写了继续却没有阻断）：之前的阻断照录，标明从哪一轮起未再提
+   * done / dropped 照旧写 clearedAt（阻断那一轮之后第一次发言的轮次），兼容旧的读取方。没有提过阻断的评审不进存档。
    */
-  run.blockerArchive = () => reviewers.map((p) => {
-    const mine = rounds.filter((x) => (x.stage === 'critique' || x.stage === 'feedback') && x.entries.some((e) => e.id === p.id))
-      .map((x) => ({ round: x.round, text: x.entries.find((e) => e.id === p.id).text }));
-    const last = [...mine].reverse().find((x) => blockerLines(x.text).length);
-    if (!last) return null;
-    const later = mine.find((x) => x.round > last.round);
-    return { id: p.id, tag: tagOf(p), round: last.round, lines: blockerLines(last.text), ...(later ? { clearedAt: later.round } : {}) };
-  }).filter(Boolean);
+  run.blockerArchive = () => blockerArchiveOf(rounds, reviewers.map((p) => ({ id: p.id, tag: tagOf(p) })));
 
   /** 熔断或到上限时，另发一张阻断存档卡片；正常收敛时不发（主文档里已经写了）。 */
   run.postBlockers = async (ending) => {
     if (!['deadlock', 'dissent', 'max'].includes(ending?.reason)) return;
-    const archive = run.blockerArchive().filter((b) => !b.clearedAt);
+    const archive = run.blockerArchive().filter(isPendingBlocker);
     if (!archive.length) return;
     await publisher.post({
       speaker: cfg.chair,
@@ -1101,7 +1101,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    */
   run.postDocFallback = async ({ round, ending, number }) => {
     const finals = [...latest.values()].sort(byTag);
-    const blockers = run.blockerArchive().map((b) => `**${b.tag}**（第 ${b.round} 轮${b.clearedAt ? `；第 ${b.clearedAt} 轮起不再提阻断` : ''}）\n${b.lines.map((l) => `- ${l.replace(/^[-*]\s*/, '')}`).join('\n')}`);
+    const blockers = run.blockerArchive().map((b) => `**${b.tag}**（${blockerStatusText(b)}）\n${blockerEntryText(b, (l) => (/^更早第/.test(l) ? l : `- ${l.replace(/^[-*]\s*/, '')}`))}`);
     const pending = run.pendingQuestions();
     const checked = run.facts.reduce((n, f) => n + f.questions.length, 0);
     const chair = cfg.chair.name;
@@ -2009,9 +2009,36 @@ function contextOut(context) {
   return { auto: Boolean(context.auto), repos: context.repos.map(describeRepo), text: context.text };
 }
 
-/** 发言里带【阻断】的那几行，原文照抄（最多 10 行，每行最多 300 字）。 */
+/** 阻断原文存档（规则见 run.blockerArchive 上的说明）。rounds：讨论记录；reviewers：[{ id, tag }]。 */
+export function blockerArchiveOf(rounds, reviewers) {
+  return reviewers.map((p) => {
+    const mine = rounds.filter((x) => (x.stage === 'critique' || x.stage === 'feedback') && x.entries.some((e) => e.id === p.id))
+      .map((x) => {
+        const text = x.entries.find((e) => e.id === p.id).text;
+        return { round: x.round, text, verdict: parseVerdict(text), lines: capLines(lineStartBlockers(text)) };
+      });
+    const last = mine.at(-1);
+    if (!last) return null;
+    const base = { id: p.id, tag: p.tag };
+    const found = [...mine].reverse().find((x) => x.verdict !== 'done' && x.lines.length);
+    const cleared = (from) => mine.find((x) => x.round > from.round)?.round;
+    if (last.verdict !== 'done') {
+      if (found === last) return { ...base, round: last.round, lines: last.lines, status: 'open' };
+      if (hasBlocker(last.text)) {
+        return { ...base, round: last.round, lines: blockerLines(last.text), status: 'unknown', ...(found ? { prev: { round: found.round, lines: found.lines } } : {}) };
+      }
+      return found ? { ...base, round: found.round, lines: found.lines, status: 'dropped', clearedAt: cleared(found) } : null;
+    }
+    return found ? { ...base, round: found.round, lines: found.lines, status: 'done', statusRound: last.round, clearedAt: cleared(found) } : null;
+  }).filter(Boolean);
+}
+
+/** 存档的行数和长度限制：最多 10 行，每行最多 300 字。 */
+const capLines = (lines) => lines.slice(0, 10).map((l) => (l.length > 300 ? `${l.slice(0, 300)}…` : l));
+
+/** 发言里带【阻断】的那几行（不管在不在行首），原文照抄。评审互见和格式未识别的存档用。 */
 export function blockerLines(text) {
-  return String(text ?? '').split('\n').map((l) => l.trim()).filter((l) => hasBlocker(l)).slice(0, 10).map((l) => (l.length > 300 ? `${l.slice(0, 300)}…` : l));
+  return capLines(String(text ?? '').split('\n').map((l) => l.trim()).filter((l) => hasBlocker(l)));
 }
 
 /** 超时、HTTP 5xx、连接中断这类临时故障：重试一次。 */
