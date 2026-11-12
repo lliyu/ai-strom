@@ -266,7 +266,7 @@ const CHANNEL_LABEL = { lark: '群里', web: '网页', 'dry-run': 'dry-run' };
 const HANDLING_LABEL = { answer: '直接回答', discuss: '重新讨论', verdict: '按裁决定稿', verify: '核实' };
 const STATUS_LABEL = { queued: '排队中', running: '进行中', done: '已结束', failed: '失败', idle: '已结束' };
 // 结束原因：主讨论五种、追问专用三种，加上旧版追问记的 followup；只有僵局、分歧、到上限用警示色
-const ENDING_LABEL = { converged: '评审都没有新意见（收敛）', max: '到轮数上限，评审仍有意见', fixed: '按固定轮数结束', deadlock: '僵局：主笔不改、评审仍有阻断', dissent: '评审之间有分歧', answered: '直接回答', verdict: '按裁决定稿', verified: '核实了事实', followup: '追问后重新讨论结束' };
+const ENDING_LABEL = { converged: '评审都没有新意见（收敛）', max: '到轮数上限，评审仍有意见', fixed: '按固定轮数结束', deadlock: '僵局：主笔不改、评审仍有阻断', dissent: '评审之间有分歧', dropped: '评审或主笔全部掉线', answered: '直接回答', verdict: '按裁决定稿', verified: '核实了事实', followup: '追问后重新讨论结束' };
 const ENDING_WARN = new Set(['deadlock', 'dissent', 'max']);
 const COLORS = { blue: '#3370ff', wathet: '#4bb3f5', turquoise: '#14c0b0', green: '#34a853', yellow: '#e6b800', orange: '#f08a24', red: '#e5484d', carmine: '#c2185b', violet: '#8e5cf7', purple: '#7b3fbf', indigo: '#4f5bd5', grey: '#8f959e' };
 const FIELD_LABELS = {
@@ -987,7 +987,7 @@ function endingHtml(o, mode) {
   if (!o?.ending) return '';
   // 快问本身也记为「直接回答」：没有追问时写成「快问已定稿」
   const label = (mode === 'quick' || mode === 'redraft') && o.ending === 'answered' && !o.handling ? `${mode === 'redraft' ? '改稿' : '快问'}已定稿` : ENDING_LABEL[o.ending] || o.ending;
-  const round = o.round && ['converged', 'max', 'fixed', 'deadlock', 'dissent'].includes(o.ending) ? `第 ${o.round} 轮 · ` : '';
+  const round = o.round && ['converged', 'max', 'fixed', 'deadlock', 'dissent', 'dropped'].includes(o.ending) ? `第 ${o.round} 轮 · ` : '';
   const via = o.handling === 'discuss' && o.ending !== 'followup' ? '追问后重新讨论 · ' : '';
   return `<span class="${ENDING_WARN.has(o.ending) ? 'warn' : ''}">结束：${via}${round}${esc(label)}</span>`;
 }

@@ -1189,6 +1189,14 @@ export function blockersBlock(blockers = []) {
 /** 告诉主席讨论是怎么结束的。 */
 function endingBlock(ending) {
   if (!ending) return '';
+  const block = endingBlockBase(ending);
+  if (!block || !ending.dropped?.length || ending.reason === 'dropped') return block;
+  const [head, ...rest] = block.split('\n\n');
+  return [`${head}\n${ending.dropped.join('、')} 中途连续调用失败掉线，后面的轮次没有参与；它掉线前提的意见仍在讨论记录里，写结论时说明这一点。`, ...rest].join('\n\n');
+}
+
+function endingBlockBase(ending) {
+  if (ending.reason === 'dropped') return `## 讨论如何结束\n第 ${ending.round} 轮之后${ending.part === 'lead' ? '主笔' : '评审'}全部掉线（${(ending.dropped ?? []).join('、')} 连续调用失败），讨论没法继续，被提前结束。${ending.part === 'lead' ? '方案停在各主笔最后一版。' : '最后几轮的方案没有经过评审。'}\n\n${VERDICT_RULES}`;
   if (ending.reason === 'converged') return `## 讨论如何结束\n第 ${ending.round} 轮${ending.byReviewers ? '所有评审都表示没有新意见' : '所有主笔的立场都不再变化'}，讨论提前结束。`;
   if (ending.reason === 'max') return `## 讨论如何结束\n已经达到上限 ${ending.round} 轮，${ending.byReviewers ? '评审仍有意见' : '主笔的立场仍在变化'}，讨论被强制结束。\n\n${VERDICT_RULES}`;
   if (ending.reason === 'deadlock') return `## 讨论如何结束\n主笔连续两轮都没有改方案（第 ${ending.round - 1}、${ending.round} 轮），评审仍有阻断：双方各自坚持，讨论以分歧结束，交给人裁决。\n\n${VERDICT_RULES}`;

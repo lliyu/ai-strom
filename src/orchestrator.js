@@ -26,6 +26,8 @@ const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 export const MIN_RATIO_CHARS = 2000;
 const PLAN_MARKER_LINE = PLAN_MARKER;
 export const STATE_VERSION = 1;
+/** 参与者连续几轮调用失败就算掉线（每轮已经重试过一次）。 */
+export const DROP_AFTER = 2;
 
 /** 参与者分工：lead（主笔，出方案并多轮修订）或 reviewer（评审，只给主笔的方案提意见）。 */
 export const partOf = (p) => (p.part === 'reviewer' ? 'reviewer' : 'lead');
@@ -711,7 +713,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     const verdict = parseVerdict(e.text);
     return verdict === 'done' || (graded && verdict === 'continue' && !hasBlocker(e.text));
   };
-  const reviewersDone = (entries) => reviewers.length > 0 && reviewers.every((p) => reviewerDone(p, entries));
+  const reviewersDone = (entries, list = reviewers) => list.length > 0 && list.every((p) => reviewerDone(p, entries));
 
   /**
    * 第 from 到 to 轮：方案讨论是「评审提意见 → 主笔互评修订」，脑洞是「盲审 → 修订」。
@@ -737,11 +739,47 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     const breakers = adaptive && graded && reviewers.length > 0;
     let stuck = loop?.stuck ?? 0; // 连续几轮：主笔全部「无变化」，评审仍有阻断
     const lone = new Map(Object.entries(loop?.lone ?? {})); // 评审 id -> 连续几轮独自坚持阻断（其他评审都没有意见）
+    // 掉线：连续 DROP_AFTER 轮调用失败（每轮已经重试过一次）的参与者，后面不再请它发言，也不再等它的结论。
+    // 不然一位评审一直失败，「评审都没有意见」永远凑不齐，讨论会一直跑到轮数上限。
+    const failStreak = new Map(Object.entries(loop?.failStreak ?? {}));
+    const dropped = new Set(loop?.dropped ?? []);
+    const droppedNames = () => participants.filter((p) => dropped.has(p.id)).map((p) => p.name);
+    const tally = async (list, entries, round) => {
+      const lost = [];
+      for (const p of list) {
+        const n = entries.some((e) => e.id === p.id) ? 0 : (failStreak.get(p.id) ?? 0) + 1;
+        failStreak.set(p.id, n);
+        if (n >= DROP_AFTER && !dropped.has(p.id)) {
+          dropped.add(p.id);
+          lost.push(p);
+        }
+      }
+      for (const p of lost) {
+        const as = reviewerIds.has(p.id) ? '评审' : '主笔';
+        log(`⚠️ ${p.name} 连续 ${DROP_AFTER} 轮调用失败，后面不再请它发言${as === '评审' ? '，也不再等它的评审结论' : '，沿用它最后一版方案'}`);
+        emit({ type: 'participant_dropped', speaker: p.id, round, part: reviewerIds.has(p.id) ? 'reviewer' : 'lead', streak: DROP_AFTER });
+        await publisher.post({
+          speaker: cfg.chair,
+          title: `${p.name} 掉线`,
+          subtitle: `第 ${round} 轮 · ${as}`,
+          body: `${p.name} 连续 ${DROP_AFTER} 轮调用失败（每轮都重试过），后面的轮次不再请它发言。${as === '评审' ? '讨论是否结束改为只看其余评审的结论。' : '它的方案沿用最后一版，评审仍会看到。'}`,
+          meta: { stage: 'dropped', round },
+        });
+      }
+    };
 
     for (let round = from; round <= to; round += 1) {
       await run.pullInterjections();
       lastRound = round;
-      const activeLeads = leads.filter((p) => latest.has(p.id));
+      const activeLeads = leads.filter((p) => latest.has(p.id) && !dropped.has(p.id));
+      const activeReviewers = reviewers.filter((p) => !dropped.has(p.id));
+      // 评审或主笔全部掉线：讨论没法再往下走，带着现有方案结束
+      if ((reviewers.length && !activeReviewers.length) || !activeLeads.length) {
+        lastRound = round - 1;
+        ending = { reason: 'dropped', round: round - 1, byReviewers: reviewers.length > 0, part: activeLeads.length ? 'reviewer' : 'lead' };
+        log(`${activeLeads.length ? '评审' : '主笔'}全部掉线，讨论在第 ${round - 1} 轮结束`);
+        break;
+      }
       // 新的插话或新的代码核实结果都要主笔先回应，这一轮不提前结束
       const newFacts = await run.factCheck(round);
       const newInterjections = heard.length > answered || newFacts;
@@ -749,10 +787,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
 
       if (cfg.mode === 'brainstorm') {
         // 盲审：主笔评其他主笔的脑洞，评审评所有主笔的脑洞；只给意见
-        const givers = [...activeLeads, ...reviewers];
+        const givers = [...activeLeads, ...activeReviewers];
         const fb = await run.runStage(givers, round, 'feedback', (p) => feedbackPrompt({ round, others: run.latestOthers(p), interjections: run.ijFor(p), askVerdict: adaptive && reviewerIds.has(p.id), convo, scope: scopeFor(p) }));
         markScoped(fb);
-        if (adaptive && reviewers.length && !newInterjections && reviewersDone(fb)) {
+        await tally(givers, fb, round);
+        if (adaptive && activeReviewers.length && !newInterjections && reviewersDone(fb, activeReviewers.filter((p) => !dropped.has(p.id)))) {
           converge(round);
           break;
         }
@@ -774,11 +813,12 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         // 评审互见只认行首【阻断】：「本轮没有【阻断】」这类否定句不再转给其他评审
         const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: capLines(lineStartBlockers(e.text)) })).filter((x) => x.lines.length);
         const resolved = run.blockerHistory().resolved;
-        const critiques = reviewers.length
-          ? await run.runStage(reviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items, ownIssues: run.ownIssuesFor(p) }))
+        const critiques = activeReviewers.length
+          ? await run.runStage(activeReviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items, ownIssues: run.ownIssuesFor(p) }))
           : [];
         markScoped(critiques);
-        if (adaptive && reviewers.length && !newInterjections && reviewersDone(critiques)) {
+        await tally(activeReviewers, critiques, round);
+        if (adaptive && activeReviewers.length && !newInterjections && reviewersDone(critiques, activeReviewers.filter((p) => !dropped.has(p.id)))) {
           converge(round);
           break;
         }
@@ -795,6 +835,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           tracking: run.tracking,
         }));
       }
+      if (cfg.mode !== 'brainstorm') await tally(activeLeads, revised, round);
       // 「无变化」：沿用上一版完整方案；没写这个标记、发言失败或写了别的内容，都算有变化
       for (const e of revised) {
         if (e.plan !== undefined && isUnchangedPlan(e.plan)) {
@@ -809,12 +850,13 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       answered = heard.length;
       if (breakers && cfg.mode !== 'brainstorm') {
         const critiques = rounds.find((x) => x.round === round && x.stage === 'critique')?.entries ?? [];
-        const blocking = reviewers.filter((p) => {
+        const voters = reviewers.filter((p) => !dropped.has(p.id)); // 掉线的评审不再算
+        const blocking = voters.filter((p) => {
           const e = critiques.find((x) => x.id === p.id);
           return e && parseVerdict(e.text) === 'continue' && hasBlocker(e.text);
         });
         // 修订后结束：评审都没有阻断（这一轮因为新核实或新插话没有提前结束），主笔看完也都没改
-        if (newInterjections && reviewersDone(critiques) && allUnchanged) {
+        if (newInterjections && reviewersDone(critiques, voters) && allUnchanged) {
           converge(round);
           break;
         }
@@ -826,8 +868,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           break;
         }
         // 熔断二：评审不少于 2 位，同一位评审连续 3 轮独自坚持阻断，其他评审都没有意见
-        const alone = blocking.length === 1 && reviewers.length >= 2
-          && reviewers.filter((q) => q.id !== blocking[0].id).every((q) => reviewerDone(q, critiques))
+        const alone = blocking.length === 1 && voters.length >= 2
+          && voters.filter((q) => q.id !== blocking[0].id).every((q) => reviewerDone(q, critiques))
           ? blocking[0] : null;
         for (const p of reviewers) lone.set(p.id, alone?.id === p.id ? (lone.get(p.id) ?? 0) + 1 : 0);
         if (alone && lone.get(alone.id) >= 3) {
@@ -843,8 +885,9 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         break;
       }
       // 这一轮完整跑完：存断点（进程中断后从下一轮续跑）
-      await onRound?.(round, { stuck, lone: Object.fromEntries(lone), answered });
+      await onRound?.(round, { stuck, lone: Object.fromEntries(lone), answered, failStreak: Object.fromEntries(failStreak), dropped: [...dropped] });
     }
+    if (dropped.size) ending = { ...ending, dropped: droppedNames() };
     return { lastRound, ending };
   };
 
@@ -1159,7 +1202,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
 
   /** 熔断或到上限时，另发一张阻断存档卡片；正常收敛时不发（主文档里已经写了）。 */
   run.postBlockers = async (ending) => {
-    if (!['deadlock', 'dissent', 'max'].includes(ending?.reason)) return;
+    if (!['deadlock', 'dissent', 'max', 'dropped'].includes(ending?.reason)) return;
     const archive = run.blockerArchive().filter(isPendingBlocker);
     if (!archive.length) return;
     await publisher.post({
@@ -1296,7 +1339,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     latest: [...latest.values()],
     rounds,
     lastRound,
-    ending: ending ? { reason: ending.reason, round: ending.round, ...(ending.tag ? { tag: ending.tag } : {}) } : null,
+    ending: ending ? { reason: ending.reason, round: ending.round, ...(ending.tag ? { tag: ending.tag } : {}), ...(ending.part ? { part: ending.part } : {}), ...(ending.dropped?.length ? { dropped: ending.dropped } : {}) } : null,
     blockers,
     interjections,
     ...(budget ? { budget } : {}),
@@ -2105,6 +2148,12 @@ function occupancyLine(participants, occupancy) {
 /** 讨论怎么结束的，一句话。 */
 function endingText(ending) {
   if (!ending) return '';
+  const base = endingBase(ending);
+  return ending.dropped?.length && ending.reason !== 'dropped' ? `${base}（${ending.dropped.join('、')} 掉线）` : base;
+}
+
+function endingBase(ending) {
+  if (ending.reason === 'dropped') return `第 ${ending.round} 轮结束：${ending.part === 'lead' ? '主笔' : '评审'}全部掉线（${(ending.dropped ?? []).join('、')} 连续 ${DROP_AFTER} 轮调用失败）`;
   if (ending.reason === 'converged') return `第 ${ending.round} 轮提前结束（收敛）`;
   if (ending.reason === 'max') return `到上限 ${ending.round} 轮结束，评审仍有意见`;
   if (ending.reason === 'fixed') return `按固定轮数在第 ${ending.round} 轮结束`;
@@ -2121,6 +2170,7 @@ function endingSuffix(ending, stopRule) {
   if (ending.reason === 'max') return '，达到上限仍有意见';
   if (ending.reason === 'deadlock') return '，以分歧结束，待你裁决';
   if (ending.reason === 'dissent') return `，${ending.tag ?? '一位评审'}独自坚持阻断，待你裁决`;
+  if (ending.reason === 'dropped') return `，${ending.part === 'lead' ? '主笔' : '评审'}全部掉线`;
   return '';
 }
 

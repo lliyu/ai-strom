@@ -81,10 +81,11 @@ test('自动轮数：没写结论或评审失败不算同意；有新插话时�
   const res = await runDiscussion({ cfg, topic: 't', providers: registry, publisher: createMemoryPublisher() });
   assert.equal(res.ending.reason, 'max');
 
-  // 一位评审没意见、另一位调用失败：不算都同意，继续到上限
-  const failing = { get: () => ({ async complete(o) { const who = whoOf(o); if (who === 'R1') throw new Error('max_tokens'); return { text: who === 'R2' ? '评审结论：没有意见了' : 'x', usage: {} }; } }) };
+  // 一位评审没意见、另一位这一轮调用失败：不算都同意，这一轮不结束
+  let r1Calls = 0;
+  const failing = { get: () => ({ async complete(o) { const who = whoOf(o); if (who === 'R1' && (r1Calls += 1) === 1) throw new Error('max_tokens'); return { text: who?.startsWith('R') ? '评审结论：没有意见了' : 'x', usage: {} }; } }) };
   const res3 = await runDiscussion({ cfg, topic: 't', providers: failing, publisher: createMemoryPublisher() });
-  assert.equal(res3.ending.reason, 'max');
+  assert.deepEqual([res3.ending.reason, res3.roundsUsed], ['converged', 3]);
 
   // 两位评审都没意见，但第 2 轮开始前人类插话了：主笔要先回应，所以不结束
   const polls = [[], [{ sender: '我', text: '补充约束' }], [], [], []];
@@ -93,6 +94,48 @@ test('自动轮数：没写结论或评审失败不算同意；有新插话时�
   const res2 = await runDiscussion({ cfg, topic: 't', providers: r2, publisher: createMemoryPublisher(), interjections });
   assert.equal(res2.roundsUsed, 3);
   assert.ok(calls.some((c) => c.round === 2 && c.who === 'A'));
+});
+
+test('掉线：评审连续 2 轮调用失败后不再请它发言，讨论按其余评审的结论收敛', async () => {
+  const cfg = normalizeConfig(base({ maxRounds: 8 }));
+  const calls = [];
+  const provider = { async complete(o) {
+    const who = whoOf(o);
+    const round = Number(/【阶段：第 (\d+) 轮/.exec(o.prompt)?.[1] ?? 0);
+    calls.push({ who, round, prompt: o.prompt });
+    if (who === 'R1' && round >= 2) throw new Error('fetch failed（ETIMEDOUT）');
+    if (who === 'R2') return { text: '评审结论：没有意见了', usage: {} };
+    return { text: o.prompt.includes('【阶段：主文档】') ? '【说明】\n结论\n【主文档】\n# 结论\n正文' : 'x', usage: {} };
+  } };
+  const publisher = createMemoryPublisher();
+  const events = [];
+  const res = await runDiscussion({ cfg, topic: 't', providers: { get: () => provider }, publisher, onEvent: (e) => events.push(e), retryDelayMs: 0 });
+  // 第 2、3 轮 R1 失败：第 3 轮掉线，只看 R2 的结论，当轮收敛
+  assert.deepEqual([res.ending.reason, res.roundsUsed], ['converged', 3]);
+  assert.deepEqual(res.ending.dropped, ['R1']);
+  assert.deepEqual(res.state.ending.dropped, ['R1']);
+  assert.ok(!calls.some((c) => c.who === 'R1' && c.round > 3));
+  assert.ok(events.some((e) => e.type === 'participant_dropped' && e.speaker === 'r1' && e.round === 3));
+  assert.ok(publisher.posts.some((p) => p.meta?.stage === 'dropped' && /R1 掉线/.test(p.title)));
+  assert.match(calls.find((c) => c.prompt.includes('【阶段：主文档】')).prompt, /R1 中途连续调用失败掉线/);
+});
+
+test('掉线：评审全部掉线，讨论带着现有方案结束，不再空转到上限', async () => {
+  const cfg = normalizeConfig(base({ maxRounds: 8 }));
+  const calls = [];
+  const provider = { async complete(o) {
+    const who = whoOf(o);
+    const round = Number(/【阶段：第 (\d+) 轮/.exec(o.prompt)?.[1] ?? 0);
+    calls.push({ who, round });
+    if (who?.startsWith('R') && round >= 2) throw new Error('fetch failed');
+    return { text: o.prompt.includes('【阶段：主文档】') ? '【说明】\n结论\n【主文档】\n# 结论\n正文' : 'x', usage: {} };
+  } };
+  const publisher = createMemoryPublisher();
+  const res = await runDiscussion({ cfg, topic: 't', providers: { get: () => provider }, publisher, retryDelayMs: 0 });
+  assert.deepEqual([res.ending.reason, res.ending.part, res.roundsUsed], ['dropped', 'reviewer', 3]);
+  assert.deepEqual(res.ending.dropped, ['R1', 'R2']);
+  assert.ok(!calls.some((c) => c.round > 3 && c.who !== '主席'));
+  assert.match(publisher.posts.at(-1).subtitle, /评审全部掉线/);
 });
 
 test('固定轮数：不要求评审给结论，跑满', async () => {
