@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { normalizeConfig } from '../src/config.js';
-import { createWebApp, startWebServer } from '../src/web/server.js';
+import { createWebApp, startWebServer, docMarkdown, docFileName } from '../src/web/server.js';
 import { createStoreInbox, combineInterjections, appendInbox } from '../src/inbox.js';
 import { openStore } from '../src/db.js';
 import { migrateRuns } from '../src/migrate.js';
@@ -167,6 +167,37 @@ test('网页：发起方案讨论只在网页上跑；仓库别名写错直接�
   const b = await request(port, 'GET', `/api/runs/${brainstorm.body.number}`);
   assert.equal(b.body.mode, 'brainstorm');
   assert.equal(b.body.progress.status, 'done');
+});
+
+test('网页：主文档每一版都能导出 Markdown，附录接在正文后面；没有这一版返回 404', async (t) => {
+  const { port, store } = await serve(t);
+  fakeLarkRun(store, { number: 5 });
+  const state = store.discussion(5).state;
+  store.saveState({ ...state, docs: [
+    { version: 1, reason: '讨论结束', note: '先不拆', text: '# 第一版\n\n结论 A\n', attachments: {} },
+    { version: 2, reason: '追问：按方案 A', note: '改成拆', text: '# 第二版\n\n结论 B', attachments: { 迁移步骤: '1. 停写\n2. 切流', 回滚: '切回老库' } },
+  ] });
+  const res = await fetch(`http://127.0.0.1:${port}/api/runs/5/docs/2.md`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /text\/markdown/);
+  const disposition = res.headers.get('content-disposition');
+  assert.match(disposition, /^attachment; filename="ai-storm-5-v2\.md"/);
+  // 文件名用这份文档的标题；最后接程序生成的变更记录
+  assert.equal(decodeURIComponent(disposition.split("UTF-8''")[1]), '讨论5-第2版-第二版.md');
+  assert.equal(await res.text(), '# 第二版\n\n结论 B\n\n---\n\n# 附录《迁移步骤》\n\n1. 停写\n2. 切流\n\n---\n\n# 附录《回滚》\n\n切回老库\n\n---\n\n# 变更记录\n\n- 第 1 版（讨论结束）：先不拆\n- 第 2 版（追问：按方案 A）：改成拆\n');
+  const v1 = await fetch(`http://127.0.0.1:${port}/api/runs/5/docs/1.md`);
+  assert.equal(await v1.text(), '# 第一版\n\n结论 A\n\n---\n\n# 变更记录\n\n- 第 1 版（讨论结束）：先不拆\n');
+  // 旧版本正文里已经写了变更记录的，不再重复
+  store.saveState({ ...state, docs: [{ version: 1, reason: '讨论结束', note: 'x', text: '# 旧\n## 变更记录\n- v1' }] });
+  assert.equal(await (await fetch(`http://127.0.0.1:${port}/api/runs/5/docs/1.md`)).text(), '# 旧\n## 变更记录\n- v1\n');
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/runs/5/docs/3.md`)).status, 404);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/runs/99/docs/1.md`)).status, 404);
+});
+
+test('导出：没有附录只有正文；文件名去掉议题里不能用的字符', () => {
+  assert.equal(docMarkdown({ text: '正文' }), '正文\n');
+  assert.equal(docFileName({ number: 3, version: 1, topic: 'A/B: 要不要拆?\n背景' }), '讨论3-第1版-A B 要不要拆.md');
+  assert.equal(docFileName({ number: 3, version: 1, topic: '' }), '讨论3-第1版.md');
 });
 
 test('网页插话：交给模型的同时，由主席发一张卡片（群里能看到）', async () => {

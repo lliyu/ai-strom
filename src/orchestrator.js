@@ -6,7 +6,7 @@ import {
   researchSystem, researchPrompt, sharedSystem, parseVerdict, parseStanceChange,
   triagePrompt, parseTriage, stripTriageLine, followUpPrompt, parseVerdictPick, parseVerifyQuestions, finalPrompt, freshBlock, HANDLING_LABELS,
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
-  docSystem, docPrompt, docUpdatePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead,
+  docSystem, docPrompt, docUpdatePrompt, docRewritePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead, docTitle, docNoOf,
   limitsFor, splitReply, overLimit, compressPrompt, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
   parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
   webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
@@ -757,10 +757,13 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
 
   /**
    * 主文档：主席写（或更新）→ 主笔在各自的会话里核对 → 有意见时主席按意见修改 → 在讨论里发一条短消息。
-   * prompt 是 docPrompt 或 docUpdatePrompt；previous 是上一版（没有时为 null）。
-   * 返回新的一版 { version, at, reason, text, note, attachments, check }；不需要修改时返回 { unchanged: true }；写失败返回 null。
+   * prompt 是 docPrompt、docUpdatePrompt 或 docRewritePrompt；previous 是当前文档的上一版（没有时为 null）；
+   * existing 是这场讨论已有的全部版本（定版本号和新文档编号）。
+   * 主席可以改当前文档，也可以新开文档（讨论分出了独立的方向，要写原因）。
+   * 返回这次写出的各版 [{ version, docNo, title, at, reason, text, note, attachments, check, opened? }]，当前文档在前；
+   * 不需要修改时返回 []；写失败返回 null。
    */
-  run.writeDoc = async ({ prompt, previous = null, round, reason, check = true }) => {
+  run.writeDoc = async ({ prompt, previous = null, existing = previous ? [previous] : [], round, reason, check = true }) => {
     // 主席这次写文档用一条临时会话：按核对意见修改时讨论记录已经在会话里，不用再发一遍。非会话模式把初稿贴回去
     let session = null;
     const write = async (text) => run.speak(cfg.chair, { stage: 'doc', round, system: run.shared, prompt: text, session, quiet: true });
@@ -776,16 +779,25 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       if (raw == null) continue;
       try {
         parsed = parseDoc(raw);
+        // 还没有文档时必须写出当前文档
+        if (!previous && !parsed.unchanged && !parsed.doc) throw new Error('没有写出主文档');
       } catch (err) {
+        parsed = null;
         log(`⚠️ 主文档格式不对：${err.message}`);
       }
     }
     if (!parsed) return null;
     if (parsed.unchanged) {
       log('主席判断：这次追问不需要改主文档');
-      return { unchanged: true };
+      return [];
     }
-    let attachments = mergeAttachments(previous?.attachments, parsed.attachments);
+    let attachments = parsed.doc ? mergeAttachments(previous?.attachments, parsed.attachments) : previous?.attachments ?? {};
+    let fresh = parsed.newDocs.map((d) => ({ ...d, attachments: mergeAttachments({}, d.attachments) }));
+    const combined = () => [
+      parsed.doc ?? '',
+      ...fresh.map((d) => `---\n\n（新开的文档《${d.title}》，原因：${d.reason ?? '没写'}）\n\n${d.doc}`),
+    ].filter(Boolean).join('\n\n');
+    const allAttachments = () => Object.assign({}, parsed.doc ? attachments : {}, ...fresh.map((d) => d.attachments));
 
     // ---------- 主笔核对 ----------
     let checkInfo = null;
@@ -796,7 +808,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         round,
         system: run.shared,
         // 非会话模式（或会话还没开始）没有身份和讨论记忆：带上身份和自己最后的方案
-        prompt: `${convo ? '' : `${participantSystem(p, { mode: cfg.mode })}\n\n`}${docCheckPrompt({ doc: parsed.doc, attachments, own: convo ? null : (latest.get(p.id).plan ?? latest.get(p.id).text) })}`,
+        prompt: `${convo ? '' : `${participantSystem(p, { mode: cfg.mode })}\n\n`}${docCheckPrompt({ doc: combined(), attachments: allAttachments(), own: convo ? null : (latest.get(p.id).plan ?? latest.get(p.id).text) })}`,
         session: convo ? sessions.get(p.id) : null,
         quiet: true,
       }));
@@ -817,9 +829,11 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         const fixedRaw = await write(docFixPrompt({ issues, draft: session ? null : raw }));
         try {
           const fixed = fixedRaw == null ? null : parseDoc(fixedRaw);
-          if (fixed && !fixed.unchanged) {
-            attachments = mergeAttachments(attachments, fixed.attachments);
-            parsed = { ...fixed, note: fixed.note ?? parsed.note };
+          if (fixed && !fixed.unchanged && (fixed.doc || !parsed.doc)) {
+            if (fixed.doc) attachments = mergeAttachments(attachments, fixed.attachments);
+            // 新开的文档按顺序对上初稿里的，附录在初稿的基础上合并
+            fresh = fixed.newDocs.map((d, i) => ({ ...d, reason: d.reason ?? fresh[i]?.reason ?? null, attachments: mergeAttachments(fresh[i]?.attachments, d.attachments) }));
+            parsed = { ...fixed, doc: fixed.doc ?? parsed.doc, note: fixed.note ?? parsed.note };
             checkInfo.fixed = true;
           }
         } catch (err) {
@@ -828,18 +842,39 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       }
     }
 
-    const version = (previous?.version ?? 0) + 1;
-    const doc = { version, at: new Date().toISOString(), reason, text: parsed.doc, note: parsed.note ?? docLead(parsed.doc), attachments, check: checkInfo };
-    const names = Object.keys(attachments);
+    const at = new Date().toISOString();
+    let version = Math.max(0, ...existing.map((d) => d.version ?? 0));
+    let docNo = Math.max(0, ...existing.map(docNoOf));
+    const written = [];
+    const currentNo = previous ? docNoOf(previous) : (docNo || 1);
+    const currentTitle = previous ? previous.title ?? docTitle(previous.text) : null;
+    if (parsed.doc) {
+      version += 1;
+      written.push({ version, docNo: currentNo, title: docTitle(parsed.doc), at, reason, text: parsed.doc, note: parsed.note ?? docLead(parsed.doc), attachments, check: checkInfo });
+      docNo = Math.max(docNo, currentNo);
+    }
+    const fromTitle = written[0]?.title ?? currentTitle;
+    for (const d of fresh) {
+      version += 1;
+      docNo += 1;
+      // 只新开、当前文档没改时，主席的说明记在第一份新文档上
+      const note = !parsed.doc && !written.length && parsed.note ? parsed.note : docLead(d.doc);
+      written.push({ version, docNo, title: d.title, at, reason, text: d.doc, note, attachments: d.attachments, check: checkInfo, opened: { reason: d.reason, ...(fromTitle ? { from: fromTitle } : {}) } });
+    }
+    const checkText = checkInfo ? ` · ${checkInfo.issues ? `主笔核对提了 ${checkInfo.issues} 份意见${checkInfo.fixed ? '，已修改' : ''}` : '主笔核对没有意见'}` : '';
+    const lines = written.map((d) => {
+      const names = Object.keys(d.attachments);
+      return `- ${d.opened ? '新开' : ''}《${d.title}》第 ${d.version} 版${names.length ? `，附录 ${names.map((n) => `《${n}》`).join('、')}` : ''}${d.opened ? `。新开原因：${d.opened.reason ?? '（没写）'}` : ''}`;
+    });
     await publisher.post({
       speaker: cfg.chair,
       title: `${cfg.chair.name} · ${STAGE_LABELS.doc}`,
-      subtitle: `第 ${version} 版 · ${reason}${checkInfo ? ` · ${checkInfo.issues ? `主笔核对提了 ${checkInfo.issues} 份意见${checkInfo.fixed ? '，已修改' : ''}` : '主笔核对没有意见'}` : ''}`,
-      body: [doc.note, '', `完整主文档${names.length ? `和附录（${names.map((n) => `《${n}》`).join('、')}）` : ''}在网页的「文档」页。`].join('\n'),
-      meta: { stage: 'doc', round, docVersion: version },
+      subtitle: `${written.length > 1 ? `${written.length} 份文档` : `第 ${written[0].version} 版`} · ${reason}${checkText}`,
+      body: [parsed.note ?? written[0].note, '', ...lines, '', '完整文档在网页的「文档」页。'].join('\n'),
+      meta: { stage: 'doc', round, docVersion: written[0].version },
     });
-    emit({ type: 'doc_written', version, reason, chars: doc.text.length, attachments: names.length, check: checkInfo });
-    return doc;
+    for (const d of written) emit({ type: 'doc_written', version: d.version, docNo: d.docNo, reason, chars: d.text.length, attachments: Object.keys(d.attachments).length, check: checkInfo, ...(d.opened ? { opened: true } : {}) });
+    return written;
   };
 
   /**
@@ -1257,13 +1292,14 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   await run.factCheck(lastRound + 1); // 最后一轮提出的待核实问题也查掉，主席写文档时以核实结果为准
   await run.postBlockers(ending);
   const blockers = run.blockerArchive();
-  const doc = await run.writeDoc({
+  const written = await run.writeDoc({
     round: lastRound + 1,
     reason: '讨论结束',
     prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted, blockers })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
-  if (!doc) await run.postDocFallback({ round: lastRound + 1, ending, number });
-  const docs = doc?.text ? [doc] : [];
+  const docs = written ?? [];
+  if (!docs.length) await run.postDocFallback({ round: lastRound + 1, ending, number });
+  const doc = docs[0] ?? null;
   const summary = doc?.text ?? null;
 
   // ---------- 打磨：写修订版 ----------
@@ -1288,8 +1324,9 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     ending,
     context: contextOut(context),
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
-    doc: doc?.text ? doc : null,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !doc, budget: run.budget, blockers, interjections: heard, data: run.data?.selection, dataContext }),
+    doc,
+    docs,
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !docs.length, budget: run.budget, blockers, interjections: heard, data: run.data?.selection, dataContext }),
   };
 }
 
@@ -1391,14 +1428,16 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   if (handling === 'answer') {
     log('主席判断：直接回答');
     // 回答里有值得留下的信息时改进主文档；只是解释文档里已有的内容时不改
-    const doc = current ? await run.writeDoc({
+    const out = current ? await run.writeDoc({
       previous: current,
+      existing: docs,
       round: state.lastRound,
       reason,
       check: false,
-      prompt: docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, answer }),
+      prompt: docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, answer }),
     }) : null;
-    if (doc?.text) docs.push(doc);
+    const doc = firstDoc(out);
+    if (out?.length) docs.push(...out);
     followUps.push({ question, handling, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
     await run.postEnd({ title: `追问已回答 · 讨论${no}`, subtitle: `主席直接回答 · ${stats.calls} 次模型调用` });
   } else if (handling === 'verdict') {
@@ -1418,13 +1457,14 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     }
     ending = { reason: 'verdict', round: lastRound };
     const finals = [...latest.values()].sort(byTag);
-    const doc = await run.writeDoc(current
+    const out = await run.writeDoc(current
       ? {
         previous: current,
+        existing: docs,
         round: r0,
         reason,
         check: false,
-        prompt: (factor) => run.fitChair(({ facts: checked, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, ruling: pick.ruling, final, finals, interjections: heard, omitted, blockers: run.blockerArchive() })}${chairFacts(checked)}`, { facts: run.facts, factor }),
+        prompt: (factor) => run.fitChair(({ facts: checked, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, ruling: pick.ruling, final, finals, interjections: heard, omitted, blockers: run.blockerArchive() })}${chairFacts(checked)}`, { facts: run.facts, factor }),
       }
       : {
         round: r0,
@@ -1432,7 +1472,8 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         check: false,
         prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals, interjections: heard, omitted, blockers: run.blockerArchive(), earlier: earlierOf(state.summary, [...followUps, { question, answer: `人的裁决：${pick.ruling}${final ? `\n\n定稿方案：\n${final.plan}` : '\n\n（由主席按裁决合并定稿）'}` }]) })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
       });
-    if (doc?.text) docs.push(doc);
+    const doc = firstDoc(out);
+    if (out?.length) docs.push(...out);
     else if (!doc) {
       docFailed = true;
       await run.postDocFallback({ round: r0, ending, number: state.number });
@@ -1452,13 +1493,14 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
       await publisher.post({ speaker: cfg.chair, title: `追问核实失败 · 讨论${no}`, subtitle: '主文档没有改', body: `要核实的问题：\n${verifyQuestions.map((q) => `- ${q}`).join('\n')}\n\n${answer}`, meta: { stage: 'verify', round: r0 } });
       followUps.push({ question, handling, questions: verifyQuestions, answer, failed: true, context: ctxMode, at: new Date().toISOString() });
     } else {
-      const doc = await run.writeDoc(current
+      const out = await run.writeDoc(current
         ? {
           previous: current,
+        existing: docs,
           round: r0,
           reason,
           check: false,
-          prompt: (factor) => run.fitChair(({ facts: f, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, verifyQuestions, interjections: heard, omitted })}${chairFacts(f)}`, { facts: run.facts, factor }),
+          prompt: (factor) => run.fitChair(({ facts: f, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, verifyQuestions, interjections: heard, omitted })}${chairFacts(f)}`, { facts: run.facts, factor }),
         }
         : {
           round: r0,
@@ -1466,7 +1508,8 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
           check: false,
           prompt: (factor) => run.fitChair(({ rounds: hist, facts: f, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, omitted, earlier: earlierOf(state.summary, followUps) })}${chairFacts(f)}`, { rounds, facts: run.facts, factor }),
         });
-      if (doc?.text) docs.push(doc);
+      const doc = firstDoc(out);
+    if (out?.length) docs.push(...out);
       answer = doc?.text ? doc.note : run.facts.at(-1).answer;
       followUps.push({ question, handling, questions: verifyQuestions, answer, ...(doc?.text ? { doc: doc.version } : {}), context: ctxMode, at: new Date().toISOString() });
     }
@@ -1495,13 +1538,14 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     const noCode = noCodeOf(state.mode, run.code ? state.context : null);
     await run.postBlockers(it.ending);
     const blockers = run.blockerArchive();
-    const doc = await run.writeDoc(current
+    const out = await run.writeDoc(current
       ? {
         previous: current,
+        existing: docs,
         round: lastRound + 1,
         reason,
         prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docUpdatePrompt({
-          mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, question, handling, brief: briefText,
+          mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, brief: briefText,
           rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted, blockers,
         })}${chairFacts(checked)}`, { rounds: rounds.filter((r) => r.round >= r0), facts: run.facts, factor }),
       }
@@ -1513,7 +1557,8 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
           earlier: earlierOf(state.summary, [...followUps, { question, answer: `（这次追问，第 ${r0} 轮之后的讨论记录就是它的讨论）` }]),
         })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
       });
-    if (doc?.text) docs.push(doc);
+    const doc = firstDoc(out);
+    if (out?.length) docs.push(...out);
     else if (!doc) {
       log('⚠️ 主文档没有更新');
       docFailed = true;
@@ -1561,6 +1606,29 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   return { handling, answer, stats, state: next, revision, context: ctxMode };
 }
 
+/** writeDoc 的结果取当前文档那一版：失败为 null，不需要修改为 { unchanged: true }。 */
+function firstDoc(out) {
+  if (out == null) return null;
+  return out[0] ?? { unchanged: true };
+}
+
+/** 各份文档的最新一版（按文档编号）。 */
+export function latestDocs(docs = []) {
+  const by = new Map();
+  for (const d of docs) by.set(docNoOf(d), d);
+  return [...by.values()].sort((a, b) => docNoOf(a) - docNoOf(b));
+}
+
+/** 当前文档之外的其他文档：标题和一句话结论，给主席避免重复。 */
+function othersOf(docs, current) {
+  return latestDocs(docs).filter((d) => docNoOf(d) !== docNoOf(current)).map((d) => ({ title: d.title ?? docTitle(d.text), lead: oneLine(d) }));
+}
+
+function oneLine(d) {
+  const m = /\*\*一句话结论\*\*[:：]\s*(.+)/.exec(d.text ?? '');
+  return (m ? m[1] : docLead(d.text).split('\n')[0] ?? '').trim().slice(0, 120);
+}
+
 /** 旧讨论补写主文档时，原来的汇总和每次追问的结论。 */
 function earlierOf(summary, followUps = []) {
   return [
@@ -1583,16 +1651,54 @@ export async function backfillDoc({ cfg, state, providers, publisher, log = () =
   const rounds = [...state.rounds];
   const run = createRun({ cfg: { ...cfg, mode: state.mode }, providers, publisher, interjections: null, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget });
   run.shared = state.shared;
-  const doc = await run.writeDoc({
+  const written = await run.writeDoc({
     round: state.lastRound + 1,
     reason: '补写',
     prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), earlier: earlierOf(state.summary, state.followUps), omitted })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
-  if (!doc?.text) throw new Error('主文档没写成');
+  if (!written?.length) throw new Error('主文档没写成');
+  const [doc] = written;
   return {
     doc,
+    docs: written,
     stats: run.stats,
-    state: { ...state, updatedAt: new Date().toISOString(), sessions: Object.fromEntries(sessions), docs: [doc], summary: doc.text, legacySummary: state.summary },
+    state: { ...state, updatedAt: new Date().toISOString(), sessions: Object.fromEntries(sessions), docs: written, summary: doc.text, legacySummary: state.summary },
+  };
+}
+
+/**
+ * 按现在的写法重写已有的文档（各份文档的最新一版）：不增加新结论，提炼、合并、删重复，细节移进附录；
+ * 主席可以把独立的方向拆成新文档。主笔在各自的会话里核对（会话已过期时不核对）。
+ * 不发到群里（publisher 由调用方给，一般只打印到终端）。返回 { docs: 这次写出的各版, stats, state }，state 由调用方写回。
+ */
+export async function rewriteDocs({ cfg, state, providers, publisher, log = () => {}, onEvent = () => {} }) {
+  if (state?.version !== STATE_VERSION) throw new Error('讨论状态的版本不对');
+  if (!state.docs?.length) throw new Error(`讨论 #${state.number} 还没有主文档，先用 doc ${state.number} 补写`);
+  const tags = new Map(Object.entries(state.tags));
+  const sessions = new Map(Object.entries(state.sessions ?? {}).map(([id, s]) => [id, { ...s, turns: [...s.turns], seen: 0 }]));
+  const latest = new Map((state.latest ?? []).map((e) => [e.id, e]));
+  const run = createRun({ cfg: { ...cfg, mode: state.mode }, providers, publisher, interjections: null, log, onEvent, tags, sessions, latest, rounds: [...(state.rounds ?? [])], facts: state.facts ?? [], budget: state.budget });
+  run.shared = state.shared;
+  if (state.expired) log('会话已过期，主笔不核对，只由主席重写');
+  const docs = [...state.docs];
+  const out = [];
+  for (const current of latestDocs(state.docs)) {
+    const written = await run.writeDoc({
+      previous: current,
+      existing: docs,
+      round: state.lastRound + 1,
+      reason: '按新写法重写',
+      check: !state.expired,
+      prompt: docRewritePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current) }),
+    });
+    if (written == null) throw new Error(`《${current.title ?? docTitle(current.text)}》没重写成`);
+    docs.push(...written);
+    out.push(...written);
+  }
+  return {
+    docs: out,
+    stats: run.stats,
+    state: { ...state, updatedAt: new Date().toISOString(), sessions: Object.fromEntries(sessions), docs, summary: docs.at(-1)?.text ?? state.summary },
   };
 }
 

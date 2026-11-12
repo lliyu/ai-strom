@@ -247,9 +247,12 @@ export function openStore(file) {
       return execRow(q('SELECT * FROM executions WHERE id = ?').get(id));
     },
 
-    /** 一场讨论的全部运行（讨论本身在前，追问按时间排）。 */
+    /**
+     * 一场讨论的全部运行，按开始时间排（讨论本身在前，追问按时间排）。
+     * 不按 id 排：补导的旧目录 id 在最后，按 id 排追问编号会错位，插话和进度也会看错运行。
+     */
     executionsOf(number) {
-      return q('SELECT * FROM executions WHERE number = ? ORDER BY id').all(Number(number)).map(execRow);
+      return q('SELECT * FROM executions WHERE number = ? ORDER BY started_at, id').all(Number(number)).map(execRow);
     },
 
     executions({ limit = 200 } = {}) {

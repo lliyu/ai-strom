@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { normalizeConfig, ConfigError } from '../config.js';
 import { lineupConfig, modelPool, roleTemplates, defaultLineup, MAX_SEATS, readsCode } from '../lineup.js';
 import { nextNumber, saveState, removeSessionFiles } from '../state.js';
-import { STAGE_LABELS, SUBJECT_LABELS } from '../modes.js';
+import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle } from '../modes.js';
+import { groupKeys, critiqueDigest, blockerSummary, docSections } from './digest.js';
 import { RUNS, storeOf, runOne, runPrepared, followUpOne, log as defaultLog } from '../runner.js';
 import { claudeSessionFile, DEFAULT_CLAUDE_CWD } from '../providers/claude-cli.js';
 import { parseRepoSpecs, resolveRepos, availableRepos } from '../repos.js';
@@ -86,13 +87,20 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return (id) => own.get(id) ?? table.get(`${mode}:${id}`) ?? table.get(`decision:${id}`);
   }
 
+  /**
+   * 一场讨论的全部发言，按「所属运行（按开始时间）、id」排。每条带轮次、代号、组键；
+   * 评审发言另带 verdict / blockerLines / blocked（读取时派生，见 digest.js）。
+   */
   function postsOf(run) {
     const who = speakerOf(run);
     const partOf = new Map(run.execs.map((e, i) => [e.id, i]));
-    return store.posts(run.execs.map((e) => e.id)).map((e, i) => {
+    const rows = store.posts(run.execs.map((e) => e.id))
+      .map((e) => ({ e, part: partOf.get(e.exec_id) ?? 0 }))
+      .sort((x, y) => x.part - y.part || x.e.id - y.e.id);
+    const posts = rows.map(({ e, part }, i) => {
       const sp = who(e.speaker);
-      const part = partOf.get(e.exec_id) ?? 0;
-      return {
+      const meta = e.meta ?? {};
+      const p = {
         seq: i + 1,
         at: e.at,
         speaker: { id: e.speaker, name: sp?.name ?? e.speaker, color: sp?.color ?? 'grey' },
@@ -102,11 +110,74 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
         body: e.body ?? '',
         plan: e.plan ?? null,
         footer: e.footer ?? '',
-        stage: e.meta?.stage ?? null,
-        error: e.meta?.error ?? null,
+        stage: meta.stage ?? null,
+        error: meta.error ?? null,
         followUp: part > 0,
         part,
+        ...(Number.isFinite(meta.round) ? { round: meta.round } : {}),
+        ...(meta.tag ? { tag: meta.tag } : {}),
       };
+      if (p.stage === 'critique') Object.assign(p, critiqueDigest(p));
+      return p;
+    });
+    groupKeys(posts).forEach((g, i) => Object.assign(posts[i], g));
+    return posts;
+  }
+
+  /** 每次运行的结束事件：{ ending, handling, roundsUsed } 或 null（还没结束或失败）。 */
+  function finishOf(exec) {
+    const ev = store.events(exec.id).filter((r) => r.type === 'run_finished').at(-1);
+    return ev ? { ending: ev.ending ?? null, handling: ev.handling ?? null, roundsUsed: ev.roundsUsed ?? null } : null;
+  }
+
+  /**
+   * 结束状态：结束原因取最近一次结束了的运行的 run_finished；最新一次追问进行中或失败时另作提示；
+   * 都找不到时退回讨论状态里存的结束原因。facts：已核实的问题数（讨论状态里各次核实的问题数之和）。
+   */
+  function outcomeOf(run) {
+    const execs = run.execs.filter((e) => e.kind === 'discussion' || e.kind === 'followup');
+    const latest = execs.at(-1) ?? null;
+    let ending = null;
+    let handling = null;
+    let from = null;
+    for (let i = execs.length - 1; i >= 0; i -= 1) {
+      const f = finishOf(execs[i]);
+      if (f) {
+        ({ ending, handling } = f);
+        from = execs[i];
+        break;
+      }
+    }
+    let followUpStatus = null;
+    if (latest?.kind === 'followup' && latest !== from) followUpStatus = latest.status === 'failed' ? 'failed' : latest.status === 'running' ? 'running' : null;
+    if (!ending && run.state?.ending?.reason) ending = run.state.ending.reason;
+    const round = from?.kind === 'discussion' || !from ? run.state?.ending?.round ?? null : null;
+    const facts = Array.isArray(run.state?.facts) ? run.state.facts.reduce((n, f) => n + (f.questions?.length ?? 0), 0) : null;
+    return { ending, round, handling: from?.kind === 'followup' ? handling : null, followUpStatus, facts };
+  }
+
+  /** 阻断区块：最后一次含评审发言的运行；它之后还有按裁决定稿的追问时，标题改成「裁决前」。 */
+  function blockersOf(run, posts) {
+    const s = blockerSummary(posts);
+    if (!s) return null;
+    const later = run.execs.slice(s.part + 1).some((e) => e.kind === 'followup' && finishOf(e)?.handling === 'verdict');
+    return later ? { ...s, beforeVerdict: true } : s;
+  }
+
+  /** 主文档每份（docNo）最新一版切段。切不开的记一次日志（同一版只记一次）。 */
+  const degraded = new Set();
+  function sectionsOf(run, mode) {
+    const docs = run.state?.docs ?? [];
+    const latest = new Map();
+    for (const d of docs) latest.set(d.docNo ?? 1, d);
+    return [...latest.values()].map((d) => {
+      const s = docSections(d.text, mode);
+      const key = `${run.number}:${d.version}`;
+      if (s.failed && mode === 'decision' && !degraded.has(key)) {
+        degraded.add(key);
+        log(`网页：#${run.number} 第 ${d.version} 版主文档未能提取结论（缺：${s.missing.join('、') || '大纲'}），结论页显示全文`);
+      }
+      return { docNo: d.docNo ?? 1, version: d.version, ...s };
     });
   }
 
@@ -188,6 +259,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     const subject = subjectOf(run);
     const progress = progressOf(number, run);
     const lastDiscuss = [...(state?.followUps ?? [])].reverse().find((f) => f.handling === 'discuss');
+    const posts = postsOf(run);
     return {
       number,
       mode,
@@ -213,8 +285,28 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       data: state?.data ? { tools: Boolean(state.data.tools), knowledge: state.data.knowledge ?? [], questions: state.dataContext?.questions ?? [] } : null,
       canFollowUp: Boolean(state) && !state.expired && progress.status !== 'running' && progress.status !== 'queued',
       progress,
-      posts: postsOf(run),
+      posts,
+      // 读取时派生：结束状态、阻断区块、主文档切段（每份文档最新一版）
+      outcome: outcomeOf(run),
+      blockers: blockersOf(run, posts),
+      docSections: sectionsOf(run, mode),
     };
+  }
+
+  /** 下载主文档的某一版：Markdown，正文后面接附录。 */
+  function exportDoc(res, number, version) {
+    const run = findRun(number);
+    if (!run) throw httpError(404, `没有 #${number} 这场讨论`);
+    const doc = (run.state?.docs ?? []).find((d) => d.version === version);
+    if (!doc) throw httpError(404, `#${number} 没有第 ${version} 版主文档`);
+    const topic = doc.title || docTitle(doc.text) || run.state?.topic || run.row.topic || '';
+    const name = docFileName({ number, version, topic });
+    res.writeHead(200, {
+      'content-type': 'text/markdown; charset=utf-8',
+      'cache-control': 'no-store',
+      'content-disposition': `attachment; filename="ai-storm-${number}-v${version}.md"; filename*=UTF-8''${encodeURIComponent(name)}`,
+    });
+    res.end(docMarkdown(doc, docChangelog(run.state.docs, version)));
   }
 
   // ---------- 网页自己跑的讨论 ----------
@@ -435,6 +527,8 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   // ---------- 路由 ----------
 
   async function route(req, res, url) {
+    const exp = /^\/api\/runs\/(\d+)\/docs\/(\d+)\.md$/.exec(url.pathname);
+    if (req.method === 'GET' && exp) return exportDoc(res, Number(exp[1]), Number(exp[2]));
     const m = /^\/api\/runs\/(\d+)(?:\/(events|interject|followup|apply|archive|delete))?$/.exec(url.pathname);
     if (req.method === 'GET' && url.pathname === '/') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
@@ -471,16 +565,22 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive' });
     let sent = Number(new URL(req.url, 'http://x').searchParams.get('after') ?? 0);
     let lastProgress = '';
+    let lastBlockers = '';
     const tick = () => {
       try {
         const run = findRun(number);
         if (run) {
-          for (const p of postsOf(run)) {
+          const posts = postsOf(run);
+          for (const p of posts) {
             if (p.seq > sent) {
               res.write(`event: post\ndata: ${JSON.stringify(p)}\n\n`);
               sent = p.seq;
             }
           }
+          // 阻断区块随新评审发言变化（进行中状态条上的阻断数靠它更新）
+          const blockers = JSON.stringify(blockersOf(run, posts));
+          if (blockers !== lastBlockers) res.write(`event: blockers\ndata: ${blockers}\n\n`);
+          lastBlockers = blockers;
         }
         const prog = JSON.stringify(progressOf(number, run));
         if (prog !== lastProgress) {
@@ -520,6 +620,23 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   }
 
   return { handle, queue, idle: () => !current && !queue.length };
+}
+
+/**
+ * 主文档一版导出成 Markdown：正文原样，附录按顺序接在后面，每份以「附录《标题》」为一级标题；
+ * 最后是程序生成的变更记录（旧版本正文里已经写了变更记录的不再重复）。
+ */
+export function docMarkdown(doc, changelog = '') {
+  const parts = [doc.text.trimEnd()];
+  for (const [title, text] of Object.entries(doc.attachments ?? {})) parts.push(`# 附录《${title}》\n\n${String(text).trimEnd()}`);
+  if (changelog && !/^#{1,3}\s*变更记录/m.test(doc.text)) parts.push(`# 变更记录\n\n${changelog}`);
+  return `${parts.join('\n\n---\n\n')}\n`;
+}
+
+/** 导出文件名：讨论编号-第N版-议题首行（去掉文件名里不能用的字符，最长 40 字）。 */
+export function docFileName({ number, version, topic = '' }) {
+  const title = topic.split('\n')[0].replace(/[\\/:*?"<>|#\s]+/g, ' ').trim().slice(0, 40).trim();
+  return `讨论${number}-第${version}版${title ? `-${title}` : ''}.md`;
 }
 
 function httpError(status, message) {

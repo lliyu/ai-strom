@@ -76,6 +76,7 @@
   .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 14px; cursor: pointer; }
   .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
+  a.btn { color: inherit; text-decoration: none; }
   .hint { color: var(--muted); font-size: 12px; }
   .pick { display: inline-flex; gap: 4px; align-items: center; font-size: 13px; }
   .err { color: var(--err); }
@@ -144,12 +145,55 @@
   .chip.lark { color: #2a7de1; border-color: #2a7de1; }
   .chip.web { color: var(--muted); }
   .post.followup-start { margin-top: 22px; }
+  /* 吸顶状态条：标题、状态、谁在写、结束原因、阻断数、子页签、轮次跳转 */
+  .sticky { position: sticky; top: 0; z-index: 4; background: var(--bg); margin: -22px -4px 0; padding: 14px 4px 0; }
+  .sticky .head { flex-wrap: nowrap; align-items: center; }
+  .sticky .head h2 { font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
+  .sticky .head .chip, .sticky .head .ops { flex: none; }
+  .statline { display: flex; gap: 6px 14px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .statline .warn { color: var(--warn); font-weight: 600; }
+  .statline .blk { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 0 10px; cursor: pointer; color: var(--muted); font-size: 12px; }
+  .statline .blk.on { color: var(--err); border-color: var(--err); font-weight: 600; }
+  .subtabs .tools { margin-left: auto; display: flex; gap: 6px; align-items: center; padding-bottom: 4px; }
+  .subtabs .tools select, .subtabs .tools button { font-size: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 2px 8px; color: var(--muted); cursor: pointer; }
+  /* 按轮折叠 */
+  .grp { margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: color-mix(in srgb, var(--panel) 55%, transparent); scroll-margin-top: 130px; }
+  .grp > .gh { display: flex; gap: 10px; align-items: baseline; width: 100%; text-align: left; background: none; border: none; padding: 9px 14px; cursor: pointer; flex-wrap: wrap; }
+  .grp > .gh .caret::before { content: '▾'; color: var(--muted); display: inline-block; width: 10px; }
+  .grp.closed > .gh .caret::before { content: '▸'; }
+  .grp > .gh .gs { color: var(--muted); font-size: 12px; }
+  .grp > .gh .gs .bad { color: var(--err); font-weight: 600; }
+  .grp > .gh .unread { margin-left: auto; font-size: 11px; background: var(--accent); color: var(--accent-ink); border-radius: 999px; padding: 0 8px; }
+  .grp > .gh .unread:empty { display: none; }
+  .grp > .gb { padding: 0 12px 12px; }
+  .grp > .gb > .post:first-child { margin-top: 0; }
+  .grp.closed > .gb { display: none; }
+  .tagc { font-weight: 700; font-size: 12px; padding: 0 7px; border-radius: 5px; background: var(--soft); color: var(--accent); }
+  /* 结论页 */
+  .oneliner { font-size: 16px; font-weight: 600; border-left: 4px solid var(--accent); }
+  .oneliner .md p { margin: 2px 0; }
+  .card h3 .hint { font-weight: 400; margin-left: 6px; }
+  .dsub { margin-top: 10px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); }
+  .dsub.pick { border-color: var(--accent); background: var(--soft); }
+  .dsub h4 { margin: 0 0 4px; font-size: 14px; }
+  .pri { font-size: 11px; font-weight: 700; padding: 0 6px; border-radius: 4px; margin-right: 2px; white-space: nowrap; }
+  .pri.first { background: var(--err); color: #fff; } .pri.later { background: var(--line); color: var(--ink); } .pri.block { background: var(--del-bg); color: var(--del-ink); }
+  .blkbox { scroll-margin-top: 130px; }
+  .blkbox.alert { border-color: var(--err); }
+  .brow { margin-top: 8px; } .brow ul { margin: 4px 0 0; padding-left: 20px; }
+  .banner { padding: 8px 12px; border-radius: 8px; background: var(--soft); font-size: 13px; margin-top: 14px; }
+  .banner.warn { background: color-mix(in srgb, var(--warn) 15%, var(--panel)); }
   .divider { margin: 22px 0 4px; color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
   .divider::before, .divider::after { content: ''; flex: 1; border-top: 1px dashed var(--line); }
   @media (max-width: 820px) {
     .app { grid-template-columns: 1fr; height: auto; }
     aside { max-height: 46vh; border-right: none; border-bottom: 1px solid var(--line); }
     .wrap { padding: 16px 16px 120px; }
+    main { overflow: visible; } /* 窄屏滚动的是整页：main 不能是滚动容器，吸顶状态条和底部输入框才贴得住 */
+    .sticky { margin-top: -16px; }
+    .sticky .head { flex-wrap: wrap; }
+    .sticky .head h2 { flex-basis: 100%; }
+    .subtabs { flex-wrap: wrap; }
   }
 </style>
 </head>
@@ -182,6 +226,9 @@ const MODE_SHORT = { decision: '方案', brainstorm: '脑洞', refine: '打磨' 
 const CHANNEL_LABEL = { lark: '群里', web: '网页', 'dry-run': 'dry-run' };
 const HANDLING_LABEL = { answer: '直接回答', discuss: '重新讨论', verdict: '按裁决定稿', verify: '核实' };
 const STATUS_LABEL = { queued: '排队中', running: '进行中', done: '已结束', failed: '失败', idle: '已结束' };
+// 结束原因：主讨论五种、追问专用三种，加上旧版追问记的 followup；只有僵局、分歧、到上限用警示色
+const ENDING_LABEL = { converged: '评审都没有新意见（收敛）', max: '到轮数上限，评审仍有意见', fixed: '按固定轮数结束', deadlock: '僵局：主笔不改、评审仍有阻断', dissent: '评审之间有分歧', answered: '直接回答', verdict: '按裁决定稿', verified: '核实了事实', followup: '追问后重新讨论结束' };
+const ENDING_WARN = new Set(['deadlock', 'dissent', 'max']);
 const COLORS = { blue: '#3370ff', wathet: '#4bb3f5', turquoise: '#14c0b0', green: '#34a853', yellow: '#e6b800', orange: '#f08a24', red: '#e5484d', carmine: '#c2185b', violet: '#8e5cf7', purple: '#7b3fbf', indigo: '#4f5bd5', grey: '#8f959e' };
 const FIELD_LABELS = {
   content: '内容', angle: '创意方向', fromMaterial: '素材延伸', marketRef: '借鉴榜单', coreIdea: '核心创意', identityRole: '原身份的分量',
@@ -191,7 +238,8 @@ const FIELD_LABELS = {
   summary: '概要', climax: '卷末高潮', estimatedChapters: '预计章数',
 };
 
-const S = { tab: 'runs', form: { mode: 'decision' }, items: [], runs: [], q: '', filter: { mode: '', days: '', archived: false }, sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null, docIdx: null, docDiff: false };
+// expanded：讨论页里展开着的组（组 id = 组键@第一条的 seq），整页重绘后恢复
+const S = { tab: 'runs', form: { mode: 'decision' }, items: [], runs: [], q: '', filter: { mode: '', days: '', archived: false }, sel: null, run: null, sub: 'talk', es: null, status: null, revIdx: null, docIdx: null, docDiff: false, docNo: null, expanded: new Set() };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -208,7 +256,9 @@ function toast(text, ms = 3200) {
 
 // ---------- 极简 Markdown：加粗、行内代码、列表、代码块、小标题 ----------
 function inline(s) {
-  return esc(s).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  return esc(s).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/【先定】/g, '<span class="pri first">先定</span>').replace(/【可后定】/g, '<span class="pri later">可后定</span>')
+    .replace(/^(\s*(?:<strong>)?)[【\[]阻断[】\]]/, '$1<span class="pri block">阻断</span>');
 }
 function md(text) {
   const out = []; let list = null; let code = null;
@@ -254,6 +304,18 @@ function diffHtml(a, b) {
   while (i < n && j < m) { if (x[i] === y[j]) { push('=', x[i]); i++; j++; } else if (dp[i + 1][j] >= dp[i][j + 1]) push('-', x[i++]); else push('+', y[j++]); }
   while (i < n) push('-', x[i++]); while (j < m) push('+', y[j++]);
   return out.map((o) => (o.t === '=' ? esc(o.s) : o.t === '-' ? `<del>${esc(o.s)}</del>` : `<ins>${esc(o.s)}</ins>`)).join('');
+}
+// 文档编号：旧版本没有 docNo 的都算第 1 份
+const docNoOf = (d) => d.docNo || 1;
+const docTitleOf = (d) => d.title || ((d.text || '').split('\n').find((l) => /^#\s/.test(l)) || '主文档').replace(/^#\s+/, '');
+// 变更记录：每版一行「第 N 版（原因）：说明」，和导出的一致
+function changelogOf(list) {
+  const cut = (t, n = 100) => (t.length > n ? `${t.slice(0, n)}…` : t);
+  const flat = (t) => cut(String(t || '').replace(/\*\*/g, '').split('\n').map((l) => l.replace(/^[-*\s]+/, '').trim()).filter(Boolean).join('；'));
+  return list.map((d) => {
+    const from = d.opened ? `新开文档${d.opened.from ? `（从《${d.opened.from}》分出）` : ''}，原因：${cut(d.opened.reason || '（没写）')}` : '';
+    return `第 ${d.version} 版（${d.reason}${d.at ? `，${d.at.slice(0, 10)}` : ''}）：${[from, flat(d.note)].filter(Boolean).join('。') || '（没有说明）'}`;
+  });
 }
 // 主文档两版之间按行对比：改了一行的显示行内差异，大段没变的折叠
 function lineDiffHtml(a, b) {
@@ -537,15 +599,37 @@ function dataHtml(st, f) {
 
 // ---------- 一场讨论 ----------
 function closeStream() { if (S.es) { S.es.close(); S.es = null; } clearInterval(S.ticker); hideNewMsg(); }
+// 子页：方案讨论有主文档时「结论 / 讨论 / 文档」；只有旧版汇总时「结论（旧版汇总） / 讨论」
+function tabsOf(r) {
+  const docs = r.docs || [];
+  const docCount = new Set(docs.map(docNoOf)).size;
+  const docTab = ['doc', docCount > 1 ? `文档 · ${docCount} 份` : docs.length ? `文档 · 第 ${docs[docs.length - 1].version} 版` : '文档（还没有）'];
+  const revs = r.revisions?.length ? r.revisions : r.revision ? [r.revision] : [];
+  if (r.mode === 'refine') return [['talk', '讨论'], docTab, ['rev', `修订版${revs.length ? '' : '（还没有）'}`], ['orig', '原稿']];
+  if (!docs.length && r.summary) return [['conclusion', '结论（旧版汇总）'], ['talk', '讨论']];
+  if (r.mode === 'decision') return [['concl', '结论'], ['talk', '讨论'], docTab];
+  return [['talk', '讨论'], docTab];
+}
+// 默认落点只在打开讨论时决定：已结束且有主文档进结论页；没有主文档进旧版汇总，再没有进讨论页；进行中进讨论页
+function landingOf(r) {
+  const st = r.progress?.status;
+  const live = st === 'running' || st === 'queued';
+  if (r.mode !== 'decision') return 'talk';
+  if (live) return 'talk';
+  if (r.docs?.length) return 'concl';
+  return r.summary ? 'conclusion' : 'talk';
+}
 async function openRun(number, sub) {
-  closeStream(); S.sel = null; S.revIdx = null; if (sub) S.sub = sub;
+  closeStream(); S.sel = null; S.revIdx = null;
   let run;
   try { run = await api(`/api/runs/${number}`); } catch (e) { toast(e.message); return; }
-  S.run = run; S.docIdx = null; S.docDiff = false;
-  if (run.mode !== 'refine' && !['talk', 'conclusion', 'doc'].includes(S.sub)) S.sub = 'talk';
-  if (S.sub === 'conclusion' && run.docs?.length) S.sub = 'doc';
-  if (S.sub === 'doc' && !run.docs?.length && run.mode !== 'refine') S.sub = run.summary ? 'conclusion' : 'talk';
+  S.run = run; S.docIdx = null; S.docDiff = false; S.docNo = null;
+  S.sub = sub && tabsOf(run).some(([k]) => k === sub) ? sub : landingOf(run);
+  // 默认只展开最新一组
+  const blocks = blocksOf(run.posts).filter((b) => b.key);
+  S.expanded = new Set(blocks.length ? [blocks[blocks.length - 1].id] : []);
   renderList(); renderRun();
+  if (S.sub === 'talk' && run.progress?.status === 'running') toBottom(); // 进行中跟到最新
   const after = run.posts.length ? run.posts[run.posts.length - 1].seq : 0;
   const es = new EventSource(`/api/runs/${number}/events?after=${after}`);
   S.es = es;
@@ -553,7 +637,13 @@ async function openRun(number, sub) {
     const p = JSON.parse(ev.data);
     if (S.run?.number !== number || S.run.posts.some((x) => x.seq === p.seq)) return;
     const prev = S.run.posts[S.run.posts.length - 1];
+    // 新建的组一律展开（不在讨论页时也记下，切回来时是展开的）
+    if (p.groupKey && prev?.groupKey !== p.groupKey) S.expanded.add(`${p.groupKey}@${p.seq}`);
     S.run.posts.push(p); appendPost(p, prev);
+  });
+  es.addEventListener('blockers', (ev) => {
+    if (S.run?.number !== number) return;
+    S.run.blockers = JSON.parse(ev.data); renderStat();
   });
   es.addEventListener('progress', async (ev) => {
     const prog = JSON.parse(ev.data);
@@ -568,13 +658,18 @@ async function openRun(number, sub) {
   });
   S.ticker = setInterval(renderProgress, 1000);
 }
+// 卡片头：代号在前，模型名在后；副标题里的「代号 xx」去掉，避免重复
+function postHead(p) {
+  const sub = p.tag ? String(p.subtitle || '').replace(/\s*·\s*代号\s*[^·]+$/, '') : p.subtitle;
+  return `<div class="ph">${p.tag ? `<span class="tagc">${esc(p.tag)}</span>` : ''}<span class="who">${esc(p.title)}</span><span class="sub">${esc(sub)}</span></div>`;
+}
 function postHtml(p) {
   const color = COLORS[p.speaker?.color] || 'var(--line)';
   const plan = p.plan ? `<details class="plan"><summary>当前完整方案</summary><div class="body">${md(p.plan)}</div></details>` : '';
   if (p.brief) {
     // 有要点：只露出要点，详细内容折叠（主席的汇总默认展开）
-    return `<div class="post ${p.error ? 'error' : ''}" style="--c:${color}">
-    <div class="ph"><span class="who">${esc(p.title)}</span><span class="sub">${esc(p.subtitle)}</span></div>
+    return `<div class="post ${p.error ? 'error' : ''}" style="--c:${color}" data-seq="${p.seq}">
+    ${postHead(p)}
     <div class="body brief">${md(p.brief)}</div>
     ${p.body ? `<details ${p.stage === 'summary' ? 'open' : ''}><summary>详细内容</summary><div class="body">${md(p.body)}</div></details>` : ''}
     ${plan}
@@ -582,16 +677,68 @@ function postHtml(p) {
   }
   const long = (p.body || '').length > 1400;
   const docLink = p.stage === 'doc' ? '<button class="btn" data-sub="doc" style="margin-top:6px">查看主文档</button>' : '';
-  return `<div class="post ${p.error ? 'error' : ''} ${long ? 'fold' : ''}" style="--c:${color}">
-    <div class="ph"><span class="who">${esc(p.title)}</span><span class="sub">${esc(p.subtitle)}</span></div>
+  return `<div class="post ${p.error ? 'error' : ''} ${long ? 'fold' : ''}" style="--c:${color}" data-seq="${p.seq}">
+    ${postHead(p)}
     <div class="body">${md(p.body)}</div>${docLink}
     ${long ? '<button class="more">展开全文</button>' : ''}
     ${plan}
     ${p.footer ? `<div class="foot">${esc(p.footer)}</div>` : ''}</div>`;
 }
-// 每次追问的发言在单独的目录里（part 1、2……），换目录时画一条分隔线
+// 每次追问的发言是单独一次运行（part 1、2……），换运行时画一条分隔线
 function divider(p, prev) { return p.part > 0 && p.part !== prev?.part ? `<div class="divider">追问 ${p.part} · ${new Date(p.at).toLocaleString('zh-CN', { hour12: false })}</div>` : ''; }
-function postsHtml(posts) { return posts.map((p, i) => divider(p, posts[i - 1]) + postHtml(p)).join(''); }
+
+// ---------- 按轮折叠：只合并相邻的同组卡片，不重排、不丢卡片；没有组键的开场、结束卡原位显示 ----------
+function blocksOf(posts) {
+  const out = [];
+  for (const p of posts) {
+    const last = out[out.length - 1];
+    if (p.groupKey && last?.key === p.groupKey) last.posts.push(p);
+    else out.push(p.groupKey ? { id: `${p.groupKey}@${p.seq}`, key: p.groupKey, label: p.groupLabel, part: p.part, posts: [p] } : { single: p, part: p.part, posts: [p] });
+  }
+  return out;
+}
+// 轮头：评审 X/Y 没有意见（解析不出的标未识别，全部解析不出就不显示）、N 位提了阻断（0 不显示）、含插话
+function groupStats(posts) {
+  const out = [`${posts.length} 条`];
+  const crit = posts.filter((p) => p.stage === 'critique' && !p.error);
+  if (crit.length) {
+    const known = crit.filter((p) => p.verdict);
+    const done = known.filter((p) => p.verdict === 'done').length;
+    if (known.length) out.push(`评审 ${done}/${crit.length} 没有意见${known.length < crit.length ? `（${crit.length - known.length} 位未识别）` : ''}`);
+    const n = crit.filter((p) => p.blocked).length;
+    if (n) out.push(`<span class="bad">${n} 位提了阻断</span>`);
+  }
+  const checks = posts.filter((p) => p.stage === 'factcheck').length;
+  if (checks) out.push('含代码核实');
+  if (posts.some((p) => p.stage === 'interjection')) out.push('含插话');
+  return out.join(' · ');
+}
+function partLabel(part) { return part > 0 ? `追问 ${part} · ` : ''; }
+function blockHtml(b) {
+  const open = S.expanded.has(b.id);
+  return `<section class="grp ${open ? '' : 'closed'}" data-blk="${esc(b.id)}" data-key="${esc(b.key)}">
+    <button class="gh" data-grp="${esc(b.id)}"><span class="caret"></span><b>${esc(b.label)}</b><span class="gs">${groupStats(b.posts)}</span><span class="unread"></span></button>
+    <div class="gb">${b.posts.map(postHtml).join('')}</div></section>`;
+}
+function postsHtml(posts) {
+  let prev = null;
+  return blocksOf(posts).map((b) => {
+    const html = divider(b.posts[0], prev) + (b.key ? blockHtml(b) : postHtml(b.single));
+    prev = b.posts[b.posts.length - 1];
+    return html;
+  }).join('');
+}
+function setOpen(id, open) {
+  if (open) S.expanded.add(id); else S.expanded.delete(id);
+  const el = document.querySelector(`.grp[data-blk="${CSS.escape(id)}"]`);
+  if (el) { el.classList.toggle('closed', !open); if (open) el.querySelector('.unread').textContent = ''; }
+}
+// 跳到一组：切到讨论页、展开、滚过去
+function jumpTo(id) {
+  if (S.sub !== 'talk') { S.sub = 'talk'; renderRun(); }
+  setOpen(id, true);
+  document.querySelector(`.grp[data-blk="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'start' });
+}
 // 宽屏时滚动的是右侧 main，窄屏（main 不出滚动条）时滚动的是整个页面
 function scroller() { const m = document.querySelector('main'); return m.scrollHeight > m.clientHeight + 1 ? m : document.scrollingElement; }
 function nearBottom() { const s = scroller(); return s.scrollTop + s.clientHeight >= s.scrollHeight - 120; }
@@ -607,15 +754,84 @@ function hideNewMsg() { unseen = 0; $('newmsg')?.remove(); }
 const onScroll = () => { if (unseen && nearBottom()) hideNewMsg(); };
 document.querySelector('main').addEventListener('scroll', onScroll, { passive: true });
 window.addEventListener('scroll', onScroll, { passive: true });
+// 新发言按组键追加：和最后一组同组就接在组里，否则新建一组（新组一律展开）。
+// 用户手动收起的组不强制展开，只更新轮头和未读数；只有停在底部时才自动滚动
 function appendPost(p, prev) {
+  renderStat();
   const box = $('posts'); if (!box) return;
   const follow = nearBottom(); // 要在插入之前判断
-  box.insertAdjacentHTML('beforeend', divider(p, prev) + postHtml(p));
+  const last = box.lastElementChild;
+  let hidden = false;
+  if (p.groupKey && last?.classList.contains('grp') && last.dataset.key === p.groupKey && prev?.groupKey === p.groupKey) {
+    last.querySelector('.gb').insertAdjacentHTML('beforeend', postHtml(p));
+    const b = blocksOf(S.run.posts).find((x) => x.id === last.dataset.blk);
+    if (b) last.querySelector('.gs').innerHTML = groupStats(b.posts);
+    if (last.classList.contains('closed')) {
+      hidden = true;
+      const u = last.querySelector('.unread'); u.textContent = `${(parseInt(u.textContent, 10) || 0) + 1} 条未读`;
+    }
+  } else if (p.groupKey) {
+    box.insertAdjacentHTML('beforeend', divider(p, prev) + blockHtml({ id: `${p.groupKey}@${p.seq}`, key: p.groupKey, label: p.groupLabel, part: p.part, posts: [p] }));
+  } else {
+    box.insertAdjacentHTML('beforeend', divider(p, prev) + postHtml(p));
+  }
   if (follow) { const sc = scroller(); sc.scrollTop = sc.scrollHeight; } // 直接跳到底：平滑滚动没滚完时，下一条消息会误以为你离开了底部
-  else { unseen += 1; showNewMsg(); }
+  else if (!hidden) { unseen += 1; showNewMsg(); }
+  renderTools();
 }
 function ago(at) { const s = Math.max(0, Math.round((Date.now() - Date.parse(at)) / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; }
+// ---------- 吸顶状态条：状态、第几轮、谁在写、结束原因、仍提阻断的评审数 ----------
+function endingHtml(o) {
+  if (!o?.ending) return '';
+  const label = ENDING_LABEL[o.ending] || o.ending;
+  const round = o.round && ['converged', 'max', 'fixed', 'deadlock', 'dissent'].includes(o.ending) ? `第 ${o.round} 轮 · ` : '';
+  const via = o.handling === 'discuss' && o.ending !== 'followup' ? '追问后重新讨论 · ' : '';
+  return `<span class="${ENDING_WARN.has(o.ending) ? 'warn' : ''}">结束：${via}${round}${esc(label)}</span>`;
+}
+function renderStat() {
+  const box = $('statline'); if (!box || !S.run) return;
+  const r = S.run, p = r.progress || {}, o = r.outcome || {}, b = r.blockers;
+  const items = [];
+  if (p.status === 'running') {
+    const lastRound = [...r.posts].reverse().find((x) => Number.isFinite(x.round) && x.round > 0)?.round;
+    const who = (p.speaking || []).map((s) => esc(s.name)).join('、');
+    items.push(`<span><span class="dot" style="display:inline-block;margin-right:6px"></span>${lastRound ? `第 ${lastRound} 轮` : '准备中'}${who ? ` · ${who} 在写` : ''}</span>`);
+  } else if (p.status === 'queued') items.push('<span>排队中</span>');
+  else if (p.status === 'failed') items.push(`<span class="warn">失败：${esc(p.error || '')}</span>`);
+  if (p.status !== 'running' && p.status !== 'queued') items.push(endingHtml(o));
+  if (o.followUpStatus === 'running' && p.status !== 'running') items.push('<span>追问进行中</span>');
+  if (o.followUpStatus === 'failed' && p.status !== 'failed') items.push('<span class="warn">最近一次追问没有完成</span>');
+  if (typeof o.facts === 'number' && o.facts) items.push(`<span>核实了 ${o.facts} 个问题</span>`);
+  if (b) {
+    // 解析不出时写「未识别」，不写 0
+    const text = b.blocking ? `${b.beforeVerdict ? '裁决前' : '仍提'}阻断：${b.blocking}/${b.reviewers} 位评审` : b.unknown === b.reviewers ? '阻断：未识别' : `阻断：0/${b.reviewers} 位${b.unknown ? `（${b.unknown} 位未识别）` : ''}`;
+    items.push(`<button class="blk ${b.blocking && !b.beforeVerdict ? 'on' : ''}" data-blkjump="1" title="${p.status === 'running' ? '跳到最新一轮评审' : '看结论页的阻断区块'}">${text}</button>`);
+  }
+  box.innerHTML = items.filter(Boolean).join('');
+}
+// 子页签右侧：轮次跳转、全部展开 / 收起（只在讨论页）
+function renderTools() {
+  const box = $('tools'); if (!box || !S.run) return;
+  if (S.sub !== 'talk') { box.innerHTML = ''; return; }
+  const blocks = blocksOf(S.run.posts).filter((b) => b.key);
+  box.innerHTML = `<select id="jump" title="跳到某一轮"><option value="">跳到…</option>${blocks.map((b) => `<option value="${esc(b.id)}">${partLabel(b.part)}${esc(b.label)}</option>`).join('')}</select>
+    <button data-allgrp="1">全部展开</button><button data-allgrp="0">全部收起</button>`;
+  $('jump').onchange = (ev) => { if (ev.target.value) jumpTo(ev.target.value); ev.target.value = ''; };
+}
+// 点阻断数：结束后跳到结论页的阻断区块；进行中跳到最新一轮评审
+function blockerJump() {
+  const r = S.run, st = r.progress?.status;
+  if (st === 'running' || st === 'queued' || r.mode !== 'decision' || !r.docs?.length) {
+    const last = blocksOf(r.posts).filter((b) => b.key && b.posts.some((p) => p.stage === 'critique')).pop();
+    if (last) jumpTo(last.id);
+    return;
+  }
+  if (S.sub !== 'concl') { S.sub = 'concl'; renderRun(); }
+  $('blockerBox')?.scrollIntoView({ block: 'start' });
+}
+
 function renderProgress() {
+  renderStat();
   const box = $('progress'); if (!box || !S.run) return;
   const p = S.run.progress || {};
   const running = p.status === 'running', queued = p.status === 'queued';
@@ -650,6 +866,52 @@ function renderProgress() {
     };
   }
 }
+// ---------- 结论页：一句话结论 → 要点 → 要拍板的事 → 下一步 → 风险，下面是结束状态和阻断区块 ----------
+const stripMark = (l) => String(l).replace(/^\s*(?:[-*+•]\s+|\d+[.、)）]\s*)/, '');
+function blockerBoxHtml(b, o) {
+  if (!b) return '';
+  const title = b.beforeVerdict ? '裁决前评审仍提的阻断' : '评审最后仍提的阻断';
+  const from = `出自${b.source}${b.round ? `第 ${b.round} 轮` : ''}，每位评审看这次最近一次发言`;
+  const rows = b.rows.filter((x) => x.blocked);
+  const unknown = b.rows.filter((x) => x.verdict === null && !x.blocked);
+  const dropped = b.rows.filter((x) => x.dropped);
+  const row = (x, lines, round) => `<div class="brow"><span class="tagc">${esc(x.tag || x.name)}</span> ${esc(x.name)}${round ? ` · 第 ${round} 轮` : ''}<ul>${lines.map((l) => `<li>${inline(stripMark(l))}</li>`).join('')}</ul></div>`;
+  const body = rows.length
+    ? rows.map((x) => row(x, x.lines, x.round)).join('')
+    : `<div class="hint">${unknown.length === b.reviewers ? '解析不出评审结论和行首【阻断】，未识别。' : '最近一次评审都没有提行首【阻断】。'}</div>`;
+  const note = ENDING_WARN.has(o?.ending) && rows.length === 0 ? '<div class="hint" style="margin-top:6px">这场以「' + esc(ENDING_LABEL[o.ending]) + '」结束：网页只认行首的【阻断】，列出的可能比程序认定的少，以结束原因为准。</div>' : '';
+  return `<div class="card blkbox ${rows.length && !b.beforeVerdict ? 'alert' : ''}" id="blockerBox"><h3>${title}<span class="hint">${esc(from)}</span></h3>${body}
+    ${unknown.length && unknown.length < b.reviewers ? `<div class="hint" style="margin-top:6px">未识别：${unknown.map((x) => esc(x.tag || x.name)).join('、')}（没写评审结论，也没有行首【阻断】）</div>` : ''}
+    ${dropped.length ? `<details style="margin-top:8px"><summary>后来没再提（${dropped.length} 位）</summary>${dropped.map((x) => row(x, x.dropped.lines, x.dropped.round)).join('')}<div class="hint">之前提过、最近一次没再提，不代表已经解除。</div></details>` : ''}${note}</div>`;
+}
+function conclHtml(r, status) {
+  const live = status === 'running' || status === 'queued';
+  const secs = r.docSections || [];
+  if (!secs.length) return `<div class="card hint">${live ? '讨论结束后生成。' : '这场讨论没有主文档。'}</div>${live ? '' : blockerBoxHtml(r.blockers, r.outcome)}`;
+  // 一场讨论可以有几份文档：和「文档」页共用选中的那份，默认最近改过的
+  const docs = r.docs || [];
+  const nos = secs.map((s) => s.docNo);
+  const no = nos.includes(S.docNo) ? S.docNo : docNoOf(docs[docs.length - 1]);
+  const s = secs.find((x) => x.docNo === no) || secs[secs.length - 1];
+  const doc = docs.find((d) => d.version === s.version);
+  const titleOf = (n) => docTitleOf(docs.filter((d) => docNoOf(d) === n).pop() || {});
+  const head = `${nos.length > 1 ? `<div class="docbar">${nos.map((n) => `<button class="btn ${n === s.docNo ? 'primary' : ''}" data-docno="${n}">《${esc(titleOf(n))}》</button>`).join('')}</div>` : ''}
+    ${live || r.outcome?.followUpStatus === 'running' ? '<div class="banner">追问进行中，下面是上一版主文档的结论。</div>' : ''}`;
+  const tail = `<div class="card"><h3>结束状态</h3>${endingHtml(r.outcome) || '<span class="hint">结束原因未知</span>'}
+      ${r.outcome?.followUpStatus === 'failed' ? '<div class="warn" style="color:var(--warn)">最近一次追问没有完成，结束原因取的是前一次。</div>' : ''}
+      ${typeof r.outcome?.facts === 'number' ? `<div class="hint">讨论中核实了 ${r.outcome.facts} 个问题。</div>` : ''}</div>
+    ${blockerBoxHtml(r.blockers, r.outcome)}
+    <div class="row"><button class="btn" data-sub="doc">看全文（第 ${s.version} 版）</button></div>`;
+  if (s.failed) return `${head}<div class="banner warn">未能提取结论（主文档里缺少：${esc((s.missing || []).map((k) => ({ points: '要点', decisions: '要拍板的事', next: '下一步' }[k] || k)).join('、') || '大纲')}），下面显示全文。</div><div class="card">${md(doc?.text || '')}</div>${tail}`;
+  const sec = (x, title) => (x ? `<div class="card"><h3>${esc(title || x.title)}</h3>${md(x.text)}</div>` : '');
+  const d = s.decisions;
+  const decisions = d ? `<div class="card"><h3>${esc(d.title)}</h3>${d.lead ? md(d.lead) : ''}${d.parts.map((p) => `<div class="dsub ${p.pick ? 'pick' : ''}"><h4>${esc(p.title)}</h4>${md(p.text)}</div>`).join('')}</div>` : '';
+  return `${head}
+    ${s.oneLiner ? `<div class="card oneliner">${md(s.oneLiner)}</div>` : ''}
+    ${sec(s.points, '要点')}${decisions}${sec(s.next, '下一步')}${sec(s.risks)}
+    ${tail}`;
+}
+
 function renderRun() {
   const r = S.run, p = r.progress || {};
   const status = p.status === 'idle' ? 'done' : p.status;
@@ -658,15 +920,18 @@ function renderRun() {
   const chips = `<span class="chip ${status}">${STATUS_LABEL[status] || status}</span><span class="chip">${MODE_LABEL[r.mode] || r.mode}</span><span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.mock ? '<span class="chip">mock</span>' : ''}`;
   const title = refine && r.subject ? `${TYPE_LABEL[r.subject.type]}「${esc(r.subject.title)}」` : esc((r.topic || '').split('\n')[0].slice(0, 80));
   const docs = r.docs || [];
-  const docTab = ['doc', docs.length ? `文档 · 第 ${docs[docs.length - 1].version} 版` : '文档（还没有）'];
-  const tabs = refine
-    ? [['talk', '讨论'], docTab, ['rev', `修订版${revs.length ? '' : '（还没有）'}`], ['orig', '原稿']]
-    : docs.length || !r.summary ? [['talk', '讨论'], docTab] : [['talk', '讨论'], ['conclusion', '结论（旧版汇总）']];
+  const tabs = tabsOf(r);
+  if (!tabs.some(([k]) => k === S.sub)) S.sub = tabs[0][0] === 'concl' && !docs.length ? 'talk' : tabs[0][0];
   $('main').innerHTML = `
-    <div class="head"><h2>#${r.number} · ${title}</h2>${chips}${r.archived ? '<span class="chip">已归档</span>' : ''}<span class="ops"><button id="archiveBtn">${r.archived ? '取消归档' : '归档'}</button><button id="deleteBtn" class="danger" ${status === 'running' || status === 'queued' ? 'disabled title="进行中或排队中的讨论不能删"' : ''}>删除</button></span></div>
+    <div class="sticky">
+      <div class="head"><h2>#${r.number} · ${title}</h2>${chips}${r.archived ? '<span class="chip">已归档</span>' : ''}<span class="ops"><button id="archiveBtn">${r.archived ? '取消归档' : '归档'}</button><button id="deleteBtn" class="danger" ${status === 'running' || status === 'queued' ? 'disabled title="进行中或排队中的讨论不能删"' : ''}>删除</button></span></div>
+      <div class="statline" id="statline"></div>
+      <div class="subtabs">${tabs.map(([k, l]) => `<button class="subtab ${S.sub === k ? 'on' : ''}" data-sub="${k}">${l}</button>`).join('')}<span class="tools" id="tools"></span></div>
+    </div>
     <div class="meta">${refine ? `作者的要求：${esc(r.topic || '（没有额外要求）')}` : (r.topic || '').includes('\n') ? `<details><summary>完整议题</summary><div class="pre">${esc(r.topic)}</div></details>` : ''}${r.code ? `代码：${r.code.auto ? '调研员按议题定位' : esc(r.code.repos.join('；'))}` : ''}${r.data ? ` · ${[r.data.tools ? '数据工具' : '', r.data.knowledge.length ? `知识：${esc(r.data.knowledge.join('、'))}` : ''].filter(Boolean).join(' · ')}` : ''}${r.followUps.length ? ` · 追问 ${r.followUps.length} 次` : ''}</div>
-    <div class="subtabs">${tabs.map(([k, l]) => `<button class="subtab ${S.sub === k ? 'on' : ''}" data-sub="${k}">${l}</button>`).join('')}</div>
-    <div id="pane"></div>`;
+    <div id="pane"></div>
+    <div class="progress" id="progress"><div class="bar"></div><div class="composer"></div></div>`;
+  renderStat(); renderTools(); renderProgress();
   $('archiveBtn').onclick = async () => {
     try {
       const res = await api(`/api/runs/${r.number}/archive`, { method: 'POST', body: JSON.stringify({ archived: !r.archived }) });
@@ -684,8 +949,9 @@ function renderRun() {
   };
   const pane = $('pane');
   if (S.sub === 'talk') {
-    pane.innerHTML = `<div id="posts">${postsHtml(r.posts)}</div><div class="progress" id="progress"><div class="bar"></div><div class="composer"></div></div>`;
-    renderProgress();
+    pane.innerHTML = `<div id="posts">${postsHtml(r.posts)}</div>`;
+  } else if (S.sub === 'concl') {
+    pane.innerHTML = conclHtml(r, status);
   } else if (S.sub === 'conclusion') {
     const asked = r.followUps.filter((f) => f.answer);
     pane.innerHTML = r.conclusion
@@ -693,20 +959,29 @@ function renderRun() {
       : `<div class="card hint">${status === 'running' || status === 'queued' ? '讨论结束后这里显示主席的汇总。' : '这场讨论没有汇总。'}</div>`;
   } else if (S.sub === 'doc') {
     if (!docs.length) { pane.innerHTML = `<div class="card hint">${status === 'running' || status === 'queued' ? '讨论结束后主席会写主文档，主笔核对后发在这里。' : r.docFailed ? '主席没能写出主文档。「讨论」页最后有一张程序整理的结果（各主笔的最终方案、评审最后提的阻断、没核实的问题）。可以在终端运行 node src/cli.js doc ' + r.number + ' 补写。' : r.summary ? '这场讨论还没有主文档（旧讨论只有汇总）。可以在终端运行 node src/cli.js doc ' + r.number + ' 补写。' : '这场讨论没有主文档。'}</div>`; return; }
-    const idx = Math.min(S.docIdx ?? docs.length - 1, docs.length - 1);
-    const d = docs[idx], prev = docs[idx - 1];
+    // 一场讨论可以有几份文档（主席按方向新开的）：先选文档，再选这份文档的版本
+    const nos = [...new Set(docs.map(docNoOf))];
+    const no = nos.includes(S.docNo) ? S.docNo : docNoOf(docs[docs.length - 1]);
+    const mine = docs.filter((v) => docNoOf(v) === no);
+    const idx = Math.min(S.docIdx ?? mine.length - 1, mine.length - 1);
+    const d = mine[idx], prev = mine[idx - 1];
     const diff = S.docDiff && prev;
     const check = d.check ? (d.check.issues ? `主笔核对提了 ${d.check.issues} 份意见${d.check.fixed ? '，已按意见修改' : ''}` : '主笔核对没有意见') : '';
     const atts = Object.entries(d.attachments || {});
     const gone = diff ? Object.keys(prev.attachments || {}).filter((k) => !(k in (d.attachments || {}))) : [];
     const asked = r.followUps.filter((f) => f.question);
+    const latestOf = (n) => docs.filter((v) => docNoOf(v) === n).pop();
     pane.innerHTML = `
-      <div class="docbar">${docs.map((v, i) => `<button class="btn ${i === idx ? 'primary' : ''}" data-docv="${i}" title="${esc(v.reason)}">第 ${v.version} 版</button>`).join('')}
-        ${prev ? `<button class="btn" data-docdiff="1">${diff ? '看全文' : `和第 ${prev.version} 版对比`}</button>` : ''}</div>
+      ${nos.length > 1 ? `<div class="docbar">${nos.map((n) => `<button class="btn ${n === no ? 'primary' : ''}" data-docno="${n}">《${esc(docTitleOf(latestOf(n)))}》</button>`).join('')}</div>` : ''}
+      <div class="docbar">${mine.map((v, i) => `<button class="btn ${i === idx ? 'primary' : ''}" data-docv="${i}" title="${esc(v.reason)}">第 ${v.version} 版</button>`).join('')}
+        ${prev ? `<button class="btn" data-docdiff="1">${diff ? '看全文' : `和第 ${prev.version} 版对比`}</button>` : ''}
+        <a class="btn" href="/api/runs/${r.number}/docs/${d.version}.md" download title="下载第 ${d.version} 版（Markdown，含附录和变更记录）">导出第 ${d.version} 版</a></div>
       <div class="docmeta">${esc(d.reason)} · ${new Date(d.at).toLocaleString('zh-CN', { hour12: false })}${check ? ` · ${check}` : ''}</div>
+      ${d.opened ? `<div class="card hint">新开的文档${d.opened.from ? `，从《${esc(d.opened.from)}》分出` : ''}。原因：${esc(d.opened.reason || '（没写）')}</div>` : ''}
       <div class="card">${diff ? lineDiffHtml(prev.text, d.text) : md(d.text)}</div>
       ${atts.map(([title, text]) => `<div class="card"><details ${diff ? 'open' : ''}><summary>附录《${esc(title)}》${diff && !(title in (prev.attachments || {})) ? ' <span class="chip">新增</span>' : ''}</summary>${diff ? lineDiffHtml(prev.attachments?.[title] ?? '', text) : md(text)}</details></div>`).join('')}
       ${gone.map((title) => `<div class="card hint">附录《${esc(title)}》在这一版删掉了</div>`).join('')}
+      <div class="card"><details><summary>变更记录（${idx + 1} 版）</summary><ul>${changelogOf(mine.slice(0, idx + 1)).map((l) => `<li>${esc(l)}</li>`).join('')}</ul></details></div>
       ${asked.length ? `<div class="card"><h3>追问记录</h3>${asked.map((f) => `<details style="margin-top:8px"><summary>${esc(f.question)}（${HANDLING_LABEL[f.handling] || f.handling}${f.context === 'fresh' ? ' · 新会话' : ''}${f.doc ? ` → 第 ${f.doc} 版` : ''}）</summary>${md(f.answer || '（没有结论）')}</details>`).join('')}</div>` : ''}`;
   } else if (S.sub === 'orig') {
     pane.innerHTML = `<div class="card"><div class="pre">${esc(r.subject.current)}</div></div><div class="card"><details><summary>背景</summary><div class="pre" style="margin-top:8px">${esc(r.subject.background)}</div></details></div>`;
@@ -738,16 +1013,20 @@ function renderRun() {
 
 // ---------- 事件 ----------
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docdiff],.more');
+  const t = ev.target.closest('[data-tab],[data-type],[data-run],[data-sub],[data-rev],[data-docv],[data-docno],[data-docdiff],[data-grp],[data-allgrp],[data-blkjump],.more');
   if (!t) return;
   if (t.matches('.more')) { const post = t.closest('.post'); post.classList.remove('fold'); t.remove(); return; }
   ev.preventDefault();
+  if (t.dataset.grp) { setOpen(t.dataset.grp, !S.expanded.has(t.dataset.grp)); return; }
+  if (t.dataset.allgrp) { for (const b of blocksOf(S.run.posts).filter((x) => x.key)) setOpen(b.id, t.dataset.allgrp === '1'); return; }
+  if (t.dataset.blkjump) { blockerJump(); return; }
   if (t.dataset.tab) { S.tab = t.dataset.tab; renderTabs(); renderList(); if (S.tab === 'runs') loadRuns(); }
-  else if (t.dataset.run) openRun(Number(t.dataset.run), 'talk');
+  else if (t.dataset.run) openRun(Number(t.dataset.run));
   else if (t.dataset.type) openItem(t.dataset.type, t.dataset.id);
   else if (t.dataset.sub) { hideNewMsg(); S.sub = t.dataset.sub; renderRun(); }
   else if (t.dataset.rev) { S.revIdx = Number(t.dataset.rev); renderRun(); }
   else if (t.dataset.docv) { S.docIdx = Number(t.dataset.docv); renderRun(); }
+  else if (t.dataset.docno) { S.docNo = Number(t.dataset.docno); S.docIdx = null; S.docDiff = false; renderRun(); }
   else if (t.dataset.docdiff) { S.docDiff = !S.docDiff; renderRun(); }
 });
 let searchTimer;

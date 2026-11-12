@@ -4,7 +4,7 @@ import { ConfigError } from './config.js';
 import { createProviderRegistry } from './providers/index.js';
 import { createLarkPublisher, createConsolePublisher, createStorePublisher, combinePublishers } from './publishers.js';
 import { createInterjectionReader } from './lark/interjections.js';
-import { runDiscussion, runFollowUp, backfillDoc } from './orchestrator.js';
+import { runDiscussion, runFollowUp, backfillDoc, rewriteDocs } from './orchestrator.js';
 import { nextNumber, saveState, findState, expireOldSessions } from './state.js';
 import { DEFAULT_CLAUDE_CWD } from './providers/claude-cli.js';
 import { isTrigger, DEFAULT_TRIGGERS } from './watch.js';
@@ -198,9 +198,10 @@ export async function followUpOne(cfg, { question, number, dryRun = false, mock 
 }
 
 /**
- * 给还没有主文档的旧讨论补写一份。只打印到终端，不发群、不写发言记录；结果写回原讨论的状态。
+ * 给还没有主文档的旧讨论补写一份；rewrite 时按现在的写法重写已有的文档（记为新的一版，可能拆出新文档）。
+ * 只打印到终端，不发群、不写发言记录；结果写回原讨论的状态。
  */
-export async function docOne(cfg, { number, mock = false, store = storeOf(cfg) }) {
+export async function docOne(cfg, { number, mock = false, rewrite = false, store = storeOf(cfg) }) {
   let found;
   try {
     found = findState(store, number);
@@ -210,17 +211,24 @@ export async function docOne(cfg, { number, mock = false, store = storeOf(cfg) }
   const state = withBudget(found.state, store);
   const providers = createProviderRegistry(cfg, { forceMock: mock });
   const publisher = combinePublishers([createConsolePublisher({ full: false })]);
-  log(`补写主文档 #${state.number}「${state.topic.split('\n')[0].slice(0, 30)}」：主席读全部记录写初稿，主笔核对`);
+  const title = state.topic.split('\n')[0].slice(0, 30);
+  log(rewrite
+    ? `重写主文档 #${state.number}「${title}」：主席按现在的写法重写${state.expired ? '' : '，主笔核对'}`
+    : `补写主文档 #${state.number}「${title}」：主席读全部记录写初稿，主笔核对`);
   let result;
   try {
-    result = await backfillDoc({ cfg: configForState(cfg, state), state, providers, publisher, log });
+    const job = { cfg: configForState(cfg, state), state, providers, publisher, log };
+    result = rewrite ? await rewriteDocs(job) : await backfillDoc(job);
   } catch (err) {
     throw new ConfigError(err.message);
   }
   saveState(store, result.state);
-  const { stats, doc } = result;
-  const extra = Object.keys(doc.attachments).length;
-  log(`完成：第 ${doc.version} 版，${doc.text.length} 字${extra ? `，附录 ${extra} 份` : ''}。${stats.calls} 次模型调用${stats.costUsd ? `，约 $${stats.costUsd.toFixed(2)}` : ''}。在网页 #${state.number} 查看`);
+  const { stats, docs } = result;
+  const lines = docs.map((d) => {
+    const extra = Object.keys(d.attachments).length;
+    return `${d.opened ? '新开' : ''}《${d.title}》第 ${d.version} 版，正文 ${d.text.length} 字${extra ? `，附录 ${extra} 份` : ''}`;
+  });
+  log(`完成：${lines.join('；')}。${stats.calls} 次模型调用${stats.costUsd ? `，约 $${stats.costUsd.toFixed(2)}` : ''}。在网页 #${state.number} 查看`);
   return result;
 }
 

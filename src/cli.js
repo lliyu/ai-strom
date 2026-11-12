@@ -29,6 +29,7 @@ const HELP = `ai-storm：多个模型分角色讨论，每个模型用自己的 
   node src/cli.js repos                        列出登记的仓库和组，以及各仓库当前的分支与改动
   node src/cli.js followup [--run 12] "<问题>"   追问一场讨论（默认最近一场）：主席判断直接回答还是重新讨论
   node src/cli.js doc <编号> [--mock]          给还没有主文档的旧讨论补写一份（主席写、主笔核对；不发群）
+  node src/cli.js doc <编号> --rewrite         按现在的写法重写已有的文档，记为新的一版（可能拆出新文档；不发群）
   node src/cli.js web [--port 8790] [--mock]   本地网页：看全部讨论、插话、追问；发起方案讨论 / 脑洞风暴（不发群）和作品打磨
   node src/cli.js knowledge                    列出知识来源：目录、索引、文档数
   node src/cli.js tools                        列出数据工具：local/tools 里的命令行工具和登记的 MCP 服务
@@ -70,6 +71,7 @@ async function main(argv) {
       port: { type: 'string' },
       model: { type: 'string' },
       dir: { type: 'string' },
+      rewrite: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -133,7 +135,7 @@ async function main(argv) {
         console.error('缺少讨论编号：doc <编号>，例如 doc 7');
         return 2;
       }
-      await docOne(cfg, { number, mock: values.mock });
+      await docOne(cfg, { number, mock: values.mock, rewrite: values.rewrite });
       return 0;
     }
     default:

@@ -163,6 +163,16 @@ export function hasBlocker(text) {
   return /[【\[]\s*阻断\s*[】\]]/.test(String(text ?? ''));
 }
 
+/**
+ * 一行是不是阻断条目：去掉行首空白、列表符号、序号、加粗后，以【阻断】开头才算。
+ * 和 hasBlocker 的差别：hasBlocker 只看一行里有没有【阻断】，会把「本轮没有【阻断】」这类否定句也算成阻断。
+ * 网页的阻断统计用这个；流程控制（收敛、熔断）仍用 hasBlocker，误判只会多跑一轮，漏判会提前收敛。
+ */
+export function isBlockerLine(line) {
+  const rest = String(line ?? '').replace(/^(?:\s|[-*+•]\s|\d+[.、)）]\s*|\*\*|__)+/u, '');
+  return /^[【\[]\s*阻断\s*[】\]]/.test(rest);
+}
+
 /** 要点一节的写法，所有发言共用。 */
 function briefLine(what) {
   return `**要点**（放在最前面，不超过 3 行，人只看这几行就要知道${what}）`;
@@ -1024,64 +1034,74 @@ export function followUpPrompt({ mode, round, question, brief, others, interject
 
 // ---------- 主文档 ----------
 //
-// 每场讨论维护一份主文档，替代原来的汇总：讨论结束时主席写初稿，主笔对照讨论核对，主席按意见修改后定稿；
-// 之后每次追问都改这同一份文档（留历史版本），不另写一份。
-// 主文档要让没看过讨论的人读懂：有什么问题、怎么解决、还有什么没定。某一点需要大段细节时写成附录，
-// 主文档里保留这一点的结论并注明见附录，删掉附录也能独立读懂。
+// 每场讨论维护主文档，替代原来的汇总：讨论结束时主席写初稿，主笔对照讨论核对，主席按意见修改后定稿；
+// 之后每次追问都改当前文档（留历史版本）。讨论分出了互相独立的方向时，主席可以新开一份文档，并写清原因。
+// 主文档给没看过讨论的人读：先提炼结论和要拍板的事，再展开；细节写成附录，删掉附录正文也能独立读懂。
+// 变更记录不写进正文，由程序按各版的原因和说明生成（docChangelog）。
 
-export const DOC_MARK = { note: '【说明】', doc: '【主文档】', unchanged: '【无需修改】' };
+export const DOC_MARK = { note: '【说明】', doc: '【主文档】', unchanged: '【无需修改】', newDoc: '【新文档】' };
 // 标记单独一行；模型偶尔把内容接在标记后面同一行，也认
-const DOC_LINE = /^[ \t]*\**[ \t]*【(说明|主文档|无需修改|附录[:：][ \t]*([^】\n]+?))】[ \t]*\**[ \t]*[:：]?[ \t]*(.*)$/;
+const DOC_LINE = /^[ \t]*\**[ \t]*【(说明|主文档|无需修改|新文档|附录[:：][ \t]*([^】\n]+?))】[ \t]*\**[ \t]*[:：]?[ \t]*(.*)$/;
 const DELETED = /^[（(]\s*删除\s*[)）]$/;
+const OPEN_REASON = /^[ \t]*\**[ \t]*(?:新开)?原因\**[ \t]*[:：][ \t]*(.+)$/;
+
+/** 拍板项和风险的重要程度标记。 */
+export const PRIORITY = { first: '【先定】', later: '【可后定】' };
+
+const KEY_POINTS = '## 要点（最多 5 条，每条一句完整的话，不嵌套子项，按重要程度排序；人只看这里就知道结论、最要紧的拍板和下一步）';
 
 /** 各模式主文档的结构。 */
 const DOC_OUTLINE = {
   decision: [
     '# 标题（一句话说清讨论的是什么问题）',
-    '**一句话结论**：……',
-    '## 要点（3–5 条，人只看这里就能知道结论和要拍板的事）',
-    '## 问题（背景、现状、为什么要解决、约束条件；关键数据和已核实的代码事实写在这里）',
-    '## 方案（讨论达成一致的做法：怎么做、关键设计、落地步骤、前提假设）',
+    '**一句话结论**：……（只写一句话，不分行、不列点；分期或多项内容放到要点里）',
+    KEY_POINTS,
+    `## 要拍板的事（没达成一致、或要人决定的事，按重要程度排序。每条开头标${PRIORITY.first}或${PRIORITY.later}，写清要定什么、可选项和各自的代价、讨论的倾向；没有就写「无」）`,
+    '## 问题（为什么要解决、现状、约束条件。只写影响结论的事实，核实的证据和代码坐标放附录）',
+    '## 方案（先用一段话说清整体做法和为什么这样做，再写关键设计和落地步骤）',
     '## 考虑过但没采用的做法（每个一两句：是什么、为什么不选）',
-    '## 分歧与需要拍板的问题（没有达成一致的点：各方立场和理由、可选项和各自的代价；没有就写「无」）',
-    '## 风险与未核实的前提',
-    '## 下一步',
-    '## 变更记录（每个版本一行）',
+    '## 风险与未核实的前提（按影响从大到小排，只写会改变结论或让方案做不成的）',
+    '## 下一步（按先后顺序，只写接下来最近要做的几步；拍板项已经在上面，不要再列一遍）',
   ],
   brainstorm: [
     '# 标题（题目是什么）',
-    '**一句话结论**：最值得写的是哪个脑洞、为什么',
-    '## 要点（3–5 条）',
+    '**一句话结论**：最值得写的是哪个脑洞、为什么（只写一句话，不分行、不列点）',
+    KEY_POINTS,
     '## 题目与要求',
-    '## 最值得写的脑洞（3 个左右，每个都写完整：核心设定、主角与冲突、钩子和卖点、为什么值得写；不能只写编号）',
+    '## 最值得写的脑洞（3 个左右，按推荐程度排序，每个都写完整：核心设定、主角与冲突、钩子和卖点、为什么值得写；不能只写编号）',
     '## 可以组合的点子（组合后是什么样子）',
     '## 被低估的点子',
     '## 放弃的方向（每个一句话：是什么、为什么放弃）',
     '## 下一步',
-    '## 变更记录（每个版本一行）',
   ],
   refine: [
     '# 标题（打磨的是哪一份、改成什么样）',
-    '**一句话结论**：最该改的是什么、改完会好在哪里',
-    '## 要点（3–5 条）',
-    '## 原稿的问题（按重要程度排序）',
-    '## 修改方案（逐条写清改哪里、改成什么、为什么，作者可以照着改）',
+    '**一句话结论**：最该改的是什么、改完会好在哪里（只写一句话，不分行、不列点）',
+    KEY_POINTS,
+    `## 要作者拍板的事（各方的改法与理由、你倾向哪一种。每条开头标${PRIORITY.first}或${PRIORITY.later}；没有就写「无」）`,
+    '## 原稿的问题（按重要程度排序，先用一句话说清最根本的问题）',
+    '## 修改方案（逐条写清改哪里、改成什么、为什么，作者可以照着改；最重要的放最前面）',
     '## 保留不改的地方（以及为什么不改）',
-    '## 分歧与需要作者拍板的问题（各方的改法与理由、你倾向哪一种；没有就写「无」）',
-    '## 变更记录（每个版本一行）',
   ],
 };
 
-/** 写文档的规则：初稿、追问后更新、按核对意见修改共用。 */
+/** 写文档的规则：初稿、追问后更新、按核对意见修改、重写共用。 */
 function docRules(mode) {
   return [
     '## 写法',
-    '- 读者没有看过讨论过程，也不知道「方案 A」「评审 1」这些代号和轮次：文中不要出现代号和轮次，各个做法用内容本身命名（例如「按供应商分批迁移」）。',
-    '- 先结论、后细节。尽量简洁，但影响决策或落地的信息一条都不能丢：关键数据、约束、前提假设、已核实的代码事实（写出处）、被否决做法的理由、没解决的分歧。',
-    '- 共识和分歧分清楚：没有达成一致的不要写成定论，也不要替人拍板；没核实的写明「未核实」。',
+    '这份文档给没看过讨论的人读，不是讨论记录的归档。动笔前先想清楚：读者读完要知道什么结论、要做什么决定、接下来做什么，全文围绕这几件事组织。',
+    '- **先提炼，再展开**：每个部分开头先用一两句话写出这部分的结论，后面的内容只用来支撑它。不能只罗列。',
+    '- **不要堆碎点**：讨论里的零碎意见不要逐条搬进来。相关的点合并成一个判断，写清它们之间的关系（因果、取舍、先后）；并不进任何结论、也不影响决策的点直接删掉。',
+    '- **能压缩就压缩**：篇幅没有硬性上限，但每一段都要有理由留下。确实压缩不了的内容（例如落地步骤、关键设计）可以写长，写成连贯的段落或有序步骤，不要写成一串碎点。列表最多两层，每条写一个完整的意思。',
+    '- **同一件事只写一次**：要点里提到的事，后文只在一个地方展开；别的地方需要时写「见『某部分』」。',
+    `- **标出重点**：要拍板的事每条开头标${PRIORITY.first}（不定就没法开工或会做错）或${PRIORITY.later}（开工后再定也来得及），${PRIORITY.first}排在前面。要点和各部分里的条目都按重要程度排序，最要紧的放最前面。`,
+    '- **细节进附录**：核实的证据和代码坐标、完整的接口或字段清单、逐项的实现约定、不影响开工的实现细节分歧、被否决做法的完整论证，都放进附录。正文写出这一点的结论并注明「详见附录《标题》」。删掉附录，正文也要能独立读懂、能据此拍板。',
+    '- 读者不知道「方案 A」「评审 1」这些代号和轮次：文中不要出现代号和轮次，各个做法用内容本身命名（例如「按供应商分批迁移」）。',
+    '- 共识和分歧分清楚：没有达成一致的不要写成定论，也不要替人拍板；没核实的写明「未核实」。影响决策或落地的信息（关键数据、约束、前提假设、已核实的事实、没解决的分歧）不能丢，但要放在合适的层级：正文写结论，附录写细节。',
     mode === 'decision' ? '- 用「方案」写清楚要做什么，不要只列结论：读者照着它就能知道怎么落地。' : '',
+    '- 不要写「变更记录」，程序会按版本自动生成。',
     '- 用 Markdown：# 标题、列表、加粗、代码块都可以，不要用表格。',
-    '- 附录：某一点需要大段细节（完整的接口或字段清单、迁移步骤、数据明细等），放进主文档会影响阅读时，才写成附录。主文档里写出这一点的结论，并注明「详见附录《标题》」；删掉附录，主文档也要能独立读懂。没有必要就不写附录。',
+    '- **一份文档只讲一件事**：讨论分成了互相独立的方向（各自有自己的结论、拍板项和下一步，读者可能只关心其中一个），可以把其中的方向新开一份文档，必须写清新开的原因：它和当前文档为什么是两件事。只是同一件事的补充、细化或改主意，就改当前文档，不要新开。',
     '',
     '## 主文档的结构',
     ...DOC_OUTLINE[mode],
@@ -1094,27 +1114,30 @@ function docFormat({ update = false, allowUnchanged = false } = {}) {
     '按顺序输出下面几部分，每部分以单独一行的标记开头，标记前后不要写别的文字：',
     `${DOC_MARK.note}`,
     update
-      ? '发到讨论里的短消息，3 行以内：追问的结论，以及主文档改了哪些地方。'
+      ? '发到讨论里的短消息，3 行以内：这次的结论，以及文档改了哪些地方（新开了文档的话说明开了什么、为什么）。'
       : '发到讨论里的短消息，3 行以内：一句话结论，加上最需要人拍板或注意的一件事。',
     `${DOC_MARK.doc}`,
-    '完整的主文档。',
-    '【附录：标题】（可选，可以有多个）',
+    update ? '修改后的当前文档全文。当前文档这次不需要改、只新开文档时，省掉这个标记和内容。' : '完整的主文档。',
+    '【附录：标题】（可选，可以有多个，属于它前面最近的那份文档）',
     update
       ? '只输出新增或改动过的附录，没改的不要输出（会原样保留）；要删掉某个附录，内容只写「（删除）」。'
       : '附录的完整内容。',
-    allowUnchanged ? `\n如果这次的内容不需要写进主文档（例如只是解释文档里已经写清楚的内容），整个回答只输出一行「${DOC_MARK.unchanged}」。` : '',
+    `${DOC_MARK.newDoc}（可选，可以有多个；只在讨论分出了独立的方向时用）`,
+    '第一行写「原因：……」，一两句话说清为什么它是另一件事、为什么不放进当前文档；下面是这份新文档的全文，结构和写法同上，后面可以接它自己的【附录：标题】。从当前文档移过去的内容，要从当前文档里删掉，只留一句「见《新文档标题》」。',
+    allowUnchanged ? `\n如果这次的内容不需要写进文档（例如只是解释文档里已经写清楚的内容），整个回答只输出一行「${DOC_MARK.unchanged}」。` : '',
   ].filter((l) => l !== '').join('\n');
 }
 
 export function docSystem(mode) {
   const who = mode === 'decision' ? '主席' : '主编';
   return [
-    `你是「${who}」，负责把一场多 AI ${mode === 'brainstorm' ? '脑洞风暴' : mode === 'refine' ? '作品打磨讨论' : '方案讨论'}的结果整理成一份主文档，给没看过讨论的人读。`,
+    `你是「${who}」，负责把一场多 AI ${mode === 'brainstorm' ? '脑洞风暴' : mode === 'refine' ? '作品打磨讨论' : '方案讨论'}的结果整理成主文档，给没看过讨论的人读。`,
     '你只看到匿名代号（方案 A、方案 B……，评审 1、评审 2……），不要猜测它们来自哪个模型。',
     mode === 'brainstorm'
       ? '看重新鲜感和可写性，保留不同方向的多样性，不要把所有点子揉成一个。'
       : '保持中立：如实写出共识与分歧，不要自己另起一个新方案，也不要替人拍板。',
-    '这份文档会一直维护：之后每次追问的结论都会改进这同一份文档。',
+    '你的价值在提炼：把讨论里分散的意见归纳成少数几个清楚的判断，标出重点，让人花最少的时间知道结论和该做的决定。',
+    '文档会一直维护：之后每次追问的结论都会改进当前文档；讨论分出独立的方向时可以新开文档。',
   ].join('\n');
 }
 
@@ -1123,6 +1146,12 @@ function historyBlock(rounds) {
   return `## 讨论记录（匿名）\n${rounds
     .map((r) => `### 第 ${r.round} 轮（${STAGE_LABELS[r.stage] ?? r.stage}）\n\n${labeled(r.entries).replace(/^### /gm, '#### ')}`)
     .join('\n\n')}`;
+}
+
+/** 这场讨论里的其他文档：只给标题和一句话结论，避免新开重复的文档或把别的文档的内容写进来。 */
+function otherDocsBlock(otherDocs = []) {
+  if (!otherDocs.length) return '';
+  return `## 这场讨论的其他文档（只读，不要改，也不要把它们的内容写进当前文档）\n${otherDocs.map((d) => `- 《${d.title}》${d.lead ? `：${d.lead}` : ''}`).join('\n')}`;
 }
 
 function attachmentsBlock(attachments) {
@@ -1158,11 +1187,12 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
 /**
  * 追问之后更新主文档：直接回答的给回答，重新讨论的给追问之后的讨论记录。
  */
-export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '', blockers = [], ruling, final, verifyQuestions = [] }) {
+export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '', blockers = [], ruling, final, verifyQuestions = [], otherDocs = [] }) {
   return join(
     `【阶段：更新${STAGE_LABELS.doc}】`,
     `## 现在的主文档（第 ${version} 版）\n${doc}`,
     attachmentsBlock(attachments),
+    otherDocsBlock(otherDocs),
     `## 人类的追问\n${question.trim()}`,
     handling === 'answer'
       ? `## 你对追问的回答（主席判断讨论记录足以回答，没有重新讨论）\n${answer}`
@@ -1197,10 +1227,11 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
     interjectionBlock(interjections),
     [
       '## 要求',
-      '- 把这次追问得出的结论合进主文档对应的位置，改完的文档要反映现在完整的结论，读者不需要再看追问记录。',
+      '- 把这次追问得出的结论合进文档对应的位置，改完的文档要反映现在完整的结论，读者不需要再看追问记录。',
       '- 被推翻的旧结论直接改掉，不要保留后再补一句「后来改了」；被放弃的做法移到「考虑过但没采用」一类的部分，写明原因。',
-      '- 没受影响的部分原样保留，不要重新措辞。',
-      `- 「变更记录」加一行：「第 ${version + 1} 版（追问：问题的简短概括）：改了什么」。`,
+      '- 不要只往里加：被新结论取代或已经不重要的内容删掉或压缩，和新内容重复的合并，要点和拍板项按新的重要程度重排。没受影响、也已经符合下面写法的部分不用重新措辞。',
+      '- 现在的文档里如果有「变更记录」部分，删掉它（程序会按版本自动生成）。',
+      `- 先判断这次追问是不是开出了和当前文档不同的独立方向：是的话用${DOC_MARK.newDoc}新开一份并写清原因，不要把它塞进当前文档；只是当前这件事的补充或改主意，就改当前文档。`,
     ].join('\n'),
     docRules(mode),
     docFormat({ update: true, allowUnchanged: handling === 'answer' }),
@@ -1215,10 +1246,12 @@ export function docCheckPrompt({ doc, attachments, own }) {
     attachmentsBlock(attachments),
     own ? `## 你最后的方案\n${own}` : '',
     [
-      '主席根据讨论写了上面这份主文档，给没看过讨论的人读。请对照你参与的讨论核对，只指出重要的问题：',
+      '主席根据讨论写了上面的主文档，给没看过讨论的人读。请对照你参与的讨论核对，只指出重要的问题：',
       '- 漏掉了影响决策或落地的信息（关键约束、数据、已核实的事实、被否决做法的理由、没解决的分歧）；',
       '- 写错了，或者把没有达成一致的写成了定论；',
-      '- 读者看不懂的地方（用了代号、缺少前提）。',
+      '- 读者看不懂的地方（用了代号、缺少前提）；',
+      '- 读起来费力的地方：没有提炼出结论、只是堆着碎点的部分，同一件事在几处重复，最要紧的结论或拍板项没有排在前面、没有标出来。能删、能并的直接指出来。',
+      '要求补充遗漏时，同时说清补在哪一层（正文写结论，还是附录写细节），不要为了完整把细节都塞进正文。',
       '措辞、格式和次要细节不用提。每条一行，写清应该怎么改，不超过 600 字。',
       '没有重要问题时只写一行「没有问题」。',
     ].join('\n'),
@@ -1239,15 +1272,42 @@ export function docFixPrompt({ issues, draft }) {
     draft ? `## 你写的初稿\n${draft}` : '',
     `## 主笔的核对意见（匿名，可能有错）\n${issues.map((x) => `### ${x.tag}\n${x.text}`).join('\n\n')}`,
     [
-      '逐条判断：对照讨论记录确实如此的，改进主文档；不成立的忽略。其余部分原样保留。',
-      `按同样的格式重新输出：${DOC_MARK.note}仍然写发到讨论里的短消息；${DOC_MARK.doc}写修改后的完整主文档；附录只输出这次新增或改动的，要删掉的写「（删除）」。`,
+      '逐条判断：对照讨论记录确实如此的，改进文档；不成立的忽略。其余部分原样保留。',
+      '补充遗漏时仍然按写法来：正文只写结论，细节进附录；补完后看一下有没有因此重复或变散，顺手合并。',
+      `按同样的格式重新输出：${DOC_MARK.note}仍然写发到讨论里的短消息；${DOC_MARK.doc}写修改后的完整文档；附录只输出这次新增或改动的，要删掉的写「（删除）」。初稿里新开的文档（${DOC_MARK.newDoc}）也要按原来的顺序重新输出全文和原因。`,
     ].join('\n'),
   );
 }
 
 /**
- * 拆开主席写的文档：{ unchanged, note, doc, attachments }。
- * attachments 是这次输出的附录：{ 标题: 内容 }，内容为 null 表示删除。没写【主文档】标记时整段当作主文档。
+ * 按新的写法重写现有文档：不增加新结论，不丢影响决策的信息；可以按方向拆成几份。
+ * otherDocs：这场讨论里的其他文档（标题和一句话结论），避免重复。
+ */
+export function docRewritePrompt({ mode, doc, attachments, version, otherDocs = [] }) {
+  return join(
+    `【阶段：重写${STAGE_LABELS.doc}】`,
+    `## 现在的主文档（第 ${version} 版）\n${doc}`,
+    attachmentsBlock(attachments),
+    otherDocsBlock(otherDocs),
+    [
+      '## 要求',
+      '这份文档是按旧的写法一版版累积出来的，读起来费力：碎点多、没有总结、同一件事写了好几处、重点不突出。请按下面的写法把它重写成新的一版：',
+      '- 不增加新的结论，也不改变已有的结论、分歧和「未核实」的标注；只重新组织、提炼、合并、删掉重复。',
+      '- 影响决策或落地的信息不能丢，但要放到合适的层级：正文写结论，细节移进附录（可以新建、合并或重写附录）。',
+      '- 现在的文档里如果有「变更记录」部分，删掉。',
+      `- 如果文档其实讲了几件互相独立的事，按「一份文档只讲一件事」拆开：当前文档保留最初议题的那件事，其余的用${DOC_MARK.newDoc}新开，并写清原因。`,
+      '- 附录也按同样的要求整理；保留的附录要完整输出（这次视为全部改动过），不再需要的附录写「（删除）」。',
+    ].join('\n'),
+    docRules(mode),
+    docFormat({ update: true }),
+  );
+}
+
+/**
+ * 拆开主席写的文档：{ unchanged, note, doc, attachments, newDocs }。
+ * doc 是当前文档（初稿或改后的全文），只新开文档、当前文档不改时为 null；attachments 是它这次输出的附录：{ 标题: 内容 }，内容为 null 表示删除。
+ * newDocs：新开的文档 [{ title, reason, doc, attachments }]，附录属于它前面最近的那份文档。
+ * 没写【主文档】也没写【新文档】时整段当作主文档。
  */
 export function parseDoc(text) {
   const raw = String(text ?? '').trim();
@@ -1257,24 +1317,78 @@ export function parseDoc(text) {
   for (const line of lines) {
     const m = DOC_LINE.exec(line);
     if (m) {
-      current = { key: m[2] ? 'attachment' : { 说明: 'note', 主文档: 'doc', 无需修改: 'unchanged' }[m[1]], title: m[2]?.trim(), lines: m[3]?.trim() ? [m[3].trim()] : [] };
+      current = { key: m[2] ? 'attachment' : { 说明: 'note', 主文档: 'doc', 无需修改: 'unchanged', 新文档: 'newDoc' }[m[1]], title: m[2]?.trim(), lines: m[3]?.trim() ? [m[3].trim()] : [] };
       parts.push(current);
     } else if (current) {
       current.lines.push(line);
     }
   }
   const body = (p) => p.lines.join('\n').trim();
-  if (parts.some((p) => p.key === 'unchanged') && !parts.some((p) => p.key === 'doc')) return { unchanged: true };
-  const docPart = parts.find((p) => p.key === 'doc');
-  const doc = docPart ? body(docPart) : raw;
-  if (!doc) throw new Error('主文档是空的');
+  const hasDoc = parts.some((p) => p.key === 'doc');
+  const hasNew = parts.some((p) => p.key === 'newDoc');
+  if (parts.some((p) => p.key === 'unchanged') && !hasDoc && !hasNew) return { unchanged: true };
   const attachments = {};
-  for (const p of parts.filter((x) => x.key === 'attachment')) {
-    const t = body(p);
-    attachments[p.title] = DELETED.test(t) || !t ? null : t;
+  const newDocs = [];
+  let owner = attachments; // 附录归到前面最近的那份文档
+  let doc = hasDoc || hasNew ? null : raw;
+  for (const p of parts) {
+    if (p.key === 'doc') {
+      doc = body(p);
+      owner = attachments;
+    } else if (p.key === 'newDoc') {
+      const ls = [...p.lines];
+      const i = ls.findIndex((l) => l.trim());
+      const m = i >= 0 ? OPEN_REASON.exec(ls[i]) : null;
+      if (m) ls.splice(i, 1);
+      const text = ls.join('\n').trim();
+      if (!text) throw new Error('新文档是空的');
+      const nd = { title: docTitle(text), reason: m ? m[1].trim() : null, doc: text, attachments: {} };
+      newDocs.push(nd);
+      owner = nd.attachments;
+    } else if (p.key === 'attachment') {
+      const t = body(p);
+      owner[p.title] = DELETED.test(t) || !t ? null : t;
+    }
   }
+  if (hasDoc && !doc) throw new Error('主文档是空的');
+  if (!doc && !newDocs.length) throw new Error('主文档是空的');
   const notePart = parts.find((p) => p.key === 'note');
-  return { unchanged: false, note: notePart ? body(notePart) || null : null, doc, attachments };
+  return { unchanged: false, note: notePart ? body(notePart) || null : null, doc, attachments, newDocs };
+}
+
+/** 文档标题：第一行 # 标题；没有时取第一行非空文字。 */
+export function docTitle(text) {
+  const lines = String(text ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const h = lines.find((l) => /^#\s/.test(l));
+  return (h ? h.replace(/^#\s+/, '') : lines[0] ?? '').replace(/\*\*/g, '').slice(0, 80);
+}
+
+/** 文档编号：旧版本没有 docNo 的都算第 1 份。 */
+export const docNoOf = (d) => d?.docNo ?? 1;
+
+/** 同一份文档的各版本（按版本号先后）。 */
+export function docSeries(docs = [], docNo) {
+  return docs.filter((d) => docNoOf(d) === docNo);
+}
+
+/**
+ * 变更记录：同一份文档到第 version 版为止，每版一行「第 N 版（原因）：说明」。
+ * 新开的文档第一行写从哪份分出来、为什么。
+ */
+export function docChangelog(docs = [], version) {
+  const target = docs.find((d) => d.version === version);
+  if (!target) return '';
+  // 每版一行：说明压成一行，超过 100 字截断（完整说明在讨论里那条主文档消息上）
+  const flat = (t) => cut(String(t ?? '').replace(/\*\*/g, '').split('\n').map((l) => l.replace(/^[-*\s]+/, '').trim()).filter(Boolean).join('；'));
+  const cut = (t, n = 100) => (t.length > n ? `${t.slice(0, n)}…` : t);
+  return docSeries(docs, docNoOf(target))
+    .filter((d) => d.version <= version)
+    .map((d) => {
+      const from = d.opened ? `新开文档${d.opened.from ? `（从《${d.opened.from}》分出）` : ''}，原因：${cut(d.opened.reason ?? '（没写）')}` : '';
+      const note = flat(d.note);
+      return `- 第 ${d.version} 版（${d.reason}${d.at ? `，${d.at.slice(0, 10)}` : ''}）：${[from, note].filter(Boolean).join('。') || '（没有说明）'}`;
+    })
+    .join('\n');
 }
 
 /** 合并附录：delta 里为 null 的删掉，其余覆盖。 */

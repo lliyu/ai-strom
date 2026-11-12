@@ -66,12 +66,12 @@ function mockDoc(stage, prompt) {
     '## 要点',
     '- 要点一',
     '- 要点二',
+    '## 要拍板的事',
+    '- 【先定】要不要做（mock）',
     '## 问题',
     '议题背景（mock）。',
     '## 方案',
-    `- 第 ${version} 版的方案（mock）`,
-    '## 变更记录',
-    ...Array.from({ length: version }, (_, i) => `- 第 ${i + 1} 版（mock）`),
+    `第 ${version} 版的方案（mock）。`,
   ].join('\n');
 }
 
