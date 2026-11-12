@@ -7,3 +7,6 @@ runs/
 
 # 本机的数据工具与知识库（不进仓库）
 local/
+
+# 工作上的业务评估文档（公司内部资料，不进仓库）
+docs/PAT-RatePlan接入SupplyPromotion可行性评估.md
