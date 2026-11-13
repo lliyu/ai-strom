@@ -8,7 +8,7 @@ import {
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
   docSystem, docPrompt, docUpdatePrompt, docRewritePrompt, docCheckPrompt, parseDocCheck, docFixPrompt, parseDoc, mergeAttachments, docLead, docTitle, docNoOf,
   limitsFor, splitReply, overLimit, compressPrompt, replyIssues, fixReplyPrompt, rewriteDrift, stripEvidence, hasBlocker, PLAN_MARKER, isUnchangedPlan, blockersBlock,
-  lineStartBlockers, isPendingBlocker, blockerStatusText, blockerEntryText, assignIssueIds, trackIssues, reviewerNoOf,
+  lineStartBlockers, isPendingBlocker, blockerStatusText, blockerEntryText, assignIssueIds, trackIssues, reviewerNoOf, peerItems, parseStances, rejectedReviewers, parseItems,
   parseFactQuestions, factsBlock, factCheckPrompt, factReviewPrompt, parseReviewCorrections, codeAccessNote, factAskLine,
   webAskLine, webPlanPrompt, parseWebPlan, webResearchPrompt, webReviewPrompt,
   dataAskLine, webAlsoLine, evidenceBlock, toolCallsBlock, dataPlanPrompt, parseDataPlan, dataCheckPrompt, dataReviewPrompt,
@@ -388,11 +388,12 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     try {
       let res = await call(speaker, { stage, round, system, prompt, callOptions, session });
       // 条目化开着、这类发言要检查格式时：合并检查、最多重写一次（代替单纯的压缩重写）
-      const checking = cfg.items && check;
-      if (checking) res = await run.checkReply(speaker, res, { stage, round, system, callOptions, session, limit, check });
+      // 评审互见的表态检查不管条目化开没开都做：别人的阻断每条都要表态
+      const checking = (cfg.items && check) || check?.peers?.length;
+      if (checking) res = await run.checkReply(speaker, res, { stage, round, system, callOptions, session, limit: cfg.items ? limit : null, check });
       // 编号在写入检查（和重写）之后、发布之前写上：库里、讨论记录、群卡片和主笔看到的是同一份带编号的文本
       if (run.tracking && stage === 'critique' && res.text) res = { ...res, text: run.numberIssues(speaker, res.text, round) };
-      const over = !checking && limit ? overLimit(cfg.items ? stripEvidence(res.text) : res.text, limit) : null;
+      const over = !(cfg.items && check) && limit ? overLimit(cfg.items ? stripEvidence(res.text) : res.text, limit) : null;
       if (over) {
         log(`${speaker.name} 超出字数上限（${over}），要求压缩重写`);
         try {
@@ -443,7 +444,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   };
 
   /** 让一组参与者并发发言，记录成一轮，返回成功的条目。 */
-  run.runStage = async (list, round, stage, promptFor) => {
+  run.runStage = async (list, round, stage, promptFor, { checkFor = null } = {}) => {
     const results = await mapLimit(list, cfg.concurrency, async (p) => {
       const session = convo ? sessions.get(p.id) : null;
       const seenNow = heard.length;
@@ -452,7 +453,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       const intro = session && session.turns.length ? '' : `${participantSystem(p, { mode: cfg.mode })}\n\n`;
       const fresh = run.freshFor(p, session);
       const code = run.codeFor(p, session);
-      const text = await run.speak(p, { stage, round, system: run.shared, prompt: `${intro}${fresh}${code.text}${promptFor(p)}`, session, limit: run.limitOf(stage), check: run.checkOf(stage), callOptions: code.callOptions });
+      const text = await run.speak(p, { stage, round, system: run.shared, prompt: `${intro}${fresh}${code.text}${promptFor(p)}`, session, limit: run.limitOf(stage), check: checkFor ? checkFor(p) : run.checkOf(stage), callOptions: code.callOptions });
       if (text != null && session) {
         session.seen = seenNow;
         session.factsSeen = factsNow;
@@ -768,6 +769,27 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       }
     };
 
+    /**
+     * 这一轮有没有人明确反对这位评审的阻断，返回说明（没有返回 null）：
+     * 其他评审对它上一轮的阻断写了【不同意】；其他评审写了【已解决】、它这一轮仍用原编号坚持；主笔【不采纳】了它这一轮的阻断。
+     */
+    const opposition = (x, critiques, revised) => {
+      const no = reviewerNoOf(tagOf(x));
+      const ownText = critiques.find((e) => e.id === x.id)?.text ?? '';
+      const ownIds = new Set(parseItems(ownText).filter((it) => it.level === '阻断' && it.id).map((it) => it.id));
+      const why = [];
+      for (const e of critiques) {
+        if (e.id === x.id) continue;
+        for (const st of parseStances(e.text)) {
+          if (st.owner !== no) continue;
+          if (st.kind === '不同意') why.push(`${e.tag}不同意`);
+          else if (st.kind === '已解决' && ownIds.has(st.key)) why.push(`${e.tag}认为 ${st.key} 已解决`);
+        }
+      }
+      for (const e of revised) if (rejectedReviewers(e.text).has(no)) why.push(`${e.tag}不采纳`);
+      return why.length ? [...new Set(why)].join('、') : null;
+    };
+
     for (let round = from; round <= to; round += 1) {
       await run.pullInterjections();
       lastRound = round;
@@ -808,13 +830,15 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       } else {
         // 评审先提意见，主笔再看着意见互评修订
         const proposals = [...latest.values()].sort(byTag);
-        // 评审互见：上一轮其他评审提的【阻断】原文（只取那几行），评审只对不同意或能补充证据的表态
+        // 评审互见：上一轮其他评审提的【阻断】原文（只取那几行），评审要逐条表态：仍成立 / 已解决 / 不同意
         const lastCritiques = rounds.find((x) => x.round === round - 1 && x.stage === 'critique')?.entries ?? [];
         // 评审互见只认行首【阻断】：「本轮没有【阻断】」这类否定句不再转给其他评审
         const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: capLines(lineStartBlockers(e.text)) })).filter((x) => x.lines.length);
         const resolved = run.blockerHistory().resolved;
         const critiques = activeReviewers.length
-          ? await run.runStage(activeReviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items, ownIssues: run.ownIssuesFor(p) }))
+          ? await run.runStage(activeReviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items, ownIssues: run.ownIssuesFor(p) }), {
+            checkFor: (p) => ({ ...(run.checkOf('critique') ?? {}), peers: peerItems(peersFor(p)) }),
+          })
           : [];
         markScoped(critiques);
         await tally(activeReviewers, critiques, round);
@@ -867,14 +891,17 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           log(`第 ${round - 1}、${round} 轮主笔都没改方案，评审仍有阻断：以分歧结束`);
           break;
         }
-        // 熔断二：评审不少于 2 位，同一位评审连续 3 轮独自坚持阻断，其他评审都没有意见
+        // 熔断二：评审不少于 2 位，同一位评审连续 3 轮独自坚持阻断，其他评审都没有意见，
+        // 而且每一轮都有人明确反对它的阻断。没人反对（主笔采纳、其他评审没有不同意）不算分歧，讨论继续
         const alone = blocking.length === 1 && voters.length >= 2
           && voters.filter((q) => q.id !== blocking[0].id).every((q) => reviewerDone(q, critiques))
           ? blocking[0] : null;
-        for (const p of reviewers) lone.set(p.id, alone?.id === p.id ? (lone.get(p.id) ?? 0) + 1 : 0);
-        if (alone && lone.get(alone.id) >= 3) {
+        const opposed = alone ? opposition(alone, critiques, revised) : null;
+        if (alone && !opposed) log(`${tagOf(alone)}独自提阻断，但没有人反对（主笔没有不采纳，其他评审没有不同意）：不算评审之间的分歧，讨论继续`);
+        for (const p of reviewers) lone.set(p.id, opposed && alone.id === p.id ? (lone.get(p.id) ?? 0) + 1 : 0);
+        if (opposed && lone.get(alone.id) >= 3) {
           ending = { reason: 'dissent', round, byReviewers: true, tag: tagOf(alone) };
-          log(`${tagOf(alone)}连续 3 轮独自坚持阻断，其他评审都没有意见：以评审之间的分歧结束`);
+          log(`${tagOf(alone)}连续 3 轮独自坚持阻断，其他评审都没有意见，且有人明确反对（这一轮：${opposed}）：以评审之间的分歧结束`);
           break;
         }
       }
@@ -2158,7 +2185,7 @@ function endingBase(ending) {
   if (ending.reason === 'max') return `到上限 ${ending.round} 轮结束，评审仍有意见`;
   if (ending.reason === 'fixed') return `按固定轮数在第 ${ending.round} 轮结束`;
   if (ending.reason === 'deadlock') return `第 ${ending.round} 轮以分歧结束：主笔连续两轮没改方案，评审仍有阻断`;
-  if (ending.reason === 'dissent') return `第 ${ending.round} 轮以评审之间的分歧结束：${ending.tag ?? '一位评审'}连续 3 轮独自坚持阻断`;
+  if (ending.reason === 'dissent') return `第 ${ending.round} 轮以评审之间的分歧结束：${ending.tag ?? '一位评审'}连续 3 轮独自坚持阻断，且有人明确反对`;
   if (ending.reason === 'verdict') return '按人的裁决定稿，未经评审';
   if (ending.reason === 'verified') return '按追问核实了事实';
   return '';

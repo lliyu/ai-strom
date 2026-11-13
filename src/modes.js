@@ -189,10 +189,10 @@ export function isBlockerLine(line) {
 // 依据不计入字数上限（压缩时最容易被删的就是它）；写入时检查格式，不合格合并重写一次，并防止立场漂移。
 
 /** 条目的级别：评审、修订、代码核实、核对主文档各用各的。 */
-export const ITEM_LEVELS = ['阻断', '建议', '改', '采纳', '不采纳', '不同意', '补充', '确认', '推翻', '查不到', '漏', '错', '不清'];
+export const ITEM_LEVELS = ['阻断', '建议', '改', '采纳', '不采纳', '不同意', '补充', '仍成立', '已解决', '确认', '推翻', '查不到', '漏', '错', '不清'];
 /**
  * 问题编号（第三期）：「Q评审号-序号」，例如 Q1-3 是评审 1 整场的第 3 个问题。写在【级别】之后。
- * 【阻断】【建议】上的是这个问题自己的编号；【采纳】【不采纳】【不同意】【补充】上的是引用。
+ * 【阻断】【建议】上的是这个问题自己的编号；【采纳】【不采纳】【不同意】【补充】【仍成立】【已解决】上的是引用。
  */
 const ISSUE_ID = /^(?:\*\*)?\s*(Q(\d+)-(\d+))\b\s*(?:\*\*)?\s*[:：]?\s*/u;
 const ITEM_HEAD = new RegExp(`^(?:\\s|[-*+•]\\s|\\d+[.、)）]\\s*|\\*\\*|__)*[【\\[]\\s*(${ITEM_LEVELS.join('|')})\\s*[】\\]]\\s*(?:\\*\\*)?\\s*`, 'u');
@@ -316,7 +316,7 @@ export function assignIssueIds(text, { own, used = new Set() }) {
  * 按编号把问题串成时间线。speeches：按发生顺序的评审（critique）和主笔修订（review）发言 [{ stage, round, tag, body }]，
  * body 是要点之后的正文。返回 { issues: [...], invalid: [...] }，没有任何编号时 issues 为空。
  * 每个问题：id、owner（评审代号）、level（最近一次的级别）、head、section、raised（首次提出的轮次）、
- * mentions（原评审提到它的轮次）、responses（主笔称采纳 / 不采纳）、stances（其他评审不同意 / 补充）、
+ * mentions（原评审提到它的轮次）、responses（主笔称采纳 / 不采纳）、stances（其他评审仍成立 / 已解决 / 不同意 / 补充）、
  * status：current（原评审最近一次发言仍在提）/ dropped（原评审之后发言没再提，after 写之前主笔的处理：accepted / rejected / unanswered）。
  * invalid：引用了不存在、或不是原评审自己的编号。
  */
@@ -343,7 +343,7 @@ export function trackIssues(speeches) {
           issue.section = it.section ?? issue.section ?? null;
           issue.mentions.push({ n, round: s.round, level: it.level, head: it.head });
           issues.set(it.id, issue);
-        } else if (it.level === '不同意' || it.level === '补充') {
+        } else if (STANCE_LEVELS.includes(it.level)) {
           if (issues.has(it.id)) issues.get(it.id).stances.push({ n, round: s.round, tag: s.tag, kind: it.level, note: it.evidence ?? it.head ?? null });
           else invalid.push({ id: it.id, round: s.round, tag: s.tag, kind: it.level });
         }
@@ -413,7 +413,7 @@ export function blockerCount(text) {
  * 写入时检查（只在 items 开关打开时用）：返回不合格项 [{ kind, note }]，合格返回空数组。
  * verdict：要求写评审结论行；stance：主笔要写「立场变化」；blockers：【阻断】要带改法和依据；limit：字数上限（依据不计）。
  */
-export function replyIssues(text, { limit = null, verdict = false, stance = false, blockers = false } = {}) {
+export function replyIssues(text, { limit = null, verdict = false, stance = false, blockers = false, peers = null } = {}) {
   const issues = [];
   const { shown } = splitReply(text);
   if (verdict && parseVerdict(text) === null) issues.push({ kind: 'verdict', note: `缺最后一行「${VERDICT_LINE}：${VERDICT_CONTINUE} / ${VERDICT_DONE}」` });
@@ -425,6 +425,7 @@ export function replyIssues(text, { limit = null, verdict = false, stance = fals
     }
   }
   if (stance && parseStanceChange(text) === null) issues.push({ kind: 'stance', note: '缺「**立场变化**」（无 / 小幅 / 较大，一句话说明）' });
+  if (peers?.length) issues.push(...stanceIssues(text, peers));
   const over = limit ? overLimit(stripEvidence(text), limit) : null;
   if (over) issues.push({ kind: 'over', note: `超出字数上限：${over}（依据不计入）` });
   return issues;
@@ -438,6 +439,9 @@ export function fixReplyPrompt({ issues, original, limit }) {
     original ? `## 你刚才的回答\n${original}` : '',
     [
       '请完整重写一遍，只补缺项或压缩，内容和立场不变：评审结论不能改，【阻断】的条数和每条的意思不能变，不要新增或删掉问题。',
+      issues.some((x) => x.kind === 'peer' || x.kind === 'peer-evidence')
+        ? '对其他评审阻断的表态写在单独一行加粗的「**对其他评审的阻断**」下面，每条一行【仍成立】/【已解决】/【不同意】，引用照抄题目里的；【不同意】必须带「｜依据：…」。'
+        : '',
       '缺依据又没有实据的，写「依据：推断」。缺改法的，补一句能直接执行的改法。',
       issues.some((x) => x.kind === 'over') && limit
         ? `压缩时删复述、铺垫和举例，保留级别标记、改法和依据（依据不计字数）；要点不超过 3 行${limit.brief ? `、${limit.brief} 字` : ''}，给人看的部分不超过 ${limit.max} 字${limit.plan ? `，「${PLAN_MARKER}」之后的完整方案不超过 ${limit.plan} 字` : ''}。`
@@ -956,18 +960,92 @@ function planned(entries) {
 }
 
 /**
- * 评审互见：上一轮其他评审提的【阻断】原文。只贴那几行，不贴整段意见；
- * 评审只对不同意的、或能补充证据的条目表态，同意的不用重复。
+ * 评审互见：上一轮其他评审提的【阻断】原文。只贴那几行，不贴整段意见。
+ * 每一条都要表态（【仍成立】/【已解决】/【不同意】），不能不管：对照主笔这一轮的方案核对一遍。
+ * 引用：有问题编号（条目化 + 问题追踪）的用编号，没有的由程序标成「评审 N 第 K 条」。
  */
+export const STANCE_LEVELS = ['仍成立', '已解决', '不同意', '补充'];
+
+/** 别人的阻断逐条展开：[{ tag, line, label（表态时照抄的引用）, key（匹配用）, owner（评审序号）}]。 */
+export function peerItems(peers = []) {
+  const out = [];
+  for (const x of peers) {
+    const no = reviewerNoOf(x.tag);
+    x.lines.forEach((line, i) => {
+      const id = parseItemLine(line)?.id;
+      out.push(id
+        ? { tag: x.tag, line, label: id, key: id, owner: issueOwner(id) }
+        : { tag: x.tag, line, label: `评审 ${no} 第 ${i + 1} 条`, key: `${no}#${i + 1}`, owner: no });
+    });
+  }
+  return out;
+}
+
+/** 一段评审发言里对别人阻断的表态：[{ kind, key, owner, evidence }]；引用认不出的不算。 */
+export function parseStances(text) {
+  const out = [];
+  for (const it of parseItems(text)) {
+    if (!STANCE_LEVELS.includes(it.level)) continue;
+    let key = it.id ?? /\bQ\d+-\d+\b/.exec(it.head)?.[0] ?? null;
+    let rest = it.id ? it.head : it.head.replace(/\bQ\d+-\d+\b/, '');
+    if (!key) {
+      const m = /评审\s*(\d+)\s*第\s*(\d+)\s*条/.exec(it.head);
+      if (m) {
+        key = `${Number(m[1])}#${Number(m[2])}`;
+        rest = it.head.replace(m[0], '');
+      }
+    }
+    if (!key) continue;
+    // 没按「｜依据：」写、但引用后面跟了理由的（「【不同意】评审 2 第 1 条：已有开关」），理由也算依据
+    rest = clean(rest.replace(/^[\s:：，,—-]+/u, ''));
+    out.push({ kind: it.level, key, owner: keyOwner(key), evidence: it.evidence ?? (rest.length >= 4 ? rest : null) });
+  }
+  return out;
+}
+
+const keyOwner = (key) => Number(/^Q(\d+)-/.exec(key)?.[1] ?? /^(\d+)#/.exec(key)?.[1]) || null;
+
+/** 写完后的检查：别人的阻断有没有逐条表态，【不同意】有没有依据。 */
+export function stanceIssues(text, items = []) {
+  const stances = parseStances(text);
+  const answered = new Set(stances.map((x) => x.key));
+  const missing = items.filter((x) => !answered.has(x.key));
+  const issues = [];
+  if (missing.length) issues.push({ kind: 'peer', note: `没有对其他评审的这些阻断表态：${missing.map((x) => x.label).join('、')}（每条一行【仍成立】/【已解决】/【不同意】）`, missing: missing.map((x) => x.label) });
+  const bare = stances.filter((x) => x.kind === '不同意' && !x.evidence && items.some((i) => i.key === x.key));
+  if (bare.length) issues.push({ kind: 'peer-evidence', note: `【不同意】没写依据：${bare.map((x) => items.find((i) => i.key === x.key).label).join('、')}` });
+  return issues;
+}
+
+/** 主笔修订里【不采纳】了哪些评审的问题：按问题编号或「评审 N」认，返回评审序号集合。 */
+export function rejectedReviewers(text) {
+  const out = new Set();
+  for (const line of String(text ?? '').split('\n')) {
+    if (!/不采纳/.test(line)) continue;
+    for (const m of line.matchAll(/\bQ(\d+)-\d+\b/g)) out.add(Number(m[1]));
+    for (const m of line.matchAll(/评审\s*((?:\d+\s*[\/、,，和与]?\s*)+)/g)) for (const n of m[1].match(/\d+/g) ?? []) out.add(Number(n));
+  }
+  return out;
+}
+
 export function peersBlock(peers = [], { tracking = false } = {}) {
-  if (!peers.length) return '';
+  const items = peerItems(peers);
+  if (!items.length) return '';
+  const ex = items[0].label;
+  const byTag = new Map();
+  for (const x of items) {
+    if (!byTag.has(x.tag)) byTag.set(x.tag, []);
+    byTag.get(x.tag).push(x.key === x.label ? x.line : `- 〔${x.label}〕${x.line.replace(/^(?:\s|[-*+•]\s|\d+[.、)）]\s*)+/u, '')}`);
+  }
   return [
     '## 上一轮其他评审提的阻断（原文，匿名）',
-    ...peers.map((x) => `### ${x.tag}\n${x.lines.join('\n')}`),
+    ...[...byTag].map(([tag, lines]) => `### ${tag}\n${lines.join('\n')}`),
     '',
-    tracking
-      ? '对这些阻断，你只需对不同意的、或能补充证据的条目表态：在单独一行加粗的「**对其他评审的阻断**」下面，每条一行「- 【不同意】编号 ｜依据：…」或「- 【补充】编号 ｜依据：…」，编号照抄上面的（例如 Q2-1）。同意的不用写，也不要把别人的问题当成自己的【阻断】再提一遍。主笔对这些阻断的回应在方案的修订说明里。'
-      : '对这些阻断，你只需对不同意的、或能补充证据的条目表态，每条一行：「对评审 N 的『……』：不同意 / 补充：理由或证据」。同意的不用重复，也不用逐条回应。主笔对这些阻断的回应在方案的修订说明里。',
+    `上面每一条都要表态，不能跳过：对照主笔这一轮的方案核对一遍，写在单独一行加粗的「**对其他评审的阻断**」下面，每条一行：`,
+    `- 「- 【仍成立】${ex} ｜依据：…」：主笔这一轮还没解决（依据可写可不写，能补充证据就写）`,
+    `- 「- 【已解决】${ex}」：主笔这一轮已经解决了`,
+    `- 「- 【不同意】${ex} ｜依据：…」：这条本来就不成立，或者不该算阻断；必须写依据`,
+    `引用照抄上面的${tracking ? '编号（例如 Q2-1）' : '「评审 N 第 K 条」'}，表态行里不要抄原文的【阻断】标记。表态【仍成立】的不要再当成你自己的【阻断】重复提；评审结论只按你自己的问题写。主笔对这些阻断的回应在方案的修订说明里。`,
   ].join('\n');
 }
 
@@ -1055,7 +1133,7 @@ export function reviewPrompt({ topic, round, own, others, critiques = [], interj
           ? '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，按问题编号每条一行：「- 【采纳】Q1-3 ｜改法：…」或「- 【不采纳】Q1-3 ｜依据：…」，编号照抄评审意见里的；不采纳必须带依据）'
           : items
           ? '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「- 【采纳】评审 N 的「问题开头几个字」 ｜改法：…」或「- 【不采纳】评审 N 的「…」 ｜依据：…」；不采纳必须带依据）'
-          : '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「采纳」或「不采纳：理由」）')
+          : '**对评审意见的回应**（只回应【阻断】级问题和你不采纳的意见，每条一行：「采纳：评审 N 的「问题开头几个字」」或「不采纳：评审 N 的「…」：理由」）')
         : '',
       hasOthers ? '**对其他方案的看法**（只写会影响结论的分歧或值得借鉴的地方，一两行，引用方案代号；没有就不写）' : '',
       '**立场变化**（无 / 小幅 / 较大，一句话说明）',
@@ -1200,7 +1278,7 @@ function endingBlockBase(ending) {
   if (ending.reason === 'converged') return `## 讨论如何结束\n第 ${ending.round} 轮${ending.byReviewers ? '所有评审都表示没有新意见' : '所有主笔的立场都不再变化'}，讨论提前结束。`;
   if (ending.reason === 'max') return `## 讨论如何结束\n已经达到上限 ${ending.round} 轮，${ending.byReviewers ? '评审仍有意见' : '主笔的立场仍在变化'}，讨论被强制结束。\n\n${VERDICT_RULES}`;
   if (ending.reason === 'deadlock') return `## 讨论如何结束\n主笔连续两轮都没有改方案（第 ${ending.round - 1}、${ending.round} 轮），评审仍有阻断：双方各自坚持，讨论以分歧结束，交给人裁决。\n\n${VERDICT_RULES}`;
-  if (ending.reason === 'dissent') return `## 讨论如何结束\n${ending.tag ?? '一位评审'}连续 3 轮坚持阻断（到第 ${ending.round} 轮），其他评审都已经没有意见：讨论以评审之间的分歧结束，交给人裁决。\n\n${VERDICT_RULES}`;
+  if (ending.reason === 'dissent') return `## 讨论如何结束\n${ending.tag ?? '一位评审'}连续 3 轮独自坚持阻断（到第 ${ending.round} 轮），其他评审都已经没有意见，而且每一轮都有人明确反对它的阻断（其他评审【不同意】、认为已解决而它仍坚持，或主笔【不采纳】）：讨论以评审之间的分歧结束，交给人裁决。\n\n${VERDICT_RULES}`;
   return '';
 }
 

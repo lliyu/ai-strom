@@ -5,7 +5,7 @@ import { normalizeConfig } from '../src/config.js';
 import { runDiscussion } from '../src/orchestrator.js';
 import { createMemoryPublisher } from '../src/publishers.js';
 import { createMockProvider } from '../src/providers/index.js';
-import { assignIssueIds, trackIssues, parseItemLine, critiquePrompt, reviewPrompt, ownIssuesBlock, peersBlock } from '../src/modes.js';
+import { assignIssueIds, trackIssues, parseItemLine, critiquePrompt, reviewPrompt, ownIssuesBlock, peersBlock, peerItems, parseStances, stanceIssues, rejectedReviewers } from '../src/modes.js';
 import { issueTracking, itemDigest } from '../src/web/digest.js';
 
 test('编号：只写在正文的【阻断】【建议】上；自己的旧编号保留，别人的、不存在的、重复的剥掉重编', () => {
@@ -73,10 +73,14 @@ test('提示词：评审拿到自己还没解决的问题清单（附主笔的�
   const c = critiquePrompt({ round: 3, proposals: [{ label: 'A', text: 'x' }], peers: [{ tag: '评审 2', lines: ['- 【阻断】Q2-1 回滚'] }], items: true, ownIssues: own, mode: 'decision' });
   assert.match(c, /你提过、还没解决的问题/);
   assert.match(c, /新问题不要写编号/);
-  assert.match(c, /「- 【不同意】编号 ｜依据：…」或「- 【补充】编号 ｜依据：…」/);
+  assert.match(c, /上面每一条都要表态，不能跳过/);
+  assert.match(c, /「- 【仍成立】Q2-1 ｜依据：…」[\s\S]*「- 【已解决】Q2-1」[\s\S]*「- 【不同意】Q2-1 ｜依据：…」：[^\n]*必须写依据/);
   // 不追踪时（没开条目化）照旧
   assert.doesNotMatch(critiquePrompt({ round: 3, proposals: [{ label: 'A', text: 'x' }], items: true, mode: 'decision' }), /你提过/);
-  assert.match(peersBlock([{ tag: '评审 2', lines: ['x'] }]), /对评审 N 的『……』/);
+  // 没有编号时由程序标成「评审 N 第 K 条」
+  const plain = peersBlock([{ tag: '评审 2', lines: ['- 【阻断】回滚没设计', '1. 【阻断】缺监控'] }]);
+  assert.match(plain, /- 〔评审 2 第 1 条〕【阻断】回滚没设计\n- 〔评审 2 第 2 条〕【阻断】缺监控/);
+  assert.match(plain, /引用照抄上面的「评审 N 第 K 条」/);
   assert.match(reviewPrompt({ round: 2, own: { text: 'x' }, others: [], critiques: [{ tag: '评审 1', text: 'y' }], mode: 'decision', items: true, tracking: true }), /「- 【采纳】Q1-3 ｜改法：…」/);
 });
 
@@ -114,10 +118,28 @@ test('流程：mock 讨论里评审发言带编号、主笔按编号回应，第
   const t = issueTracking(posts);
   const q = t.issues.find((x) => x.id === 'Q1-1');
   assert.deepEqual([q.status, q.handled, q.responses.length], ['dropped', 'accepted', 2]);
-  assert.deepEqual(q.stances.map((s) => [s.tag, s.kind]), [['评审 2', '补充']], '评审 2 第 3 轮对 Q1-1 补充了依据');
+  assert.deepEqual(q.stances.map((s) => [s.tag, s.kind]), [['评审 2', '已解决']], '评审 2 第 3 轮对 Q1-1 表态已解决');
   assert.deepEqual(t.invalid, []);
   assert.equal(issueTracking([{ stage: 'critique', round: 2, tag: '评审 1', body: '- 【阻断】没有编号' }]), null, '没有编号的旧讨论不显示追踪');
   // 表态条目也照常解析（卡片上显示在「对其他评审的阻断」小节下）
-  const withStance = crit.find((p) => /【补充】/.test(p.body));
+  const withStance = crit.find((p) => /【已解决】/.test(p.body));
   assert.equal(itemDigest({ stage: 'critique', brief: '', body: withStance.body }).items.at(-1).section, '对其他评审的阻断');
+});
+
+test('评审互见：表态按编号或「评审 N 第 K 条」认；漏表态和【不同意】没依据都要补；主笔不采纳认出是哪位评审', () => {
+  const items = peerItems([{ tag: '评审 2', lines: ['- 【阻断】回滚没设计', '- 【阻断】缺监控'] }, { tag: '评审 3', lines: ['- 【阻断】Q3-2 会超扣'] }]);
+  assert.deepEqual(items.map((x) => [x.label, x.key, x.owner]), [['评审 2 第 1 条', '2#1', 2], ['评审 2 第 2 条', '2#2', 2], ['Q3-2', 'Q3-2', 3]]);
+  const text = '**对其他评审的阻断**\n- 【已解决】评审 2 第 1 条\n- 【不同意】**评审2第2条**：线上已有开关\n- 【仍成立】Q3-2';
+  assert.deepEqual(parseStances(text).map((x) => [x.kind, x.key, x.owner, x.evidence]), [
+    ['已解决', '2#1', 2, null],
+    ['不同意', '2#2', 2, '线上已有开关'], // 没按「｜依据：」写，引用后面的理由也算依据
+    ['仍成立', 'Q3-2', 3, null],
+  ]);
+  assert.deepEqual(stanceIssues(text, items), []);
+  const partial = stanceIssues('- 【不同意】Q3-2', items);
+  assert.deepEqual(partial.map((x) => x.kind), ['peer', 'peer-evidence']);
+  assert.deepEqual(partial[0].missing, ['评审 2 第 1 条', '评审 2 第 2 条']);
+  assert.deepEqual([...rejectedReviewers('- 【不采纳】Q4-1 ｜依据：z\n不采纳：评审 1、评审 2 的「a」：b\n- 【采纳】评审 5 的「c」')].sort(), [1, 2, 4]);
+  // 主笔回应（没开条目化时）要写明是哪位评审
+  assert.match(reviewPrompt({ round: 2, own: { text: 'x' }, others: [], critiques: [{ tag: '评审 1', text: 'y' }], mode: 'decision' }), /「不采纳：评审 N 的「…」：理由」/);
 });

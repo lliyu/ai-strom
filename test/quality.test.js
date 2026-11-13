@@ -83,19 +83,67 @@ test('熔断一：主笔连续 2 轮全部「无变化」、评审仍有阻断�
   assert.equal(res.state.ending.reason, 'deadlock');
 });
 
-test('熔断二：一位评审连续 3 轮独自坚持阻断、其他评审都没有意见，以评审之间的分歧结束', async () => {
+// 评审 2 对上一轮别人的阻断逐条表态：提示词里的引用照抄，kind 是表态
+const stanceOn = (prompt, kind) => {
+  const refs = [...String(prompt).matchAll(/〔(评审 \d+ 第 \d+ 条)〕/g)].map((m) => m[1]);
+  return refs.length ? `\n**对其他评审的阻断**\n${refs.map((r) => `- 【${kind}】${r}${kind === '不同意' ? ' ｜依据：已有开关' : ''}`).join('\n')}` : '';
+};
+
+test('熔断二：一位评审连续 3 轮独自坚持阻断、其他评审都没有意见，而且有人明确反对，以评审之间的分歧结束', async () => {
   const { registry } = scripted((c) => {
     if (lead(c)) return PLAN(`${c.who}${c.round}`); // 主笔每轮都改
     if (c.who === 'R1') return BLOCK;
-    if (c.who === 'R2') return DONE;
+    if (c.who === 'R2') return `${DONE}${stanceOn(c.prompt, '不同意')}`;
     return null;
   });
   const publisher = createMemoryPublisher();
   const res = await runDiscussion({ cfg: base(), topic: 't', providers: registry, publisher, rng: () => 0 });
   assert.equal(res.ending.reason, 'dissent');
-  assert.equal(res.ending.round, 4); // 第 2、3、4 轮
+  assert.equal(res.ending.round, 5); // 第 2 轮还没有互见，第 3、4、5 轮评审 2 都不同意
   assert.match(res.ending.tag, /^评审 \d$/);
   assert.ok(publisher.posts.some((p) => p.meta?.stage === 'blockers'));
+});
+
+test('熔断二：主笔【不采纳】也算有人反对，从第 2 轮就开始计数', async () => {
+  const REJECT = (x) => `**要点**：方案 ${x}\n**改了什么**\n- 改了\n**对评审意见的回应**\n不采纳：评审 1、评审 2 的「回滚没设计」：已有开关\n**立场变化**（小幅）\n\n【完整方案】\n完整方案-${x}`;
+  const { registry } = scripted((c) => {
+    if (lead(c)) return REJECT(`${c.who}${c.round}`);
+    if (c.who === 'R1') return BLOCK;
+    if (c.who === 'R2') return `${DONE}${stanceOn(c.prompt, '仍成立')}`;
+    return null;
+  });
+  const res = await runDiscussion({ cfg: base(), topic: 't', providers: registry, publisher: createMemoryPublisher(), rng: () => 0 });
+  assert.equal(res.ending.reason, 'dissent');
+  assert.equal(res.ending.round, 4); // 第 2、3、4 轮
+});
+
+test('熔断二不触发：一位评审独自提阻断，但主笔采纳、其他评审认为仍成立，讨论一直跑到上限', async () => {
+  const { registry } = scripted((c) => {
+    if (lead(c)) return PLAN(`${c.who}${c.round}`);
+    if (c.who === 'R1') return BLOCK;
+    if (c.who === 'R2') return `${DONE}${stanceOn(c.prompt, '仍成立')}`;
+    return null;
+  });
+  const res = await runDiscussion({ cfg: base(), topic: 't', providers: registry, publisher: createMemoryPublisher(), rng: () => 0 });
+  assert.equal(res.ending.reason, 'max');
+  assert.equal(res.ending.round, 8);
+});
+
+test('评审互见：别人的阻断漏了表态，要求补写一次；补完还漏的照常发布', async () => {
+  const { calls, registry } = scripted((c) => {
+    if (lead(c)) return PLAN(`${c.who}${c.round}`);
+    if (c.who === 'R1') return c.round >= 4 ? DONE : BLOCK;
+    if (c.who === 'R2') return /补全重写/.test(c.prompt) ? `${DONE}${stanceOn(c.prompt, '已解决')}` : DONE;
+    return null;
+  });
+  const events = [];
+  const res = await runDiscussion({ cfg: base(), topic: 't', providers: registry, publisher: createMemoryPublisher(), rng: () => 0, onEvent: (e) => events.push(e) });
+  const fix = calls.find((c) => c.who === 'R2' && /补全重写/.test(c.prompt));
+  assert.ok(fix, '漏表态时让评审补写');
+  assert.match(fix.prompt, /没有对其他评审的这些阻断表态：评审 \d 第 1 条/);
+  const checks = events.filter((e) => e.type === 'reply_check' && e.speaker === 'r2');
+  assert.ok(checks.some((e) => e.issues.includes('peer')));
+  assert.equal(res.ending.reason, 'converged');
 });
 
 test('修订后结束：评审都没有阻断但有新插话，主笔回应后都没改就结束', async () => {

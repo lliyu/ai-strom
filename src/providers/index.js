@@ -46,6 +46,8 @@ export function createMockProvider(spec = {}) {
       if (stage === '改稿') return { text: `**要点**：改了开头（mock）\n\n- 开头更快进入冲突\n\n【完整方案】\n${mockRedraft(`${system ?? ''}\n${prompt ?? ''}`)}`, model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
       if (stage.includes('主文档') || stage === '快问定稿' || stage === '改稿定稿') return { text: mockDoc(stage, prompt), model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 40 } };
       const itemized = mockItems(stage, prompt ?? '');
+      const stances = stage.includes('评审意见') && /对其他评审的阻断\*\*」下面/.test(prompt ?? '') ? peerLabels(prompt) : [];
+      if (!itemized && stances.length) return { text: `**${who}** 的${stage}（mock）\n\n- 要点一\n\n**对其他评审的阻断**\n${stances.map((x) => `- 【已解决】${x}`).join('\n')}`, model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 20 } };
       if (itemized) return { text: itemized, model: model ?? 'mock', durationMs: 1, usage: { inputTokens: prompt?.length ?? 0, outputTokens: 30 } };
       return {
         text: `**${who}** 的${stage}（mock）\n\n- 要点一\n- 要点二\n\n提示词长度 ${prompt?.length ?? 0} 字。`,
@@ -55,6 +57,12 @@ export function createMockProvider(spec = {}) {
       };
     },
   };
+}
+
+/** 提示词里「上一轮其他评审提的阻断」一节的引用：问题编号或「评审 N 第 K 条」。 */
+function peerLabels(prompt) {
+  const sec = /## 上一轮其他评审提的阻断（原文，匿名）\n([\s\S]*?)\n\n/.exec(prompt)?.[1] ?? '';
+  return sec.split('\n').map((l) => /〔(评审 \d+ 第 \d+ 条)〕/.exec(l)?.[1] ?? /【阻断】(Q\d+-\d+)/.exec(l)?.[1]).filter(Boolean);
 }
 
 /**
@@ -68,13 +76,14 @@ function mockItems(stage, prompt) {
   if (stage.includes('评审意见')) {
     const blocking = round <= 2;
     // 问题追踪开着时：对上一轮其他评审的阻断补充一条表态（编号照抄提示词里的）
-    const peer = /对其他评审的阻断\*\*」下面/.test(prompt) ? /### 评审 \d+\n- 【阻断】(Q\d+-\d+)/.exec(prompt)?.[1] : null;
+    // 评审互见：上一轮其他评审的阻断逐条表态（mock 里主笔都采纳了，一律写已解决）
+    const peers = /对其他评审的阻断\*\*」下面/.test(prompt) ? peerLabels(prompt) : [];
     return [
       blocking ? '**要点**：方案 A 还有 1 条阻断，预算会超扣（mock）' : '**要点**：没有阻断了，只剩一条建议（mock）',
       '**方案 A**',
       blocking ? '- 【阻断】并发扣减时预算会超扣（mock） ｜改法：扣减时加行锁 ｜依据：推断 ｜影响：活动亏钱' : '',
       '- 【建议】补一个超扣告警（mock） ｜改法：扣减后比对余额',
-      peer ? `**对其他评审的阻断**\n- 【补充】${peer} ｜依据：推断` : '',
+      peers.length ? `**对其他评审的阻断**\n${peers.map((x) => `- 【已解决】${x}`).join('\n')}` : '',
       verdict ? `评审结论：${blocking ? '继续讨论' : '没有意见了'}` : '',
     ].filter(Boolean).join('\n');
   }
