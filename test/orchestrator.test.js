@@ -228,3 +228,55 @@ test('第 1 轮成功不足 2 人时中止', async () => {
     /讨论无法继续/,
   );
 });
+
+test('脑洞风暴：评审过半标【弃】就拿掉，不补新的；主笔的脑洞全被放弃就退出，全部放弃提前结束', async () => {
+  const cfg = cfgWithReviewers('brainstorm', 4);
+  const calls = [];
+  const marks = {
+    2: '【弃】A1：老套路换皮\n【弃】A2：撑不起长篇\n【留】B1\n**亮点**：x\n【弃】B2：钩子不抓人',
+    3: '【弃】B1：越补越重',
+  };
+  const provider = {
+    async complete({ model, prompt }) {
+      const who = whoOf(arguments[0]);
+      const stage = /【阶段：([^】]+)】/.exec(prompt)?.[1] ?? '';
+      const round = Number(/第 (\d+) 轮/.exec(stage)?.[1]);
+      let text = `发言-${calls.length}`;
+      if (stage.includes('盲审意见') && /模型[23]/.test(who)) text = `${marks[round] ?? '【留】B1'}\n评审结论：继续讨论`;
+      if (stage === '核对主文档') text = '没有问题';
+      calls.push({ who, stage, prompt, text });
+      return { text, model, durationMs: 10, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const pub = createMemoryPublisher();
+  const result = await runDiscussion({ cfg, topic: '末日 种田', providers: { get: () => provider }, publisher: pub, rng: fixedRng });
+  const leadA = Object.entries(result.labels).find(([, t]) => t === '方案 A')[0];
+  const nameA = cfg.participants.find((p) => p.id === leadA).name;
+
+  // 发散只要 2 个
+  assert.match(calls.find((c) => c.stage === '发散').prompt, /独立给出 2 个/);
+  // 第 2 轮：A 的两个和 B2 被放弃，主编发卡片
+  const card = pub.posts.find((p) => p.meta?.stage === 'abandon' && p.meta.round === 2);
+  assert.match(card.body, /A1[\s\S]*A2[\s\S]*B2/);
+  assert.match(card.body, /方案 A 的脑洞都已放弃/);
+  // A 不修订；B 只修订 B1，并被告知 B2 已放弃
+  const revise2 = calls.filter((c) => c.stage === '第 2 轮修订');
+  assert.equal(revise2.length, 1);
+  assert.ok(!revise2[0].who.startsWith(nameA));
+  assert.match(revise2[0].prompt, /B2：钩子不抓人[\s\S]*不要再写它们/);
+  assert.match(revise2[0].prompt, /只写还留着的脑洞（编号 1）/);
+  // 第 3 轮：A 不再发言，评审只评 B，并看到已放弃的清单
+  const round3 = calls.filter((c) => c.stage.startsWith('第 3 轮'));
+  assert.ok(round3.every((c) => !c.who.startsWith(nameA)));
+  const fb3 = round3.find((c) => /模型2/.test(c.who));
+  assert.doesNotMatch(fb3.prompt.split('## 待评的脑洞')[1].split('## 已经放弃')[0], /### 方案 A/);
+  assert.match(fb3.prompt, /已经放弃的脑洞[\s\S]*A1/);
+  // B1 也被放弃：提前结束，不再修订，主编知道放弃了哪些
+  assert.equal(result.ending.reason, 'abandoned');
+  assert.equal(result.roundsUsed, 3);
+  assert.equal(calls.filter((c) => c.stage === '第 3 轮修订').length, 0);
+  const doc = calls.find((c) => c.stage === '主文档');
+  assert.match(doc.prompt, /讨论中放弃的脑洞[\s\S]*B1（第 3 轮，2\/2 位评审标【弃】）：越补越重/);
+  assert.match(doc.prompt, /所有脑洞都被评审过半判定放弃/);
+  assert.equal(result.state.ideasPerAgent, 2);
+});

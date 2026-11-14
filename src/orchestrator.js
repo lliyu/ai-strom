@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   STAGE_LABELS, participantSystem, chairSystem,
   proposePrompt, critiquePrompt, reviewPrompt,
-  divergePrompt, feedbackPrompt, revisePrompt,
+  divergePrompt, feedbackPrompt, revisePrompt, abandonedIdeas, keptIdeas, ideaCode,
   researchSystem, researchPrompt, sharedSystem, parseVerdict, parseStanceChange,
   triagePrompt, parseTriage, stripTriageLine, followUpPrompt, parseVerdictPick, parseVerifyQuestions, finalPrompt, freshBlock, HANDLING_LABELS,
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
@@ -105,7 +105,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   const convo = cfg.conversation !== false;
   const heard = []; // 本次运行收到的插话
   const stats = { calls: 0, failures: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
-  const ideasPerAgent = cfg.ideasPerAgent ?? 3;
+  const ideasPerAgent = cfg.ideasPerAgent ?? 2;
   const limits = limitsFor(cfg.mode, cfg.limits); // 脑洞风暴不限字数（null）
   const run = { participants, leads, reviewers, reviewerIds, tagOf, convo, heard, stats, emit, ideasPerAgent, limits, shared: '', truncations: 0 };
   /**
@@ -164,6 +164,29 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   /** 发给这位发言者的插话：会话模式只发它还没收到过的，非会话模式每轮都发全部。 */
   run.ijFor = (p) => (convo ? heard.slice(sessions.get(p.id)?.seen ?? 0) : heard);
   run.latestOthers = (p) => [...latest.values()].filter((e) => e.id !== p.id).sort(byTag);
+  /**
+   * 脑洞风暴里被放弃的脑洞：每轮盲审评审过半标【弃】就拿掉，不补新的（从讨论记录算，续跑和追问都不用另存）。
+   * retired：脑洞全被放弃的主笔，后面的轮次不再请它发言，别人也不再评它。
+   */
+  run.abandoned = () => (cfg.mode === 'brainstorm' ? abandonedIdeas(rounds, { hasReviewers: reviewers.length > 0 }) : []);
+  run.keptOf = (p, abandoned = run.abandoned()) => keptIdeas(tagOf(p), ideasPerAgent, abandoned);
+  run.retired = (abandoned = run.abandoned()) => new Set(cfg.mode === 'brainstorm' ? leads.filter((p) => !run.keptOf(p, abandoned).length).map((p) => p.id) : []);
+  /** 这一轮放弃了哪些脑洞：主编发一张卡片，脑洞全被放弃的主笔从下一轮起退出。 */
+  run.postAbandoned = async (fresh, round, retiredLeads = []) => {
+    log(`第 ${round} 轮放弃 ${fresh.map((a) => a.code).join('、')}${retiredLeads.length ? `；${retiredLeads.map((p) => tagOf(p)).join('、')} 的脑洞都已放弃，退出后面的轮次` : ''}`);
+    emit({ type: 'ideas_abandoned', round, ideas: fresh.map((a) => ({ code: a.code, votes: a.votes, voters: a.voters })), retired: retiredLeads.map((p) => p.id) });
+    await publisher.post({
+      speaker: cfg.chair,
+      title: `放弃 ${fresh.length} 个脑洞`,
+      subtitle: `第 ${round} 轮 · 评审过半标【弃】`,
+      body: [
+        ...fresh.map((a) => `- **${a.code}**（${a.votes}/${a.voters}）${a.reasons.length ? `：${a.reasons.join('；')}` : ''}`),
+        retiredLeads.length ? `\n${retiredLeads.map((p) => tagOf(p)).join('、')} 的脑洞都已放弃，后面的轮次不再参加。` : '',
+        '\n放弃的脑洞不补新的，后面不再讨论。',
+      ].filter(Boolean).join('\n'),
+      meta: { stage: 'abandon', round },
+    });
+  };
 
   run.pullInterjections = async () => {
     if (!interjections) return;
@@ -793,9 +816,16 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     for (let round = from; round <= to; round += 1) {
       await run.pullInterjections();
       lastRound = round;
-      const activeLeads = leads.filter((p) => latest.has(p.id) && !dropped.has(p.id));
+      const retired = run.retired();
+      const activeLeads = leads.filter((p) => latest.has(p.id) && !dropped.has(p.id) && !retired.has(p.id));
       const activeReviewers = reviewers.filter((p) => !dropped.has(p.id));
       // 评审或主笔全部掉线：讨论没法再往下走，带着现有方案结束
+      if (retired.size && retired.size === leads.length) {
+        // 续跑时断点在全部放弃之后：直接按放弃结束
+        lastRound = round - 1;
+        ending = { reason: 'abandoned', round: round - 1, byReviewers: reviewers.length > 0 };
+        break;
+      }
       if ((reviewers.length && !activeReviewers.length) || !activeLeads.length) {
         lastRound = round - 1;
         ending = { reason: 'dropped', round: round - 1, byReviewers: reviewers.length > 0, part: activeLeads.length ? 'reviewer' : 'lead' };
@@ -808,22 +838,37 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
       let revised;
 
       if (cfg.mode === 'brainstorm') {
-        // 盲审：主笔评其他主笔的脑洞，评审评所有主笔的脑洞；只给意见
+        // 盲审：主笔评其他主笔的脑洞，评审评所有主笔的脑洞；只给意见，并给每个脑洞标【留】或【弃】
         const givers = [...activeLeads, ...activeReviewers];
-        const fb = await run.runStage(givers, round, 'feedback', (p) => feedbackPrompt({ round, others: run.latestOthers(p), interjections: run.ijFor(p), askVerdict: adaptive && reviewerIds.has(p.id), convo, scope: scopeFor(p) }));
+        const before = run.abandoned();
+        const othersFor = (p) => run.latestOthers(p).filter((e) => !retired.has(e.id));
+        const fb = await run.runStage(givers, round, 'feedback', (p) => feedbackPrompt({ round, others: othersFor(p), abandoned: before, interjections: run.ijFor(p), askVerdict: adaptive && reviewerIds.has(p.id), convo, scope: scopeFor(p) }));
         markScoped(fb);
         await tally(givers, fb, round);
+        // 评审过半标【弃】的脑洞立即拿掉；主笔的脑洞全被放弃就退出后面的轮次
+        const after = run.abandoned();
+        const fresh = after.filter((a) => a.round === round && !before.some((b) => b.code === a.code));
+        const nowRetired = run.retired(after);
+        if (fresh.length) await run.postAbandoned(fresh, round, activeLeads.filter((p) => nowRetired.has(p.id)));
+        const remaining = activeLeads.filter((p) => !nowRetired.has(p.id));
+        if (!remaining.length) {
+          ending = { reason: 'abandoned', round, byReviewers: reviewers.length > 0 };
+          log(`第 ${round} 轮所有脑洞都被放弃，提前结束`);
+          break;
+        }
         if (adaptive && activeReviewers.length && !newInterjections && reviewersDone(fb, activeReviewers.filter((p) => !dropped.has(p.id)))) {
           converge(round);
           break;
         }
         const fbBy = new Map(fb.map((e) => [e.id, e.text]));
-        // 修订：主笔只看到别人给的意见（来源匿名），独立修改
-        revised = await run.runStage(activeLeads, round, 'revise', (p) => revisePrompt({
+        // 修订：主笔只看到别人给的意见（来源匿名），独立修改；只写还留着的脑洞
+        revised = await run.runStage(remaining, round, 'revise', (p) => revisePrompt({
           round,
           own: latest.get(p.id),
           feedback: givers.filter((q) => q.id !== p.id && fbBy.has(q.id)).map((q) => fbBy.get(q.id)),
           ideasPerAgent,
+          kept: run.keptOf(p, after),
+          dropped: fresh.filter((a) => a.code[0] === ideaCode(tagOf(p), 1)[0]),
           interjections: run.ijFor(p),
           convo,
         }));
@@ -1353,6 +1398,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     // 条目化发言是按场开的（试跑）：追问沿用发起时的设置
     ...(cfg.items ? { items: true } : {}),
     mode: cfg.mode,
+    ...(cfg.mode === 'brainstorm' ? { ideasPerAgent: cfg.ideasPerAgent ?? 2 } : {}),
     createdAt: createdAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     tags: Object.fromEntries(tags),
@@ -1409,6 +1455,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const sessions = resume
     ? new Map(Object.entries(resume.sessions).map(([id, s]) => [id, { ...s, turns: [...s.turns] }]))
     : new Map(cfg.participants.map((p) => [p.id, { id: randomUUID(), turns: [], seen: 0 }]));
+  if (resume?.ideasPerAgent) cfg = { ...cfg, ideasPerAgent: resume.ideasPerAgent }; // 续跑按断点时的脑洞个数
   const latest = new Map(resume ? resume.latest.map((e) => [e.id, e]) : []); // 主笔 id -> 最新一版方案
   const rounds = resume ? [...resume.rounds] : []; // [{ round, stage, entries: [{ id, label, tag, text }] }]
   const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: resume?.facts ?? [], budget: resume?.budget ?? {}, data: cfg.mode === 'decision' ? data : null });
@@ -1569,7 +1616,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const written = await run.writeDoc({
     round: lastRound + 1,
     reason: '讨论结束',
-    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted, blockers: run.chairBlockers() })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
+    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ abandoned: run.abandoned(), mode: cfg.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, ending, noCode: noCodeOf(cfg.mode, context), omitted, blockers: run.chairBlockers() })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
   const docs = written ?? [];
   if (!docs.length) await run.postDocFallback({ round: lastRound + 1, ending, number });
@@ -1755,6 +1802,8 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   if (state?.version !== STATE_VERSION) throw new Error('讨论状态的版本不对，无法追问');
   if (state.expired) throw new Error(`讨论 #${state.number} 已超过保留期，会话已清理，请重新发起讨论`);
   if (state.items && !cfg.items) cfg = { ...cfg, items: true };
+  // 每人几个脑洞按发起时的：旧的脑洞风暴没存这一项，那时默认 3 个
+  if (state.mode === 'brainstorm') cfg = { ...cfg, ideasPerAgent: state.ideasPerAgent ?? 3 };
   const tags = new Map(Object.entries(state.tags));
   // 追问里的插话从头算，seen 归零
   const sessions = new Map(Object.entries(state.sessions).map(([id, s]) => [id, { ...s, turns: [...s.turns], seen: 0 }]));
@@ -1867,7 +1916,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
       reason,
       check: false,
       ...(answerer ? { writer: answerer } : {}),
-      prompt: docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, answer }),
+      prompt: docUpdatePrompt({ abandoned: run.abandoned(), mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, answer }),
     }) : null;
     const doc = firstDoc(out);
     if (out?.length) docs.push(...out);
@@ -1897,13 +1946,13 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         round: r0,
         reason,
         check: false,
-        prompt: (factor) => run.fitChair(({ facts: checked, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, ruling: pick.ruling, final, finals, interjections: heard, omitted, blockers: run.chairBlockers() })}${chairFacts(checked)}`, { facts: run.facts, factor }),
+        prompt: (factor) => run.fitChair(({ facts: checked, omitted }) => `${docUpdatePrompt({ abandoned: run.abandoned(), mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, ruling: pick.ruling, final, finals, interjections: heard, omitted, blockers: run.chairBlockers() })}${chairFacts(checked)}`, { facts: run.facts, factor }),
       }
       : {
         round: r0,
         reason: `补写（${reason}）`,
         check: false,
-        prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals, interjections: heard, omitted, blockers: run.chairBlockers(), earlier: earlierOf(state.summary, [...followUps, { question, answer: `人的裁决：${pick.ruling}${final ? `\n\n定稿方案：\n${final.plan}` : '\n\n（由主席按裁决合并定稿）'}` }]) })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
+        prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ abandoned: run.abandoned(), mode: state.mode, rounds: hist, finals, interjections: heard, omitted, blockers: run.chairBlockers(), earlier: earlierOf(state.summary, [...followUps, { question, answer: `人的裁决：${pick.ruling}${final ? `\n\n定稿方案：\n${final.plan}` : '\n\n（由主席按裁决合并定稿）'}` }]) })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
       });
     const doc = firstDoc(out);
     if (out?.length) docs.push(...out);
@@ -1934,13 +1983,13 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
           round: r0,
           reason,
           check: false,
-          prompt: (factor) => run.fitChair(({ facts: f, omitted }) => `${docUpdatePrompt({ mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, verifyQuestions, interjections: heard, omitted })}${chairFacts(f)}`, { facts: run.facts, factor }),
+          prompt: (factor) => run.fitChair(({ facts: f, omitted }) => `${docUpdatePrompt({ abandoned: run.abandoned(), mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, verifyQuestions, interjections: heard, omitted })}${chairFacts(f)}`, { facts: run.facts, factor }),
         }
         : {
           round: r0,
           reason: `补写（${reason}）`,
           check: false,
-          prompt: (factor) => run.fitChair(({ rounds: hist, facts: f, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, omitted, earlier: earlierOf(state.summary, followUps) })}${chairFacts(f)}`, { rounds, facts: run.facts, factor }),
+          prompt: (factor) => run.fitChair(({ rounds: hist, facts: f, omitted }) => `${docPrompt({ abandoned: run.abandoned(), mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), interjections: heard, omitted, earlier: earlierOf(state.summary, followUps) })}${chairFacts(f)}`, { rounds, facts: run.facts, factor }),
         });
       const doc = firstDoc(out);
     if (out?.length) docs.push(...out);
@@ -1954,9 +2003,13 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     // ---------- 主笔回应追问 ----------
     const r0 = state.lastRound + 1;
     await run.pullInterjections();
-    const activeLeads = leads.filter((p) => latest.has(p.id));
+    const retired = run.retired();
+    const activeLeads = leads.filter((p) => latest.has(p.id) && !retired.has(p.id));
+    if (!activeLeads.length) throw new Error('这场脑洞风暴的脑洞都已放弃，没有可以继续讨论的；想换方向请新开一场');
+    const brainstorm = state.mode === 'brainstorm';
     const revised = await run.runStage(activeLeads, r0, 'followup', (p) => followUpPrompt({
-      mode: state.mode, round: r0, question, brief: briefText, others: run.latestOthers(p), interjections: run.ijFor(p), ideasPerAgent, limits: run.limits,
+      mode: state.mode, round: r0, question, brief: briefText, others: run.latestOthers(p).filter((e) => !retired.has(e.id)), interjections: run.ijFor(p), ideasPerAgent, limits: run.limits,
+      ...(brainstorm ? { kept: run.keptOf(p) } : {}),
     }));
     if (!revised.length) throw new Error('主笔都没能回应追问');
     for (const e of revised) latest.set(e.id, e);
@@ -1979,7 +2032,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         round: lastRound + 1,
         reason,
         prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docUpdatePrompt({
-          mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, brief: briefText,
+          abandoned: run.abandoned(), mode: state.mode, doc: current.text, attachments: current.attachments, version: current.version, otherDocs: othersOf(docs, current), question, handling, brief: briefText,
           rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted, blockers,
         })}${chairFacts(checked)}`, { rounds: rounds.filter((r) => r.round >= r0), facts: run.facts, factor }),
       }
@@ -1987,7 +2040,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
         round: lastRound + 1,
         reason: `补写（${reason}）`,
         prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({
-          mode: state.mode, rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted, blockers,
+          abandoned: run.abandoned(), mode: state.mode, rounds: hist, finals, interjections: heard, ending: it.ending, noCode, omitted, blockers,
           earlier: earlierOf(state.summary, [...followUps, { question, answer: `（这次追问，第 ${r0} 轮之后的讨论记录就是它的讨论）` }]),
         })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
       });
@@ -2088,7 +2141,7 @@ export async function backfillDoc({ cfg, state, providers, publisher, log = () =
   const written = await run.writeDoc({
     round: state.lastRound + 1,
     reason: '补写',
-    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), earlier: earlierOf(state.summary, state.followUps), omitted })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
+    prompt: (factor) => run.fitChair(({ rounds: hist, facts: checked, omitted }) => `${docPrompt({ abandoned: run.abandoned(), mode: state.mode, rounds: hist, finals: [...latest.values()].sort(byTag), earlier: earlierOf(state.summary, state.followUps), omitted })}${chairFacts(checked)}`, { rounds, facts: run.facts, factor }),
   });
   if (!written?.length) throw new Error('主文档没写成');
   const [doc] = written;
@@ -2181,6 +2234,7 @@ function endingText(ending) {
 
 function endingBase(ending) {
   if (ending.reason === 'dropped') return `第 ${ending.round} 轮结束：${ending.part === 'lead' ? '主笔' : '评审'}全部掉线（${(ending.dropped ?? []).join('、')} 连续 ${DROP_AFTER} 轮调用失败）`;
+  if (ending.reason === 'abandoned') return `第 ${ending.round} 轮所有脑洞都被放弃，提前结束`;
   if (ending.reason === 'converged') return `第 ${ending.round} 轮提前结束（收敛）`;
   if (ending.reason === 'max') return `到上限 ${ending.round} 轮结束，评审仍有意见`;
   if (ending.reason === 'fixed') return `按固定轮数在第 ${ending.round} 轮结束`;
@@ -2195,6 +2249,7 @@ function endingBase(ending) {
 function endingSuffix(ending, stopRule) {
   if (ending.reason === 'converged') return `，${stopRule}`;
   if (ending.reason === 'max') return '，达到上限仍有意见';
+  if (ending.reason === 'abandoned') return '，所有脑洞都被放弃';
   if (ending.reason === 'deadlock') return '，以分歧结束，待你裁决';
   if (ending.reason === 'dissent') return `，${ending.tag ?? '一位评审'}独自坚持阻断，待你裁决`;
   if (ending.reason === 'dropped') return `，${ending.part === 'lead' ? '主笔' : '评审'}全部掉线`;

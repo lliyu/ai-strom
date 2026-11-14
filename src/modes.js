@@ -34,6 +34,7 @@ export const STAGE_LABELS = {
   review: '互评与修订',
   diverge: '发散',
   feedback: '盲审意见',
+  abandon: '放弃脑洞',
   revise: '修订',
   summary: '汇总',
   research: '代码调研',
@@ -1292,6 +1293,7 @@ function endingBlock(ending) {
 
 function endingBlockBase(ending) {
   if (ending.reason === 'dropped') return `## 讨论如何结束\n第 ${ending.round} 轮之后${ending.part === 'lead' ? '主笔' : '评审'}全部掉线（${(ending.dropped ?? []).join('、')} 连续调用失败），讨论没法继续，被提前结束。${ending.part === 'lead' ? '方案停在各主笔最后一版。' : '最后几轮的方案没有经过评审。'}\n\n${VERDICT_RULES}`;
+  if (ending.reason === 'abandoned') return `## 讨论如何结束\n第 ${ending.round} 轮所有脑洞都被评审过半判定放弃，讨论提前结束。没有留下值得推荐的脑洞：在「一句话结论」和「最值得写的脑洞」里如实说明，写清各个脑洞为什么被放弃、下一场换什么方向更有希望。`;
   if (ending.reason === 'converged') return `## 讨论如何结束\n第 ${ending.round} 轮${ending.byReviewers ? '所有评审都表示没有新意见' : '所有主笔的立场都不再变化'}，讨论提前结束。`;
   if (ending.reason === 'max') return `## 讨论如何结束\n已经达到上限 ${ending.round} 轮，${ending.byReviewers ? '评审仍有意见' : '主笔的立场仍在变化'}，讨论被强制结束。\n\n${VERDICT_RULES}`;
   if (ending.reason === 'deadlock') return `## 讨论如何结束\n主笔连续两轮都没有改方案（第 ${ending.round - 1}、${ending.round} 轮），评审仍有阻断：双方各自坚持，讨论以分歧结束，交给人裁决。\n\n${VERDICT_RULES}`;
@@ -1381,33 +1383,130 @@ export function divergePrompt({ topic, ideasPerAgent, interjections, context, ow
   );
 }
 
-export function feedbackPrompt({ topic, round, others, interjections, context, askVerdict = false, convo = false, scope }) {
+/** 脑洞代号：「方案 B」的第 2 个脑洞是「B2」。 */
+export const ideaCode = (tag, no) => `${/方案\s*([A-Z])/.exec(String(tag ?? ''))?.[1] ?? '?'}${no}`;
+
+/** 已经放弃的脑洞：告诉评审不要再评，告诉主编不能推荐。 */
+function abandonedBlock(abandoned = [], { forChair = false } = {}) {
+  if (!abandoned.length) return '';
+  return [
+    forChair ? '## 讨论中放弃的脑洞（评审过半判定放弃，不能进推荐；写进「放弃的方向」）' : '## 已经放弃的脑洞（不要再评，也不要建议恢复）',
+    ...abandoned.map((a) => `- ${a.code}（第 ${a.round} 轮，${a.votes}/${a.voters} 位评审标【弃】）${a.reasons?.length ? `：${a.reasons.join('；')}` : ''}`),
+  ].join('\n');
+}
+
+/** 什么问题值得在脑洞阶段继续讨论；数字、逻辑小漏洞、正文执行都留给后面。 */
+export const BRAINSTORM_BAR = [
+  '这是开书前的脑洞阶段，只看点子值不值得写，不审大纲：',
+  '- **问题**只写脑洞级的：钩子不抓人、老套路、看不出主角要干什么或爽在哪里、核心冲突或金手指撑不起长篇。',
+  '- 具体数字、设定里的逻辑小漏洞、某一卷怎么写、某个情节怎么圆、人物台词和表现，都不是脑洞级问题，写进**后续注意**，主笔这一轮不用改。',
+  '- **可以更大胆的方向**也只写会改变这个脑洞卖点或核心冲突的方向；只是补细节的不算。',
+].join('\n');
+
+/** 每个脑洞第一行的去留标记：「【留】B1」或「【弃】B1：理由」。 */
+const MARK_RE = /^[\s>*\-#]*\**\s*【(留|弃)】\s*\**\s*(?:方案\s*)?([A-Z])\s*(\d+)\s*\**\s*(?:[:：]\s*(.*))?$/;
+
+/** 解析一条盲审意见里的去留标记：[{ code: 'B1', keep, reason }]，同一个脑洞取第一次出现的。 */
+export function parseIdeaMarks(text) {
+  const out = new Map();
+  for (const line of String(text ?? '').split('\n')) {
+    const m = MARK_RE.exec(line);
+    if (!m) continue;
+    const code = `${m[2]}${m[3]}`;
+    if (!out.has(code)) out.set(code, { code, keep: m[1] === '留', reason: (m[4] ?? '').replace(/\**\s*$/, '').trim() });
+  }
+  return [...out.values()];
+}
+
+/**
+ * 从讨论记录里算出被放弃的脑洞：每一轮盲审，评审过半标【弃】的脑洞就放弃，之后不再讨论。
+ * 有评审时只算评审的票，没有评审时算其他主笔的票；没写标记的算【留】。放弃的不补新的。
+ * 返回 [{ code, round, votes, voters, reasons }]，按放弃的先后排。
+ */
+export function abandonedIdeas(rounds = [], { hasReviewers = true } = {}) {
+  const gone = new Map();
+  for (const r of [...rounds].filter((x) => x.stage === 'feedback').sort((a, b) => a.round - b.round)) {
+    const voters = r.entries.filter((e) => (hasReviewers ? /^评审/.test(e.tag ?? '') : /^方案/.test(e.tag ?? '')));
+    const tally = new Map();
+    for (const e of voters) {
+      const own = /方案\s*([A-Z])/.exec(e.tag ?? '')?.[1];
+      for (const m of parseIdeaMarks(e.text)) {
+        if (gone.has(m.code) || m.code[0] === own) continue;
+        const t = tally.get(m.code) ?? { votes: 0, reasons: [] };
+        if (!m.keep) {
+          t.votes += 1;
+          if (m.reason) t.reasons.push(m.reason);
+        }
+        tally.set(m.code, t);
+      }
+    }
+    for (const [code, t] of tally) {
+      // 主笔不给自己的脑洞投票，不算进分母
+      const n = voters.filter((e) => /方案\s*([A-Z])/.exec(e.tag ?? '')?.[1] !== code[0]).length;
+      if (n && t.votes * 2 > n) gone.set(code, { code, round: r.round, votes: t.votes, voters: n, reasons: t.reasons });
+    }
+  }
+  return [...gone.values()];
+}
+
+/** 某位主笔还留着的脑洞编号。 */
+export function keptIdeas(tag, ideasPerAgent, abandoned = []) {
+  const gone = new Set(abandoned.map((a) => a.code));
+  return Array.from({ length: ideasPerAgent }, (_, i) => i + 1).filter((n) => !gone.has(ideaCode(tag, n)));
+}
+
+export function feedbackPrompt({ topic, round, others, interjections, context, askVerdict = false, convo = false, scope, abandoned = [] }) {
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.feedback}】`,
     scopeBlock(scope, { once: convo }),
     `## 待评的脑洞（匿名）\n${labeled(others)}`,
+    abandonedBlock(abandoned),
     interjectionBlock(interjections),
     [
       ...followUpLines(convo, round),
       '只给意见，不要改写、合并或替别人重写脑洞。',
-      '站在网文读者的角度，对每个方案里的每个脑洞（用「方案代号 + 编号」指代）写：',
-      '**亮点**（读者会为了什么点开、追下去）、**问题**（例如老套路、看不出主角要干什么或爽在哪里、金手指或冲突撑不起长篇）、**可以更大胆的方向**（一句话）',
-      askVerdict ? verdictInstruction(round).replace('影响方案取舍、正确性或落地', '明显提升这些脑洞') : '',
+      '站在网文读者的角度，逐个评每个方案里还在讨论的脑洞，用「方案代号 + 编号」指代（如 B1）。',
+      '每个脑洞的第一行单独写去留，二选一：「【留】B1」或「【弃】B1：一句话理由」。',
+      '- 【弃】：这个点子不值得再投入，继续改也写不出让人想追的书（核心钩子不成立、老套路换皮、改到现在越补越重）。不要因为还能改进就留着，该放弃就放弃。',
+      '- 评审过半标【弃】的脑洞会被直接拿掉，主笔不能保留，也不会补新的。',
+      '然后写：',
+      '**亮点**（读者会为了什么点开、追下去）',
+      '**问题**（只写脑洞级的；没有就写「无」）',
+      '**可以更大胆的方向**（一句话；没有就写「无」）',
+      '**后续注意**（写梗概、大纲、正文时要留意的，主笔这一轮不用改；没有就写「无」）',
+      '标了【弃】的脑洞只写理由，后面几项不用写。',
+      BRAINSTORM_BAR,
+      askVerdict ? brainstormVerdict(round) : '',
     ].filter(Boolean).join('\n'),
   );
 }
 
-export function revisePrompt({ topic, round, own, feedback, ideasPerAgent, interjections, context, convo = false }) {
+/** 脑洞风暴的评审结论：只有还留着的脑洞有脑洞级问题才继续。 */
+function brainstormVerdict(round) {
+  return [
+    '',
+    `最后单独一行写结论，只能二选一：「${VERDICT_LINE}：${VERDICT_CONTINUE}」或「${VERDICT_LINE}：${VERDICT_DONE}」。`,
+    `只有你标了【留】的脑洞里还有脑洞级问题、或者有值得一试的更大胆方向时，才写「${VERDICT_CONTINUE}」；只剩后续注意、数字或细节时写「${VERDICT_DONE}」。`,
+    round > 2 ? '已经被主笔采纳或合理反驳的意见不要重复提。' : '',
+  ].filter((l) => l !== '').join('\n');
+}
+
+export function revisePrompt({ topic, round, own, feedback, ideasPerAgent, interjections, context, convo = false, kept = null, dropped = [] }) {
   const fb = feedback.map((f, i) => `### 意见 ${i + 1}\n${f}`).join('\n\n');
+  const keep = kept ?? Array.from({ length: ideasPerAgent }, (_, i) => i + 1);
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.revise}】`,
     ownBlock('你上一版的脑洞', own, convo),
     `## 别人给你的意见（匿名）\n${fb || '（这一轮没有收到意见）'}`,
+    dropped.length
+      ? `## 这一轮被放弃的脑洞\n评审过半标了【弃】，已经拿掉：\n${dropped.map((a) => `- ${a.code}${a.reasons?.length ? `：${a.reasons.join('；')}` : ''}`).join('\n')}\n修订版里不要再写它们，也不要换个名字或拆成别的点子写回来。`
+      : '',
     interjectionBlock(interjections),
     [
       '按你自己的视角修订脑洞：意见可以采纳、部分采纳或拒绝（拒绝要说明理由）。',
-      '保持你的风格，不要向别人的点子靠拢。可以删掉弱的、补新的。',
-      `修订后仍给出 ${ideasPerAgent} 个，结构和编号与上一版一致。`,
+      '保持你的风格，不要向别人的点子靠拢。',
+      '修问题用最少的改动：宁可换掉一个弱的设定，也不要为了堵漏洞新增规则或机制。意见里的「后续注意」是写大纲和正文时的事，这一轮不用改。',
+      `只写还留着的脑洞（编号 ${keep.join('、')}），编号不变，不补新的；结构和上一版一致。`,
     ].join('\n'),
   );
 }
@@ -1537,7 +1636,7 @@ export function stripTriageLine(text) {
 }
 
 /** 主笔回应追问：在自己的会话里接着聊，所以只发新内容。 */
-export function followUpPrompt({ mode, round, question, brief, others, interjections, ideasPerAgent = 3, limits = limitsFor(mode) }) {
+export function followUpPrompt({ mode, round, question, brief, others, interjections, ideasPerAgent = 2, limits = limitsFor(mode), kept = null }) {
   const isBrainstorm = mode === 'brainstorm';
   const plan = mode === 'refine' ? '修改方案' : '方案';
   return join(
@@ -1552,7 +1651,7 @@ export function followUpPrompt({ mode, round, question, brief, others, interject
         '结合追问重新审视你的脑洞：需要改就改，不需要改要说明理由。',
         '按下面的结构：',
         '**对追问的回应**',
-        `**修订后的脑洞**（仍给出 ${ideasPerAgent} 个，编号与之前一致）`,
+        `**修订后的脑洞**（只写还留着的脑洞${kept ? `：编号 ${kept.join('、')}` : `，最多 ${ideasPerAgent} 个`}，编号与之前一致；被放弃的不要再写，也不补新的）`,
         '**立场变化**（无 / 小幅 / 较大，一句话说明）',
       ].join('\n')
       : [
@@ -1607,10 +1706,10 @@ const DOC_OUTLINE = {
     '**一句话结论**：最值得写的是哪个脑洞、为什么（只写一句话，不分行、不列点）',
     KEY_POINTS,
     '## 题目与要求',
-    '## 最值得写的脑洞（3 个左右，按推荐程度排序，每个都写完整，不能只写编号：一句话钩子、题材、主角和他想要什么、核心冲突或金手指（含代价或限制）、开篇第一个场景、卖点和与同类热门书的差异、主线大致怎么走才能撑起长篇、为什么值得写）',
+    '## 最值得写的脑洞（3 个左右，按推荐程度排序，每个都写完整，不能只写编号：一句话钩子、题材、主角和他想要什么、核心冲突或金手指（含代价或限制）、开篇第一个场景、卖点和与同类热门书的差异、主线大致怎么走才能撑起长篇、为什么值得写、写梗概和大纲时要注意什么（来自评审的「后续注意」））',
     '## 可以组合的点子（组合后是什么样子）',
     '## 被低估的点子',
-    '## 放弃的方向（每个一句话：是什么、为什么放弃）',
+    '## 放弃的方向（讨论中被放弃的脑洞和你没选的方向，每个一句话：是什么、为什么放弃）',
     '## 下一步',
   ],
   quick: [
@@ -1760,7 +1859,7 @@ function attachmentsBlock(attachments) {
 /**
  * 初稿：讨论结束时写。补写旧讨论时 earlier 带上原来的汇总和追问记录。
  */
-export function docPrompt({ mode, rounds, finals, interjections, ending, earlier, noCode = false, omitted = '', blockers = [] }) {
+export function docPrompt({ mode, rounds, finals, interjections, ending, earlier, noCode = false, omitted = '', blockers = [], abandoned = [] }) {
   const hasCritique = rounds?.some((r) => r.stage === 'critique');
   return join(
     `【阶段：${STAGE_LABELS.doc}】`,
@@ -1769,6 +1868,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
     mode === 'brainstorm'
       ? (finals?.length ? `## 各方最终版脑洞（匿名）\n${labeled(finals)}` : '')
       : finalsBlock(finals, mode === 'refine' ? '各主笔最终的修改方案' : '各主笔的最终方案'),
+    abandonedBlock(abandoned, { forChair: true }),
     earlier ? `## 之前的汇总和追问（按时间先后，后面的结论推翻前面时以后面为准）\n${earlier}` : '',
     blockersBlock(blockers),
     endingBlock(ending),
@@ -1784,7 +1884,7 @@ export function docPrompt({ mode, rounds, finals, interjections, ending, earlier
 /**
  * 追问之后更新主文档：直接回答的给回答，重新讨论的给追问之后的讨论记录。
  */
-export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '', blockers = [], ruling, final, verifyQuestions = [], otherDocs = [] }) {
+export function docUpdatePrompt({ mode, doc, attachments, version, question, handling, answer, brief, rounds, finals, interjections, ending, noCode = false, omitted = '', blockers = [], ruling, final, verifyQuestions = [], otherDocs = [], abandoned = [] }) {
   return join(
     `【阶段：更新${STAGE_LABELS.doc}】`,
     `## 现在的主文档（第 ${version} 版）\n${doc}`,
@@ -1817,6 +1917,7 @@ export function docUpdatePrompt({ mode, doc, attachments, version, question, han
         omittedBlock(omitted),
         historyBlock(rounds).replace('## 讨论记录（匿名）', '## 追问之后的讨论（匿名）'),
         mode === 'brainstorm' ? (finals?.length ? `## 各方最新的脑洞（匿名）\n${labeled(finals)}` : '') : finalsBlock(finals, '各主笔目前的方案'),
+        abandonedBlock(abandoned, { forChair: true }),
         blockersBlock(blockers),
         endingBlock(ending),
         noCodeBlock(noCode),
