@@ -5,6 +5,8 @@
  * 用量：缓存命中读 usage.prompt_tokens_details.cached_tokens（OpenAI / LiteLLM）或 prompt_cache_hit_tokens（DeepSeek）；
  * LiteLLM 网关在响应头 x-litellm-response-cost 里给出这次调用的费用。
  * 上下文窗口：配置里没写 contextWindow 时，查一次 {baseUrl}/models 里的 max_input_tokens / context_length。
+ * 推理强度：发言者或 provider 配了 effort 就原样作为 reasoning_effort 发出（low / medium / high）。
+ * 有的网关（例如经 LiteLLM 接的 Gemini）不传就完全不思考，评审会变得很好说话。
  */
 export function createOpenAICompatibleProvider(spec, { fetchImpl = globalThis.fetch, env = process.env } = {}) {
   if (!spec.baseUrl) throw new Error(`provider ${spec.name}：缺少 baseUrl`);
@@ -34,7 +36,7 @@ export function createOpenAICompatibleProvider(spec, { fetchImpl = globalThis.fe
 
   return {
     name: spec.name,
-    async complete({ model, system, prompt, temperature, session }) {
+    async complete({ model, system, prompt, effort, temperature, session }) {
       const apiKey = spec.apiKeyEnv ? env[spec.apiKeyEnv] : undefined;
       if (spec.apiKeyEnv && !apiKey) throw new Error(`provider ${spec.name}：环境变量 ${spec.apiKeyEnv} 未设置`);
       const messages = [];
@@ -45,6 +47,8 @@ export function createOpenAICompatibleProvider(spec, { fetchImpl = globalThis.fe
       const body = { model: model ?? spec.model, messages };
       const temp = temperature ?? spec.temperature;
       if (temp !== undefined) body.temperature = temp;
+      const eff = effort ?? spec.effort;
+      if (eff) body.reasoning_effort = eff;
 
       const contextWindow = await lookupWindow(body.model, apiKey);
       const started = Date.now();

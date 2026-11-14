@@ -142,6 +142,21 @@ test('OpenAI 兼容接口', async () => {
   assert.deepEqual(res.usage, { inputTokens: 10, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0 });
 });
 
+test('OpenAI 兼容接口：effort 作为 reasoning_effort 发出，发言者的优先于 provider 的；都没配就不带', async () => {
+  const bodies = [];
+  const fetchImpl = async (url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: {} }), { status: 200 });
+  };
+  const plain = createOpenAICompatibleProvider({ name: 'gw', baseUrl: 'https://gw', contextWindow: 1 }, { fetchImpl, env: {} });
+  await plain.complete({ model: 'g', prompt: 'q' });
+  await plain.complete({ model: 'g', prompt: 'q', effort: 'high' });
+  const withDefault = createOpenAICompatibleProvider({ name: 'gw', baseUrl: 'https://gw', contextWindow: 1, effort: 'medium' }, { fetchImpl, env: {} });
+  await withDefault.complete({ model: 'g', prompt: 'q' });
+  await withDefault.complete({ model: 'g', prompt: 'q', effort: 'high' });
+  assert.deepEqual(bodies.map((b) => b.reasoning_effort), [undefined, 'high', 'medium', 'high']);
+});
+
 test('OpenAI 兼容接口缺 key 时报错', async () => {
   const p = createOpenAICompatibleProvider({ name: 'ds', baseUrl: 'https://x', apiKeyEnv: 'K' }, { fetchImpl: async () => { throw new Error('不应调用'); }, env: {} });
   await assert.rejects(p.complete({ prompt: 'q' }), /K 未设置/);

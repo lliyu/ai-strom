@@ -89,6 +89,7 @@
   "deepseek": { "type": "openai-compatible", "baseUrl": "https://api.deepseek.com/v1", "apiKeyEnv": "DEEPSEEK_API_KEY" }
   ```
   然后在发言者上写 `"provider": "deepseek", "model": "deepseek-chat"`。
+  发言者（或 provider）上的 `effort` 会作为 `reasoning_effort` 原样发出（`low` / `medium` / `high`）。有的网关不传就完全不思考，例如经 LiteLLM 网关接的 Gemini：它当评审时第 2、3 轮就会写「没有意见了」，所以接这类模型时要配上 `effort`。
 - **anthropic-compatible**：Anthropic Messages 兼容接口（请求 `{baseUrl}/v1/messages`），例如阿里百炼的 `/apps/anthropic`。返回里的 thinking 块会被忽略，只取正文：
   ```json
   "bailian": { "type": "anthropic-compatible", "baseUrl": "https://<工作空间>.maas.aliyuncs.com/apps/anthropic", "apiKeyEnv": "BAILIAN_API_KEY", "maxTokens": 8192 }
