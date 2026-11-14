@@ -173,3 +173,14 @@ test('重写：各份文档的最新一版按新写法重写成新的一版，�
   assert.equal(s.calls.filter((x) => x.stage === '核对主文档').length, 2);
   await assert.rejects(rewriteDocs({ cfg: c, state: { ...state, docs: [] }, providers: s.registry, publisher: createMemoryPublisher() }), /还没有主文档/);
 });
+
+test('脑洞风暴的提示词是网文向的：发散写主角、金手指代价，盲审站在读者角度，主文档写开篇和主线', async () => {
+  const { divergePrompt, feedbackPrompt, chairSystem } = await import('../src/modes.js');
+  const d = divergePrompt({ topic: '末日、菜市场', ideasPerAgent: 3 });
+  assert.match(d, /长篇网文脑洞[\s\S]*主角和他想要什么[\s\S]*代价或限制/);
+  assert.match(feedbackPrompt({ round: 2, others: [{ tag: '方案 A', text: 'x' }] }), /网文读者的角度[\s\S]*老套路/);
+  assert.match(chairSystem('brainstorm'), /开书/);
+  const doc = docPrompt({ mode: 'brainstorm', rounds: [], finals: [] });
+  assert.match(doc, /开篇第一个场景[\s\S]*撑起长篇/);
+  assert.match(doc, /## 下一步/);
+});

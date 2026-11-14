@@ -258,7 +258,7 @@ const TIER_HINT = {
   quick: '一位回答、一位挑刺、回答的一方定稿，3 次模型调用，通常一两分钟。问题涉及登记的代码仓库时，先由调研员读相关代码（多一次调用、多几分钟）。缺的信息写在结果里，用追问补充；不够深可以「升级为讨论」。',
   meeting: '两位主笔、一位评审，最多 3 轮，评审都没有新意见就提前结束。',
   decision: '完整的方案讨论：可以读代码、查数据、核实事实，多轮评审直到收敛。',
-  brainstorm: '主笔发散脑洞，评审盲审，多轮修订后主编挑选。',
+  brainstorm: '给长篇网文想开书的点子：题目可以是一句话脑洞或几个关键词。主笔发散脑洞，评审站在读者和市场的角度盲审，多轮修订后主编挑选。',
   redraft: '贴上一章原文：一位改稿、一位对照原文挑刺、改稿的一方定稿，3 次模型调用。产出修改说明、逐段对比和完整修改稿，自己复制回去，不写回墨稿。',
 };
 const modeOfTier = (t) => (t === 'meeting' ? 'decision' : t);
@@ -662,7 +662,7 @@ function openForm() {
       <div class="seg" id="modeSeg">${TIERS.map(([k, l]) => `<button data-tier="${k}" class="${tier === k ? 'on' : ''}">${l}</button>`).join('')}</div>
       <div class="hint" style="margin-top:8px">${esc(TIER_HINT[tier])}</div>
       <label>${what}</label>
-      <textarea id="topic" ${tier === 'redraft' ? 'style="min-height:60px"' : ''} placeholder="${tier === 'brainstorm' ? '例如：给一款面向独居老人的智能音箱想功能' : tier === 'quick' ? '例如：周末两个人去杭州还是苏州？预算两千' : tier === 'redraft' ? '例如：开头太慢，前两段压到一段；对话太书面。不写就找最影响阅读的问题来改' : '例如：订单服务要不要从单库拆成按用户分库？目前日订单 50 万……'}">${esc(f.topic || '')}</textarea>
+      <textarea id="topic" ${tier === 'redraft' ? 'style="min-height:60px"' : ''} placeholder="${tier === 'brainstorm' ? '例如：末日、菜市场、读心术。一句话脑洞或几个关键词都行' : tier === 'quick' ? '例如：周末两个人去杭州还是苏州？预算两千' : tier === 'redraft' ? '例如：开头太慢，前两段压到一段；对话太书面。不写就找最影响阅读的问题来改' : '例如：订单服务要不要从单库拆成按用户分库？目前日订单 50 万……'}">${esc(f.topic || '')}</textarea>
       <label>${tier === 'redraft' ? '章节原文' : '材料（可选）'}<span class="hint" id="matCount" style="font-weight:400;margin-left:8px"></span></label>
       <textarea id="material" style="min-height:${tier === 'redraft' ? 220 : 80}px" placeholder="${tier === 'redraft' ? `贴上要改的一章，保持原来的分段。最多 ${max} 字。` : `贴上相关的原文：章节、日志、文档片段、之前的结论……最多 ${max} 字，不占${what}的字数。`}">${esc(f.material || '')}</textarea>
       ${tier === 'redraft' ? `<label>设定与上下文（可选）<span class="hint" id="setCount" style="font-weight:400;margin-left:8px"></span></label>

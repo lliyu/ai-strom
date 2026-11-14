@@ -139,3 +139,10 @@ test('网页：按自选阵容讨论，阵容存进讨论状态，追问照原�
   assert.deepEqual(started2.participants.map((p) => p.id), ['x', 'x-2', 'r']);
   assert.equal(started2.chair.model, 'm-a');
 });
+
+test('脑洞风暴只写小说：模板是网文向的，技术视角只留给方案讨论', () => {
+  const t = roleTemplates(normalizeConfig({ ...raw, roleTemplates: [] }));
+  const forBrainstorm = t.filter((x) => x.modes.includes('brainstorm')).map((x) => x.name);
+  assert.deepEqual(forBrainstorm, ['类型反转', '人物欲望', '爽点与钩子', '挑剔读者', '市场与差异']);
+  for (const name of ['架构视角', '质疑视角', '落地视角', '风险视角', '业务与用户']) assert.deepEqual(t.find((x) => x.name === name).modes, ['decision']);
+});
