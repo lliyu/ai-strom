@@ -1082,6 +1082,17 @@ export function resolvedBlock(resolved = []) {
 }
 
 /** 评审：不出自己的方案，只给主笔的方案挑问题，并分级。 */
+/**
+ * 打磨（脑洞 / 梗概 / 总纲）的阻断门槛：这些是在搭架子，后面写作时还会改，
+ * 不按能直接开写的细则去审，免得评审逐轮下钻、主笔为堵口子不断加规则。
+ */
+export const REFINE_BLOCKER_BAR = [
+  '这是在搭架子，后面写作时还会改，阻断从宽：',
+  '- 具体数值（价格、次数、人数、票数、日期）、某一卷的执行细则、写到那里再定也来得及的参数，最多算【建议】，不标【阻断】。',
+  '- 一句话就能补上的小漏洞、只在少数情节里才会碰到的边角情况，最多算【建议】。',
+  '- 后期卷只要方向清楚、和前面的设定不冲突就够了，不要求写到能直接执行。',
+].join('\n');
+
 export function critiquePrompt({ topic, round, proposals, peers = [], resolved = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false, ownIssues = null }) {
   const tracking = items && ownIssues !== null;
   const refine = mode === 'refine';
@@ -1100,8 +1111,11 @@ export function critiquePrompt({ topic, round, proposals, peers = [], resolved =
         : '你是评审，不要提出自己的方案，只指出上面每个方案的问题，引用方案代号。',
       `只写会${refine ? '影响作品质量' : '改变结论、导致做不成或出错'}的问题；措辞、细节、锦上添花不写，不要复述方案内容，不要写优点。`,
       '每个问题标级别：',
-      `- 【阻断】不解决的话${refine ? '这版修改就不该采用' : '方案不成立、会出错或无法落地'}`,
+      refine
+        ? '- 【阻断】只给动摇架子的问题：核心卖点或金手指的主规则自相矛盾、读者前几章就会出戏的硬伤、长篇写不下去（主线断档、成长线提前用完）、违背作者的定位或要求'
+        : '- 【阻断】不解决的话方案不成立、会出错或无法落地',
       '- 【建议】改了更好，不改也行（最多 2 条）',
+      refine ? REFINE_BLOCKER_BAR : '',
       `按下面的结构${limits ? `，全文不超过 ${limits.critique} 字${items ? '（依据不计）' : ''}` : ''}：`,
       items ? `${briefLine('还有几条阻断级问题、最要紧的是哪条')}。要点里只用文字说，不写【阻断】【建议】这类标记` : briefLine('还有几条阻断级问题、最要紧的是哪条'),
       items
@@ -1137,6 +1151,9 @@ export function reviewPrompt({ topic, round, own, others, critiques = [], interj
         : '',
       hasOthers ? '**对其他方案的看法**（只写会影响结论的分歧或值得借鉴的地方，一两行，引用方案代号；没有就不写）' : '',
       '**立场变化**（无 / 小幅 / 较大，一句话说明）',
+      mode === 'refine' && critiques.length
+        ? '这是在搭架子，后面写作时还会改：补漏洞用最少的规则；评审要的具体数值或后期卷的细则，写进「可调参数」或标成待定即可，不要为了堵口子新增成套机制。'
+        : '',
       '',
       `第二部分不发到${mode === 'refine' ? '页面' : '群里'}，只给其他参与者和主席看：单独一行写「${PLAN_MARKER}」，下面写修订后的完整${plan}（结构同第 1 轮，${mode === 'refine' ? '完整写出，不要只写这一轮的变化，' : ''}${limits ? `不超过 ${limits.plan} 字` : ''}）。`,
       `这一轮${plan}没有任何改动时，「${PLAN_MARKER}」下面只写「${UNCHANGED_MARK}」三个字，程序会沿用你上一版；改了哪怕一处，就写完整的${plan}。`,

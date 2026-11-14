@@ -152,6 +152,20 @@ test('提示词：评审分级、不写优点；脑洞风暴不限字数', () =>
   assert.match(r, /不超过 1000 字[\s\S]*【完整方案】[\s\S]*完整写出[\s\S]*不超过 2500 字/);
 });
 
+test('提示词：打磨是在搭架子，阻断从宽，数值和后期细则只算建议；主笔补漏洞不加成套机制', () => {
+  const proposals = [{ tag: '方案 A', text: '变化', plan: '全文' }];
+  const refine = critiquePrompt({ round: 2, proposals, askVerdict: true, mode: 'refine' });
+  assert.match(refine, /【阻断】只给动摇架子的问题/);
+  assert.match(refine, /搭架子[\s\S]*具体数值[\s\S]*最多算【建议】/);
+  assert.doesNotMatch(refine, /这版修改就不该采用/);
+  const decision = critiquePrompt({ round: 2, proposals, askVerdict: true, mode: 'decision' });
+  assert.match(decision, /【阻断】不解决的话方案不成立/);
+  assert.doesNotMatch(decision, /搭架子/);
+  const critiques = [{ tag: '评审 1', text: '- 【阻断】x' }];
+  assert.match(reviewPrompt({ round: 2, own: { tag: '方案 A', text: 'x' }, others: [], critiques, mode: 'refine' }), /可调参数[\s\S]*不要为了堵口子新增成套机制/);
+  assert.doesNotMatch(reviewPrompt({ round: 2, own: { tag: '方案 A', text: 'x' }, others: [], critiques, mode: 'decision' }), /堵口子/);
+});
+
 test('卡片：有要点时只露出要点，详细内容和完整方案折叠；超长时先去掉完整方案', () => {
   const card = buildCard({ title: 't', brief: '- 结论', body: '**改了什么**\n- x', plan: '全文', footer: 'm' });
   assert.equal(card.elements[0].tag, 'markdown');
