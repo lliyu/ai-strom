@@ -12,21 +12,23 @@
  *   从作者给的题目、一句话脑洞或几个关键词出发，第 1 轮各自按固定视角发散 → 每个循环先盲审（只给意见、不改写）再各自修订 → 主编挑选与组合。
  *   不让参与者自由讨论，避免多轮之后观点趋同。
  *
- * refine（作品打磨，从墨稿 novel-idea 取一份脑洞 / 梗概 / 总纲）：
+ * refine（作品打磨，从墨稿 novel-idea 取一份脑洞 / 梗概 / 总纲 / 一段章节细纲）：
  *   流程同 decision：主笔诊断并给修改方案 → 评审提意见 → 主笔修订 → 主编写主文档（修改说明）；
  *   最后主编按主文档写出完整修订版（JSON，结构由墨稿给出），作者在 ai-storm 页面上确认后才写回墨稿。
  */
 
-export const SUBJECT_LABELS = { idea: '脑洞', premise: '梗概', outline: '总纲' };
+export const SUBJECT_LABELS = { idea: '脑洞', premise: '梗概', outline: '总纲', chapters: '细纲' };
 
 /** 墨稿字段的中文名，修订版说明里用。 */
 export const FIELD_LABELS = {
   content: '内容', angle: '创意方向', fromMaterial: '素材延伸', marketRef: '借鉴榜单', coreIdea: '核心创意', identityRole: '原身份的分量',
   title: '书名', logline: '一句话梗概', protagonist: '主角', goal: '目标', obstacle: '阻碍', goldenFinger: '金手指',
   goldenFingerCost: '金手指的边界', goldenFingerGrowth: '金手指的成长', sellingPoint: '卖点', hook: '开篇钩子', differentiation: '差异点',
-  arc: '总纲', volumes: '分卷',
+  arc: '总纲', volumes: '分卷', chapters: '章节细纲',
 };
 const subjectLabel = (subject) => SUBJECT_LABELS[subject?.type] ?? '作品';
+/** 细纲是写正文前的最后一层，审法和脑洞 / 梗概 / 总纲（搭架子）不同。 */
+const isChapters = (subjectType) => subjectType === 'chapters';
 
 export const STAGE_LABELS = {
   propose: '独立方案',
@@ -35,6 +37,7 @@ export const STAGE_LABELS = {
   diverge: '发散',
   feedback: '盲审意见',
   abandon: '放弃脑洞',
+  askcheck: '征询判断',
   revise: '修订',
   summary: '汇总',
   research: '代码调研',
@@ -541,7 +544,7 @@ export function scopeBlock(scope, { once = false } = {}) {
 
 export function interjectionBlock(items) {
   if (!items?.length) return '';
-  const lines = items.map((m) => `- ${m.time ? `[${m.time}] ` : ''}${m.sender}：${m.text}`);
+  const lines = items.map((m) => `- ${m.time ? `[${m.time}] ` : ''}${m.sender}${m.answerTo ? `（回答主席的征询：${m.answerTo.questions.join('；')}）` : ''}：${m.text}`);
   return `## 人类主持人的插话（优先级最高，必须回应）\n${lines.join('\n')}`;
 }
 
@@ -896,8 +899,12 @@ export function proposePrompt({ topic, interjections, context, ownTag, mode, sub
       [
         `请独立诊断这份${label}，给出你的修改方案，按下面的结构。${cap}`,
         briefLine('最大的短板是什么、你打算怎么改'),
-        '**主要问题**（按严重程度排序，最多 5 条；每条一句话写清问题在哪、为什么会让读者弃书或让长篇写不下去）',
-        '**具体修改**（逐条写改哪里、改成什么，尽量给出能直接用的文字；不改的地方不用列）',
+        isChapters(subject?.type)
+          ? '**主要问题**（按严重程度排序，最多 5 条；每条写清是第几章的哪一栏、为什么会让读者跳读弃书，或者写正文时卡住、和前后对不上）'
+          : '**主要问题**（按严重程度排序，最多 5 条；每条一句话写清问题在哪、为什么会让读者弃书或让长篇写不下去）',
+        isChapters(subject?.type)
+          ? '**具体修改**（逐条写第几章的哪一栏改成什么，尽量给出能直接用的文字；不改的章节不用列。章数和章号不能动，要拆要并写进「需要作者决定的」）'
+          : '**具体修改**（逐条写改哪里、改成什么，尽量给出能直接用的文字；不改的地方不用列）',
         '**要保留的长处**（一两条）',
         '**需要作者决定的**（有几种改法、取决于作者偏好的地方；没有就不写）',
       ].join('\n'),
@@ -925,8 +932,10 @@ export const VERDICT_CONTINUE = '继续讨论';
 export const VERDICT_DONE = '没有意见了';
 
 /** 要求评审在最后单独一行给出结论。graded：问题分了阻断 / 建议两级，只有阻断级才继续。 */
-export function verdictInstruction(round, mode, { graded = false } = {}) {
-  const matters = mode === 'refine' ? '明显影响作品质量（读者会不会追、长篇写不写得下去）' : '影响方案取舍、正确性或落地';
+export function verdictInstruction(round, mode, { graded = false, subjectType } = {}) {
+  const matters = mode === 'refine'
+    ? (isChapters(subjectType) ? '明显影响这几章（读者会不会追下去、能不能照着写正文）' : '明显影响作品质量（读者会不会追、长篇写不写得下去）')
+    : '影响方案取舍、正确性或落地';
   return [
     '',
     `最后单独一行写结论，只能二选一：「${VERDICT_LINE}：${VERDICT_CONTINUE}」或「${VERDICT_LINE}：${VERDICT_DONE}」。`,
@@ -1084,7 +1093,7 @@ export function resolvedBlock(resolved = []) {
 
 /** 评审：不出自己的方案，只给主笔的方案挑问题，并分级。 */
 /**
- * 打磨（脑洞 / 梗概 / 总纲）的阻断门槛：这些是在搭架子，后面写作时还会改，
+ * 打磨（脑洞 / 梗概 / 总纲 / 细纲）的阻断门槛：这些是在搭架子，后面写作时还会改，
  * 不按能直接开写的细则去审，免得评审逐轮下钻、主笔为堵口子不断加规则。
  */
 export const REFINE_BLOCKER_BAR = [
@@ -1094,9 +1103,21 @@ export const REFINE_BLOCKER_BAR = [
   '- 后期卷只要方向清楚、和前面的设定不冲突就够了，不要求写到能直接执行。',
 ].join('\n');
 
-export function critiquePrompt({ topic, round, proposals, peers = [], resolved = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false, ownIssues = null }) {
+/**
+ * 细纲的阻断门槛：这是写正文前的最后一层，要能照着直接写，
+ * 所以前后衔接、时间线和数字账都算数；文笔和总纲层面的问题不在这次范围内。
+ */
+export const CHAPTERS_BLOCKER_BAR = [
+  '这是写正文前的章节细纲，要能照着直接写；只审这几章本身：',
+  '- 和总纲、本卷概要、前后已写章节对不上的（时间线、日期、数字账、人物出场和信息揭露的顺序），算【阻断】。',
+  '- 文笔、台词、具体措辞留给正文，最多算【建议】。',
+  '- 总纲层面的问题（主线、人物设定、后面几卷怎么写）不在这次修改范围内，最多算【建议】，提醒主编写进主文档。',
+].join('\n');
+
+export function critiquePrompt({ topic, round, proposals, peers = [], resolved = [], interjections, context, askVerdict = false, convo = false, mode, limits = limitsFor(mode), scope, items = false, ownIssues = null, subjectType }) {
   const tracking = items && ownIssues !== null;
   const refine = mode === 'refine';
+  const chapters = refine && isChapters(subjectType);
   return join(
     `【阶段：第 ${round} 轮${STAGE_LABELS.critique}】`,
     scopeBlock(scope, { once: convo }),
@@ -1112,17 +1133,19 @@ export function critiquePrompt({ topic, round, proposals, peers = [], resolved =
         : '你是评审，不要提出自己的方案，只指出上面每个方案的问题，引用方案代号。',
       `只写会${refine ? '影响作品质量' : '改变结论、导致做不成或出错'}的问题；措辞、细节、锦上添花不写，不要复述方案内容，不要写优点。`,
       '每个问题标级别：',
-      refine
-        ? '- 【阻断】只给动摇架子的问题：核心卖点或金手指的主规则自相矛盾、读者前几章就会出戏的硬伤、长篇写不下去（主线断档、成长线提前用完）、违背作者的定位或要求'
-        : '- 【阻断】不解决的话方案不成立、会出错或无法落地',
+      chapters
+        ? '- 【阻断】只给照着写会出问题的：和前后章节、本卷概要或总纲对不上，某章没有推进也没有爽点、主角连着一两章以上被动挨打，章末钩子断档让人不想点下一章，场景只有“发生冲突”“取得进展”这类空话写不出正文，一章塞得太多或太空（按每章约 2500 字估），违背作者的定位或要求'
+        : refine
+          ? '- 【阻断】只给动摇架子的问题：核心卖点或金手指的主规则自相矛盾、读者前几章就会出戏的硬伤、长篇写不下去（主线断档、成长线提前用完）、违背作者的定位或要求'
+          : '- 【阻断】不解决的话方案不成立、会出错或无法落地',
       '- 【建议】改了更好，不改也行（最多 2 条）',
-      refine ? REFINE_BLOCKER_BAR : '',
+      chapters ? CHAPTERS_BLOCKER_BAR : refine ? REFINE_BLOCKER_BAR : '',
       `按下面的结构${limits ? `，全文不超过 ${limits.critique} 字${items ? '（依据不计）' : ''}` : ''}：`,
       items ? `${briefLine('还有几条阻断级问题、最要紧的是哪条')}。要点里只用文字说，不写【阻断】【建议】这类标记` : briefLine('还有几条阻断级问题、最要紧的是哪条'),
       items
         ? `然后按方案代号分组：每组单独一行加粗的方案代号（例如「**方案 A**」），下面是条目，条目不要直接接在要点后面。没有新问题的方案在代号下写「无新问题」。\n${itemFormat({ levels: '【阻断】【建议】', need: `- 【阻断】必须写改法和依据。${tracking ? '\n- 问题编号由程序在发布前写上，新问题不要自己编号；仍坚持的旧问题写原编号（见上面的清单）。' : ''}` })}`
         : '然后按方案代号分组，每个问题一行：「【阻断】问题 → 后果 → 怎么改」。没有新问题的方案写「无新问题」。',
-      askVerdict ? verdictInstruction(round, mode, { graded: true }) : '',
+      askVerdict ? verdictInstruction(round, mode, { graded: true, subjectType }) : '',
     ].filter(Boolean).join('\n'),
   );
 }
@@ -1391,7 +1414,9 @@ function abandonedBlock(abandoned = [], { forChair = false } = {}) {
   if (!abandoned.length) return '';
   return [
     forChair ? '## 讨论中放弃的脑洞（评审过半判定放弃，不能进推荐；写进「放弃的方向」）' : '## 已经放弃的脑洞（不要再评，也不要建议恢复）',
-    ...abandoned.map((a) => `- ${a.code}（第 ${a.round} 轮，${a.votes}/${a.voters} 位评审标【弃】）${a.reasons?.length ? `：${a.reasons.join('；')}` : ''}`),
+    ...abandoned.map((a) => (a.by === 'human'
+      ? `- ${a.code}（第 ${a.round} 轮之后作者没选）`
+      : `- ${a.code}（第 ${a.round} 轮，${a.votes}/${a.voters} 位评审标【弃】）${a.reasons?.length ? `：${a.reasons.join('；')}` : ''}`)),
   ].join('\n');
 }
 
@@ -1423,8 +1448,9 @@ export function parseIdeaMarks(text) {
  * 有评审时只算评审的票，没有评审时算其他主笔的票；没写标记的算【留】。放弃的不补新的。
  * 返回 [{ code, round, votes, voters, reasons }]，按放弃的先后排。
  */
-export function abandonedIdeas(rounds = [], { hasReviewers = true } = {}) {
-  const gone = new Map();
+export function abandonedIdeas(rounds = [], { hasReviewers = true, already = [] } = {}) {
+  const gone = new Map(already.map((a) => [a.code, a])); // 已经放弃的（例如作者没选的）不再计票，也不重复返回
+  const skip = new Set(gone.keys());
   for (const r of [...rounds].filter((x) => x.stage === 'feedback').sort((a, b) => a.round - b.round)) {
     const voters = r.entries.filter((e) => (hasReviewers ? /^评审/.test(e.tag ?? '') : /^方案/.test(e.tag ?? '')));
     const tally = new Map();
@@ -1446,7 +1472,25 @@ export function abandonedIdeas(rounds = [], { hasReviewers = true } = {}) {
       if (n && t.votes * 2 > n) gone.set(code, { code, round: r.round, votes: t.votes, voters: n, reasons: t.reasons });
     }
   }
-  return [...gone.values()];
+  return [...gone.values()].filter((a) => !skip.has(a.code));
+}
+
+/** 从一位主笔的发散里取每个脑洞的一句话钩子（给作者挑选用）；取不到的留空。 */
+export function ideaHooks(text, n) {
+  const hooks = [...String(text ?? '').matchAll(/一句话钩子\**\s*[:：]?\s*\**\s*[:：]?\s*(.+)/g)].map((m) => m[1].replace(/\*\*/g, '').trim());
+  return Array.from({ length: n }, (_, i) => (hooks[i] ?? '').slice(0, 120));
+}
+
+/**
+ * 解析作者选了哪些脑洞：认 A1、b3、C 2 这样的编号（只认 codes 里有的）；没写编号但说了「全部」就都留。
+ * 一个都没认出来返回 null（接着等）。
+ */
+export function parsePick(text, codes) {
+  const t = String(text ?? '');
+  const valid = new Set(codes);
+  const picked = [...new Set([...t.matchAll(/([A-Za-z])\s*(\d+)/g)].map((m) => `${m[1].toUpperCase()}${m[2]}`))].filter((c) => valid.has(c));
+  if (picked.length) return codes.filter((c) => picked.includes(c)); // 写了编号就以编号为准（「选 A1，其余全部不要」）
+  return /全部|都要|都留|都保留|都继续/.test(t) ? [...codes] : null;
 }
 
 /** 某位主笔还留着的脑洞编号。 */
@@ -1636,7 +1680,7 @@ export function stripTriageLine(text) {
 }
 
 /** 主笔回应追问：在自己的会话里接着聊，所以只发新内容。 */
-export function followUpPrompt({ mode, round, question, brief, others, interjections, ideasPerAgent = 2, limits = limitsFor(mode), kept = null }) {
+export function followUpPrompt({ mode, round, question, brief, others, interjections, ideasPerAgent = 3, limits = limitsFor(mode), kept = null }) {
   const isBrainstorm = mode === 'brainstorm';
   const plan = mode === 'refine' ? '修改方案' : '方案';
   return join(
@@ -2384,4 +2428,57 @@ export function redraftFinalPrompt({ notes, draft, challenge }) {
     docRules('redraft'),
     docFormat(),
   );
+}
+
+// ---------- 征询人：每轮结束后主席判断要不要停下来问人 ----------
+//
+// 人跟不上讨论的速度，很少主动插话；讨论跑偏要等结束才知道。
+// 每轮结束后由主席看一眼现状，只有需要人来定、而且现在不问会走偏或白跑时才问，问了就暂停，一直等到人回答。
+
+export const ASK_LINE = '是否需要问人';
+export const ASK_MAX_QUESTIONS = 3;
+
+/** 主席的征询判断：给最新方案、这一轮的意见、人说过的话和问过的问题。 */
+export function askCheckPrompt({ mode, round, finals = [], entries = [], heard = [], asks = [], abandoned = [], remaining = null }) {
+  const plans = mode === 'brainstorm'
+    ? (finals.length ? `## 各主笔目前的脑洞（匿名）\n${labeled(finals)}` : '')
+    : (finals.some((e) => e.plan) ? finalsBlock(finals, mode === 'refine' ? '各主笔目前的修改方案' : '各主笔目前的方案') : (finals.length ? `## 各主笔目前的方案（匿名）\n${labeled(finals)}` : ''));
+  const said = heard.filter((m) => !m.answerTo);
+  return join(
+    `【阶段：第 ${round} 轮${STAGE_LABELS.askcheck}】`,
+    plans,
+    entries.length ? `## 这一轮的意见（匿名）\n${labeled(entries)}` : '',
+    abandoned.length ? `## 已经放弃的脑洞\n${abandoned.map((a) => `- ${a.code}`).join('\n')}` : '',
+    said.length ? `## 人类主持人说过的话\n${said.map((m) => `- ${m.text}`).join('\n')}` : '',
+    asks.length
+      ? `## 之前问过人的问题\n${asks.map((a) => `### 第 ${a.round} 轮问的\n${a.questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n**人的回答**：${a.answer ?? '（还没回答）'}`).join('\n\n')}`
+      : '',
+    [
+      '你是主持这场讨论的人，现在判断：要不要暂停讨论，向人类主持人问几个问题。问了以后讨论会一直停着，直到人回答，所以只在值得打断人的时候问。',
+      '**该问**：',
+      '- 题目或要求里没写清、各方理解不一致，按哪种理解做结论完全不同；',
+      '- 方向卡在两三个都说得通的选项之间，取舍取决于人的偏好、目标、预算或资源，不是讨论能推出来的；',
+      '- 讨论正在偏离人在题目和插话里明确说过的要求，或者各方都默认了一个人没说过的前提；',
+      '- 主笔和评审、或评审之间僵住了，只有人能裁决。',
+      '**不该问**：模型能自己查到或推理出的事实；写到最后、由主文档列给人拍板也来得及的细节；人已经回答过的；只是为了确认或礼貌。拿不准就不问。',
+      remaining === null ? '' : `这场讨论还能再问 ${remaining} 次。`,
+      '',
+      '按下面的格式回答：',
+      `第一行：「${ASK_LINE}：需要」或「${ASK_LINE}：不需要」。`,
+      `需要时，下面每行一个问题，编号 1、2、3，最多 ${ASK_MAX_QUESTIONS} 个。每个问题写成人一两句话就能回答的样子：先说要人定什么，把可选的答案列出来，最后用「——」接一句为什么现在要问（不问的话讨论会怎样）。不要用代号，人没看过讨论，要用内容本身说清楚。`,
+      '不需要时，第二行用一句话说明理由。',
+    ].join('\n'),
+  );
+}
+
+/** 解析征询判断：{ need, questions }；格式不对按不需要处理。 */
+export function parseAsk(text) {
+  const s = String(text ?? '');
+  const m = new RegExp(`${ASK_LINE}\\**\\s*[:：]\\s*\\**\\s*(需要|不需要)`).exec(s);
+  if (!m || m[1] !== '需要') return { need: false, questions: [] };
+  const questions = s.slice(m.index + m[0].length).split('\n')
+    .map((l) => /^\s*(?:[-*]\s*)?\**\s*(\d+)\s*[.、)）]\s*\**\s*(.+)$/.exec(l)?.[2]?.trim())
+    .filter(Boolean)
+    .slice(0, ASK_MAX_QUESTIONS);
+  return { need: questions.length > 0, questions };
 }

@@ -3,7 +3,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeConfig, ConfigError } from '../config.js';
-import { lineupConfig, modelPool, roleTemplates, defaultLineup, tierLineup, MAX_SEATS, readsCode } from '../lineup.js';
+import { lineupConfig, modelPool, roleTemplates, defaultLineup, tierLineup, MAX_SEATS, readsCode, CHAPTERS_LINEUP } from '../lineup.js';
 import { nextNumber, saveState, removeSessionFiles } from '../state.js';
 import { STAGE_LABELS, SUBJECT_LABELS, docChangelog, docTitle, MATERIAL_MAX, SETTING_MAX } from '../modes.js';
 import { groupKeys, critiqueDigest, blockerSummary, docSections, itemDigest, issueTracking } from './digest.js';
@@ -225,7 +225,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     if (exec.status === 'done') return { status: current?.number === number ? 'running' : 'done', speaking: [] };
     if (current?.number !== number && !alive(exec.pid)) return { status: 'failed', error: '跑这场讨论的进程已经退出，讨论没有正常结束', speaking: [] };
     const open = [];
+    let waiting = null; // 主席征询人、还没收到回答
     for (const r of store.events(exec.id)) {
+      if (r.type === 'human_ask') waiting = { round: r.round, no: r.no, ...(r.kind ? { kind: r.kind, ideas: r.ideas ?? [] } : {}), questions: r.questions ?? [], at: r.at };
+      if (r.type === 'human_answered') waiting = null;
       if (r.type === 'call_started') open.push(r);
       if (r.type === 'call_finished' || r.type === 'call_failed') {
         const i = open.findIndex((x) => x.speaker === r.speaker && x.stage === r.stage && x.round === r.round);
@@ -236,6 +239,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
     return {
       status: 'running',
       speaking: open.map((x) => ({ name: who(x.speaker)?.name ?? x.speaker, stage: STAGE_LABELS[x.stage] ?? x.stage, round: x.round, at: x.at })),
+      ...(waiting ? { waiting } : {}),
     };
   }
 
@@ -254,7 +258,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       type: subject?.type,
       createdAt: state?.createdAt ?? start?.at ?? row.created_at ?? null,
       updatedAt: state?.updatedAt ?? null,
-      status: progressOf(run.number, run).status,
+      ...(({ status, waiting }) => ({ status, ...(waiting ? { waiting: true } : {}) }))(progressOf(run.number, run)),
       followUps: state?.followUps?.length ?? run.execs.filter((e) => e.kind === 'followup').length,
       hasRevision: Boolean(state?.revision),
       docVersion: state?.docs?.at(-1)?.version ?? null,
@@ -459,9 +463,10 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
   }
 
   async function startRefine({ type, id, requirement = '', lineup, memory, number: reuse }) {
-    if (!SUBJECT_LABELS[type] || !id) throw httpError(400, '需要 type（idea / premise / outline）和 id');
+    if (!SUBJECT_LABELS[type] || !id) throw httpError(400, '需要 type（idea / premise / outline / chapters）和 id');
     const mem = memoryPick(memory);
-    const jobCfg = jobConfig('refine', undefined, lineup);
+    // 没带阵容（不是从页面发起）时，细纲用细纲的默认角色
+    const jobCfg = jobConfig('refine', undefined, lineup ?? (type === 'chapters' ? defaultLineup(cfg, CHAPTERS_LINEUP) : undefined));
     const item = await novel.get(type, id);
     const number = reuse ?? nextNumber(store, { mode: 'refine', topic: String(requirement).slice(0, 4000), channel: 'web', info: { subject: { type: item.type, id: item.id, title: item.title } } });
     store.saveJob(number, { kind: 'refine', params: { type, id, requirement, lineup, memory } });
@@ -663,7 +668,7 @@ export function createWebApp({ cfg, novel = createNovelClient(cfg.novel), mock =
       // 自选阵容：可选的模型、角色模板、各模式的默认阵容
       models: modelPool(cfg).map((m) => ({ id: m.id, name: m.name, provider: m.provider, model: m.model ?? null, color: m.color ?? 'grey', readsCode: readsCode(cfg, m) })),
       roleTemplates: roleTemplates(cfg),
-      lineups: { decision: defaultLineup(cfg, 'decision'), brainstorm: defaultLineup(cfg, 'brainstorm'), refine: defaultLineup(cfg, 'refine') },
+      lineups: { decision: defaultLineup(cfg, 'decision'), brainstorm: defaultLineup(cfg, 'brainstorm'), refine: defaultLineup(cfg, 'refine'), [CHAPTERS_LINEUP]: defaultLineup(cfg, CHAPTERS_LINEUP) },
       maxSeats: MAX_SEATS,
       // 方案讨论能选的数据工具和知识来源
       data: dataAvailable(),

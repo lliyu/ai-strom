@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { normalizeConfig } from '../src/config.js';
-import { lineupConfig, modelPool, defaultLineup, savedLineup, configForState, roleTemplates } from '../src/lineup.js';
+import { lineupConfig, modelPool, defaultLineup, savedLineup, configForState, roleTemplates, CHAPTERS_LINEUP } from '../src/lineup.js';
 import { findState, saveState } from '../src/state.js';
 import { createWebApp, startWebServer } from '../src/web/server.js';
 import { openStore } from '../src/db.js';
@@ -145,4 +145,22 @@ test('脑洞风暴只写小说：模板是网文向的，技术视角只留给�
   const forBrainstorm = t.filter((x) => x.modes.includes('brainstorm')).map((x) => x.name);
   assert.deepEqual(forBrainstorm, ['类型反转', '人物欲望', '爽点与钩子', '挑剔读者', '市场与差异']);
   for (const name of ['架构视角', '质疑视角', '落地视角', '风险视角', '业务与用户']) assert.deepEqual(t.find((x) => x.name === name).modes, ['decision']);
+});
+
+test('打磨细纲另有默认阵容：模型和主编沿用作品打磨的，角色换成细纲的', () => {
+  const d = defaultLineup(cfg, CHAPTERS_LINEUP);
+  const refine = defaultLineup(cfg, 'refine');
+  assert.deepEqual(d.participants.map((p) => [p.model, p.part]), refine.participants.map((p) => [p.model, p.part]));
+  assert.equal(d.chair, refine.chair);
+  // 没配 personas['refine-chapters']：按座位顺序套用细纲模板，不再是「结构与人物」
+  const chapterTpls = roleTemplates(cfg).filter((t) => t.modes.includes(CHAPTERS_LINEUP)).map((t) => t.name);
+  assert.deepEqual(d.participants.map((p) => p.role), chapterTpls.slice(0, 3));
+  assert.ok(d.participants.every((p) => p.persona));
+  assert.ok(!d.participants.some((p) => p.role === '结构与人物'));
+
+  // 配了的发言者用配置的角色，没配的照样按座位套模板
+  const own = normalizeConfig({ ...raw, personas: { ...raw.personas, [CHAPTERS_LINEUP]: { b: { role: '章节节奏', persona: '只看节奏' } } } });
+  const o = defaultLineup(own, CHAPTERS_LINEUP);
+  assert.deepEqual(o.participants[1], { model: 'b', part: 'lead', role: '章节节奏', persona: '只看节奏' });
+  assert.equal(o.participants[0].role, chapterTpls[0]);
 });

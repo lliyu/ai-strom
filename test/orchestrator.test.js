@@ -230,7 +230,7 @@ test('第 1 轮成功不足 2 人时中止', async () => {
 });
 
 test('脑洞风暴：评审过半标【弃】就拿掉，不补新的；主笔的脑洞全被放弃就退出，全部放弃提前结束', async () => {
-  const cfg = cfgWithReviewers('brainstorm', 4);
+  const cfg = normalizeConfig({ ...cfgWithReviewers('brainstorm', 4), ideasPerAgent: 2 });
   const calls = [];
   const marks = {
     2: '【弃】A1：老套路换皮\n【弃】A2：撑不起长篇\n【留】B1\n**亮点**：x\n【弃】B2：钩子不抓人',
@@ -253,7 +253,6 @@ test('脑洞风暴：评审过半标【弃】就拿掉，不补新的；主笔�
   const leadA = Object.entries(result.labels).find(([, t]) => t === '方案 A')[0];
   const nameA = cfg.participants.find((p) => p.id === leadA).name;
 
-  // 发散只要 2 个
   assert.match(calls.find((c) => c.stage === '发散').prompt, /独立给出 2 个/);
   // 第 2 轮：A 的两个和 B2 被放弃，主编发卡片
   const card = pub.posts.find((p) => p.meta?.stage === 'abandon' && p.meta.round === 2);
@@ -279,4 +278,133 @@ test('脑洞风暴：评审过半标【弃】就拿掉，不补新的；主笔�
   assert.match(doc.prompt, /讨论中放弃的脑洞[\s\S]*B1（第 3 轮，2\/2 位评审标【弃】）：越补越重/);
   assert.match(doc.prompt, /所有脑洞都被评审过半判定放弃/);
   assert.equal(result.state.ideasPerAgent, 2);
+});
+
+test('征询人：主席判断需要就暂停发卡片，一直等到人回答；回答当插话交给所有人，状态里记下问答；最后一轮不问', async () => {
+  const cfg = normalizeConfig({ ...cfgFor('decision', 3, 2), humanAsk: { pollMs: 1 } });
+  const calls = [];
+  const provider = {
+    async complete({ model, prompt }) {
+      const who = whoOf(arguments[0]);
+      const stage = /【阶段：([^】]+)】/.exec(prompt)?.[1] ?? '';
+      let text = `发言-${calls.length}`;
+      if (stage === '第 1 轮征询判断') text = '**是否需要问人**：需要\n1. 蓝染的终结留给谁？可选：一护 / 主角——决定高潮怎么写';
+      else if (stage.includes('征询判断')) text = '是否需要问人：不需要\n方向已经清楚';
+      if (stage === '核对主文档') text = '没有问题';
+      calls.push({ who, stage, prompt, text });
+      return { text, model, durationMs: 10, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const pub = createMemoryPublisher();
+  let pollsWhileWaiting = 0;
+  const interjections = {
+    async poll() {
+      if (!pub.posts.some((p) => p.meta?.stage === 'ask')) return [];
+      pollsWhileWaiting += 1;
+      return pollsWhileWaiting === 3 ? [{ sender: '主持人', text: '留给一护', time: '10:00', source: 'web' }] : [];
+    },
+  };
+  const events = [];
+  const result = await runDiscussion({ cfg, topic: '死神同人', providers: { get: () => provider }, publisher: pub, interjections, rng: fixedRng, onEvent: (e) => events.push(e) });
+
+  // 第 1、2 轮之后各判断一次，第 3 轮是最后一轮不判断
+  assert.deepEqual(calls.filter((c) => c.stage.includes('征询判断')).map((c) => c.stage), ['第 1 轮征询判断', '第 2 轮征询判断']);
+  const card = pub.posts.find((p) => p.meta?.stage === 'ask');
+  assert.match(card.body, /1\. 蓝染的终结留给谁？/);
+  assert.match(card.body, /一直停在这里/);
+  // 发卡片后读了 3 次插话才拿到回答，这之间没有任何发言
+  assert.ok(pollsWhileWaiting >= 3);
+  const askAt = calls.findIndex((c) => c.stage === '第 1 轮征询判断');
+  assert.ok(calls[askAt + 1].stage.startsWith('第 2 轮'));
+  // 第 2 轮所有人都看到回答和问题
+  const round2 = calls.filter((c) => c.stage.startsWith('第 2 轮') && !c.stage.includes('征询'));
+  assert.ok(round2.length >= 2);
+  assert.ok(round2.every((c) => /回答主席的征询：蓝染的终结留给谁[\s\S]*留给一护/.test(c.prompt)));
+  // 第 2 轮的判断看得到之前问过什么、人怎么答的
+  assert.match(calls.find((c) => c.stage === '第 2 轮征询判断').prompt, /之前问过人的问题[\s\S]*人的回答\*\*：留给一护/);
+  assert.equal(result.state.asks.length, 1);
+  assert.equal(result.state.asks[0].answer, '留给一护');
+  assert.deepEqual(events.filter((e) => e.type.startsWith('human_')).map((e) => e.type), ['human_ask', 'human_answered']);
+});
+
+test('征询人：默认不限次数，主席每轮判断需要就问', async () => {
+  const cfg = normalizeConfig({ ...cfgFor('decision', 4, 2), humanAsk: { pollMs: 1 } });
+  const provider = {
+    async complete({ model, prompt }) {
+      const stage = /【阶段：([^】]+)】/.exec(prompt)?.[1] ?? '';
+      const text = stage.includes('征询判断') ? '是否需要问人：需要\n1. 要不要更虐？' : stage === '核对主文档' ? '没有问题' : 'x';
+      return { text, model, durationMs: 10, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const pub = createMemoryPublisher();
+  let answered = 0;
+  const interjections = { async poll() { const asked = pub.posts.filter((p) => p.meta?.stage === 'ask').length; return asked > answered ? (answered = asked, [{ sender: '主持人', text: `回答 ${asked}` }]) : []; } };
+  const result = await runDiscussion({ cfg, topic: '题目', providers: { get: () => provider }, publisher: pub, interjections, rng: fixedRng });
+  // 第 1、2、3 轮之后各问一次（第 4 轮是最后一轮）
+  assert.deepEqual(result.state.asks.map((a) => [a.round, a.answer]), [[1, '回答 1'], [2, '回答 2'], [3, '回答 3']]);
+});
+
+test('征询人：配了 maxAsks 就限制每次运行最多问几次，用完不再请主席判断；没有插话通道时不问', async () => {
+  const cfg = normalizeConfig({ ...cfgFor('decision', 4, 2), humanAsk: { pollMs: 1, maxAsks: 1 } });
+  const calls = [];
+  const provider = {
+    async complete({ model, prompt }) {
+      const stage = /【阶段：([^】]+)】/.exec(prompt)?.[1] ?? '';
+      const text = stage.includes('征询判断') ? '是否需要问人：需要\n1. 要不要更虐？' : stage === '核对主文档' ? '没有问题' : `发言-${calls.length}`;
+      calls.push({ stage });
+      return { text, model, durationMs: 10, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const pub = createMemoryPublisher();
+  const interjections = { async poll() { return pub.posts.some((p) => p.meta?.stage === 'ask') && !this.done ? (this.done = true, [{ sender: '主持人', text: '不要' }]) : []; } };
+  await runDiscussion({ cfg, topic: '题目', providers: { get: () => provider }, publisher: pub, interjections, rng: fixedRng });
+  assert.equal(calls.filter((c) => c.stage.includes('征询判断')).length, 1);
+  assert.equal(pub.posts.filter((p) => p.meta?.stage === 'ask').length, 1);
+
+  calls.length = 0;
+  await runDiscussion({ cfg, topic: '题目', providers: { get: () => provider }, publisher: createMemoryPublisher(), rng: fixedRng });
+  assert.equal(calls.filter((c) => c.stage.includes('征询判断')).length, 0);
+});
+
+test('脑洞风暴：每人 3 个，第 1 轮后暂停请作者挑；认不出编号就提示接着等，没选的放弃，全没被选的主笔退出', async () => {
+  const cfg = normalizeConfig({ ...cfgWithReviewers('brainstorm', 3), humanAsk: { pollMs: 1 } });
+  const calls = [];
+  const provider = {
+    async complete({ model, prompt }) {
+      const who = whoOf(arguments[0]);
+      const stage = /【阶段：([^】]+)】/.exec(prompt)?.[1] ?? '';
+      let text = `发言-${calls.length}`;
+      if (stage === '发散') text = '1. **一句话钩子**：钩子一\n展开\n\n2. **一句话钩子：**钩子二\n\n3. **一句话钩子**：钩子三';
+      if (stage.includes('征询判断')) text = '是否需要问人：不需要\n清楚';
+      if (stage === '核对主文档') text = '没有问题';
+      calls.push({ who, stage, prompt, text });
+      return { text, model, durationMs: 10, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const pub = createMemoryPublisher();
+  const replies = ['嗯，我想想', '选 b1 和 B 3'];
+  const cards = () => pub.posts.filter((p) => p.meta?.stage === 'ask').length;
+  let used = 0;
+  const interjections = { async poll() { return cards() > used && used < replies.length ? [{ sender: '主持人', text: replies[used++] }] : []; } };
+  const result = await runDiscussion({ cfg, topic: '死神同人', providers: { get: () => provider }, publisher: pub, interjections, rng: fixedRng });
+
+  assert.match(calls.find((c) => c.stage === '发散').prompt, /独立给出 3 个/);
+  const pick = pub.posts.find((p) => p.meta?.stage === 'ask');
+  assert.match(pick.title, /挑出要继续讨论的脑洞/);
+  assert.match(pick.body, /\*\*A1\*\*：钩子一[\s\S]*\*\*A2\*\*：钩子二[\s\S]*\*\*B3\*\*：钩子三/);
+  assert.match(pub.posts.filter((p) => p.meta?.stage === 'ask')[1].title, /没认出/); // 第一条回复没有编号
+  const done = pub.posts.find((p) => /继续讨论 2 个脑洞/.test(p.title));
+  assert.match(done.body, /继续\*\*：B1、B3[\s\S]*放弃\*\*：A1、A2、A3、B2[\s\S]*方案 A 的脑洞都没被选/);
+  // 第 1 轮后不再让主席做征询判断（作者已经挑过）
+  assert.ok(!calls.some((c) => c.stage === '第 1 轮征询判断'));
+  // A 退出：第 2 轮起不再发言，评审只评 B，并看到作者没选的
+  const nameA = cfg.participants.find((p) => result.labels[p.id] === '方案 A').name;
+  assert.ok(calls.filter((c) => /^第 [23] 轮/.test(c.stage)).every((c) => !c.who.startsWith(nameA)));
+  const fb = calls.find((c) => c.stage === '第 2 轮盲审意见' && /模型[23]/.test(c.who));
+  assert.match(fb.prompt, /已经放弃的脑洞[\s\S]*A1（第 1 轮之后作者没选）/);
+  const revise = calls.find((c) => c.stage === '第 2 轮修订');
+  assert.match(revise.prompt, /B2：作者没选/);
+  assert.match(revise.prompt, /只写还留着的脑洞（编号 1、3）/);
+  assert.deepEqual(result.state.asks[0].picked, ['B1', 'B3']);
+  assert.equal(result.state.asks[0].answer, '嗯，我想想\n选 b1 和 B 3');
 });

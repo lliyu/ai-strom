@@ -51,3 +51,27 @@ test('修订提示词：不补新的、不靠加机制补漏洞，后续注意�
   assert.match(p, /「后续注意」是写大纲和正文时的事/);
   assert.doesNotMatch(p, /补新的、|可以删掉弱的、补新的/);
 });
+
+test('作者挑脑洞：认大小写和空格的编号、只认存在的；没写编号说「全部」就都留；什么都没认出返回 null；钩子按顺序取', async () => {
+  const { parsePick, ideaHooks } = await import('../src/modes.js');
+  const codes = ['A1', 'A2', 'A3', 'B1'];
+  assert.deepEqual(parsePick('选 b1、a 3 还有 Z9', codes), ['A3', 'B1']);
+  assert.deepEqual(parsePick('选 A1，其余全部不要', codes), ['A1']);
+  assert.deepEqual(parsePick('全部保留', codes), codes);
+  assert.equal(parsePick('我再想想', codes), null);
+  assert.deepEqual(ideaHooks('1. **一句话钩子：**《死神》——别人\n2. **一句话钩子**：110年前', 3), ['《死神》——别人', '110年前', '']);
+});
+
+test('征询判断：只认「需要」后面编号的问题，最多 3 个；格式不对按不需要；插话带上回答的是哪些问题', async () => {
+  const { parseAsk, askCheckPrompt, interjectionBlock } = await import('../src/modes.js');
+  assert.deepEqual(parseAsk('**是否需要问人**：需要\n1. A？——因为\n2、B？\n- 3) C？\n4. D？'), { need: true, questions: ['A？——因为', 'B？', 'C？'] });
+  assert.deepEqual(parseAsk('是否需要问人：不需要\n1. 不该被当成问题'), { need: false, questions: [] });
+  assert.deepEqual(parseAsk('随便说点什么'), { need: false, questions: [] });
+  assert.deepEqual(parseAsk('是否需要问人：需要\n（没写问题）'), { need: false, questions: [] });
+  const p = askCheckPrompt({ mode: 'decision', round: 2, finals: [{ tag: '方案 A', text: 'x', plan: '完整' }], asks: [{ round: 1, questions: ['Q1'], answer: null }], remaining: 2 });
+  assert.match(p, /只在值得打断人的时候问/);
+  assert.match(p, /还能再问 2 次/);
+  assert.doesNotMatch(askCheckPrompt({ mode: 'brainstorm', round: 2 }), /还能再问/); // 默认不限次数，不提次数
+  assert.match(p, /人的回答\*\*：（还没回答）/);
+  assert.match(interjectionBlock([{ sender: '主持人', text: '留给一护', answerTo: { no: 1, questions: ['Q1', 'Q2'] } }]), /主持人（回答主席的征询：Q1；Q2）：留给一护/);
+});

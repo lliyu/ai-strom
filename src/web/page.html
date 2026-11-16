@@ -104,6 +104,11 @@
   @keyframes pulse { 50% { opacity: .25; } }
   .composer { display: flex; gap: 8px; margin-top: 8px; }
   .composer textarea { min-height: 42px; height: 42px; }
+  .composer:has(.askbox) { flex-wrap: wrap; }
+  .composer .askbox { flex-basis: 100%; border: 1px solid var(--err); border-radius: 8px; padding: 8px 12px; }
+  .composer .askbox ol { margin: 6px 0 0; padding-left: 20px; }
+  .composer .askbox .pick { display: flex; gap: 6px; align-items: baseline; margin-top: 6px; font-weight: 400; cursor: pointer; }
+  .composer:has(.askbox) textarea { flex: 1; min-height: 64px; }
   .field { border-top: 1px solid var(--line); padding: 12px 0; }
   .field:first-child { border-top: none; }
   .field .fl { font-weight: 600; margin-bottom: 4px; display: flex; gap: 8px; align-items: baseline; }
@@ -242,14 +247,18 @@
     <div class="list" id="list"></div>
   </aside>
   <button class="sidetoggle" id="openSide" title="展开侧边栏（快捷键 [ ）" aria-label="展开侧边栏">☰</button>
-  <main><div class="wrap" id="main"><div class="welcome">左边「讨论」里是群里和网页上的全部讨论；「脑洞 / 梗概 / 总纲」里挑一项可以做作品打磨。</div></div></main>
+  <main><div class="wrap" id="main"><div class="welcome">左边「讨论」里是群里和网页上的全部讨论；「脑洞 / 梗概 / 总纲 / 细纲」里挑一项可以做作品打磨。</div></div></main>
 </div>
 <script>
-const TABS = [['runs', '讨论'], ['memory', '记忆'], ['idea', '脑洞'], ['premise', '梗概'], ['outline', '总纲']];
+const TABS = [['runs', '讨论'], ['memory', '记忆'], ['idea', '脑洞'], ['premise', '梗概'], ['outline', '总纲'], ['chapters', '细纲']];
 const MEM_LABEL = { work: '工作', personal: '个人', novel: '小说' };
 // 各档位默认带的记忆域：只带一个，不跨域；个人域从不默认勾选（个人内容会发给所选模型的服务）
 const memDefault = (tier) => (['brainstorm', 'redraft', 'refine'].includes(tier) ? ['novel'] : ['work']);
-const TYPE_LABEL = { idea: '脑洞', premise: '梗概', outline: '总纲' };
+const TYPE_LABEL = { idea: '脑洞', premise: '梗概', outline: '总纲', chapters: '细纲' };
+// 细纲每章的字段：hook 在这里是章末钩子，不是梗概的开篇钩子
+const CHAPTER_FIELD_LABELS = { title: '章名', summary: '概要', scenes: '场景', cast: '出场人物', mustDeliver: '必须交付', goal: '本章推进', conflict: '冲突', payoff: '爽点', hook: '章末钩子' };
+// 写回前墨稿会自动存历史版本的类型
+const SNAPSHOT_TYPES = new Set(['outline', 'chapters']);
 const MODE_LABEL = { decision: '方案讨论', brainstorm: '脑洞风暴', refine: '作品打磨', quick: '快问', redraft: '改稿' };
 const MODE_SHORT = { decision: '方案', brainstorm: '脑洞', refine: '打磨', quick: '快问', redraft: '改稿' };
 // 新建页的档位：快问、小会（方案讨论的轻量版）、方案讨论、脑洞风暴
@@ -324,6 +333,7 @@ function flatten(fields) {
   const walk = (obj, prefix) => {
     for (const [k, v] of Object.entries(obj)) {
       if (k === 'characters' && Array.isArray(v)) rows.push({ key: `${prefix}characters`, label: FIELD_LABELS.characters, value: v.map((c) => `${c.name}（${c.role}）：${c.description}`).join('\n') });
+      else if (k === 'chapters' && Array.isArray(v)) v.forEach((ch, i) => { for (const [ck, cv] of Object.entries(ch)) if (ck !== 'number') rows.push({ key: `chapters.${i}.${ck}`, label: `第 ${ch.number ?? i + 1} 章 · ${CHAPTER_FIELD_LABELS[ck] || ck}`, value: Array.isArray(cv) ? cv.join('\n') : text(cv) }); });
       else if (k === 'volumes' && Array.isArray(v)) v.forEach((vol, i) => { for (const [vk, vv] of Object.entries(vol)) rows.push({ key: `volumes.${i}.${vk}`, label: `第 ${i + 1} 卷 · ${vk === 'title' ? '卷名' : FIELD_LABELS[vk] || vk}`, value: text(vv) }); });
       else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, `${prefix}${k}.`);
       else rows.push({ key: `${prefix}${k}`, label: FIELD_LABELS[k] || k, value: Array.isArray(v) ? v.join('、') : text(v) });
@@ -420,7 +430,7 @@ function renderList() {
     const rows = S.runs;
     html = rows.map((r) => `<div class="item ${S.run?.number === r.number ? 'on' : ''}" data-run="${r.number}">
       <div class="t">#${r.number} · ${r.mode === 'refine' ? `${esc(TYPE_LABEL[r.type] || '')}「${esc(r.topic)}」` : esc(r.topic)}</div>
-      <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span> <span class="chip">${r.tier === 'meeting' ? '小会' : MODE_SHORT[r.mode] || r.mode}</span> <span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.followUps ? ` 追问 ${r.followUps} 次` : ''}${r.hasRevision ? ' · 有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.mock ? ' · mock' : ''}</div>
+      <div class="m"><span class="chip ${r.status}">${STATUS_LABEL[r.status] || r.status}</span>${r.waiting ? ' <span class="chip failed">等你回答</span>' : ''} <span class="chip">${r.tier === 'meeting' ? '小会' : MODE_SHORT[r.mode] || r.mode}</span> <span class="chip ${r.channel}">${CHANNEL_LABEL[r.channel] || r.channel}</span>${r.followUps ? ` 追问 ${r.followUps} 次` : ''}${r.hasRevision ? ' · 有修订版' : ''}${r.applied ? ' · 已写回' : ''}${r.mock ? ' · mock' : ''}</div>
       ${r.requirement ? `<div class="p">要求：${esc(r.requirement)}</div>` : ''}</div>`).join('');
     if (!rows.length) html = `<div class="empty">${S.q.trim() || S.filter.mode || S.filter.days || S.filter.archived ? '没有符合条件的讨论' : '还没有讨论'}</div>`;
   } else if (S.tab === 'memory') {
@@ -487,25 +497,26 @@ async function openItem(type, id) {
   let item;
   try { item = await api(`/api/novel/item?type=${type}&id=${encodeURIComponent(id)}`); } catch (e) { $('main').innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
   const past = S.runs.filter((r) => r.mode === 'refine' && r.type === type && item.title === r.topic);
+  const lk = type === 'chapters' ? CHAPTERS_LINEUP : 'refine'; // 阵容键
   $('main').innerHTML = `
     <div class="head"><h2>${esc(item.title)}</h2><span class="chip">${TYPE_LABEL[type]}</span></div>
     <div class="card form">
       <h3>这次想怎么改（可选）</h3>
       <textarea id="req" placeholder="例如：金手指太强，想加限制；开篇钩子不够抓人；第三卷之后没东西写了……不写就让模型自己找最影响质量的问题"></textarea>
       ${memoryPickHtml('refine', S.refineForm || (S.refineForm = {}))}
-      <div id="lineupBox">${lineupHtml('refine')}</div>
+      <div id="lineupBox">${lineupHtml(lk)}</div>
       <div class="row"><button class="btn primary" id="go">开始打磨</button><span class="hint">修订版不会自动写回墨稿，要你确认。</span></div>
       ${past.length ? `<div class="hint" style="margin-top:8px">之前打磨过：${past.map((r) => `<a href="#" data-run="${r.number}">#${r.number}</a>`).join('、')}</div>` : ''}
     </div>
     <div class="card"><h3>现在的版本</h3><div class="pre">${esc(item.current)}</div></div>
     <div class="card"><details><summary>背景（定位、素材、评委意见等，模型都会看到）</summary><div class="pre" style="margin-top:8px">${esc(item.background)}</div></details></div>`;
-  bindLineup('refine', (ok) => { $('go').disabled = !ok; });
+  bindLineup(lk, (ok) => { $('go').disabled = !ok; });
   const rf = S.refineForm;
   document.querySelectorAll('[data-memdom]').forEach((x) => { x.onchange = () => { rf.memoryTouched = true; rf.memory = [...document.querySelectorAll('[data-memdom]:checked')].map((y) => y.dataset.memdom); $('memHint').innerHTML = memoryHint(rf.memory); }; });
   $('go').onclick = async () => {
     $('go').disabled = true;
     try {
-      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ type, id, requirement: $('req').value, lineup: lineupPayload('refine'), memory: S.status?.memory ? rf.memory || [] : [] }) });
+      const { number } = await api('/api/runs', { method: 'POST', body: JSON.stringify({ type, id, requirement: $('req').value, lineup: lineupPayload(lk), memory: S.status?.memory ? rf.memory || [] : [] }) });
       await loadRuns(); openRun(number);
     } catch (e) { toast(e.message); $('go').disabled = false; }
   };
@@ -517,6 +528,9 @@ const PART_LABEL = { lead: '主笔', reviewer: '评审' };
 const QUICK_PART = { lead: '回答', reviewer: '挑刺' };
 const REDRAFT_PART = { lead: '改稿', reviewer: '挑刺' };
 const twoSeats = (mode) => mode === 'quick' || mode === 'redraft';
+// 打磨细纲单独记一套阵容（默认角色看节奏、衔接、能不能照着写），讨论模式仍是 refine
+const CHAPTERS_LINEUP = 'refine-chapters';
+const isRefineKey = (mode) => mode === 'refine' || mode === CHAPTERS_LINEUP;
 const clone = (x) => JSON.parse(JSON.stringify(x));
 // mode 这里是阵容的键：quick、meeting 用新建页档位的默认阵容，其余用各模式的
 function defaultLineupOf(mode) { return clone((['quick', 'meeting', 'redraft'].includes(mode) ? S.status?.tiers?.[mode] : S.status?.lineups?.[mode]) || { participants: [], chair: null }); }
@@ -567,7 +581,7 @@ function seatsHtml(mode) {
 function lineupHtml(mode) {
   const st = S.status || {};
   const l = lineupOf(mode);
-  const chairName = mode === 'refine' ? '主编' : '主席';
+  const chairName = isRefineKey(mode) ? '主编' : '主席';
   if (twoSeats(mode)) {
     const who = mode === 'redraft' ? '改稿' : '回答';
     return `<label>参与者<button class="btn" id="lnReset" type="button">恢复默认</button></label>
@@ -579,7 +593,7 @@ function lineupHtml(mode) {
     <div class="seats" id="seats">${seatsHtml(mode)}</div>
     <div class="lnbar">
       <button class="btn" id="lnAdd" type="button" ${l.participants.length >= (st.maxSeats || 8) ? 'disabled' : ''}>＋ 添加参与者</button>
-      <span>${chairName}（最后汇总${mode === 'refine' ? '并写修订版' : '、写主文档'}）用 <select id="lnChair">${(st.models || []).map((m) => `<option value="${esc(m.id)}" ${m.id === l.chair ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></span>
+      <span>${chairName}（最后汇总${isRefineKey(mode) ? '并写修订版' : '、写主文档'}）用 <select id="lnChair">${(st.models || []).map((m) => `<option value="${esc(m.id)}" ${m.id === l.chair ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></span>
       <span class="hint" id="lnHint"></span>
     </div>
     ${mode === 'decision' || mode === 'meeting' ? `<div class="lnbar"><span>核实员 <select id="lnChecker" title="有代码时读代码回答「待核实的事实」；本场无代码时联网搜集资料、联网核实"><option value="">不用（${(st.repos || []).length ? '调研员直接读代码核实；无代码时不联网' : '不联网搜集资料'}）</option>${(st.models || []).filter((m) => m.readsCode).map((m) => `<option value="${esc(m.id)}" ${m.id === l.factChecker ? 'selected' : ''}>${esc(m.name)}：先答，调研员审查纠正后再发</option>`).join('')}</select></span></div>
@@ -995,7 +1009,8 @@ function renderStat() {
   const box = $('statline'); if (!box || !S.run) return;
   const r = S.run, p = r.progress || {}, o = r.outcome || {}, b = r.blockers;
   const items = [];
-  if (p.status === 'running') {
+  if (p.status === 'running' && p.waiting) items.push(`<span class="warn">⏸ 第 ${p.waiting.round} 轮之后暂停，${p.waiting.kind === 'pick' ? `等你挑出要继续讨论的脑洞（共 ${p.waiting.ideas.length} 个，页面底部）` : `等你回答${r.mode === 'decision' ? '主席' : '主编'}的 ${p.waiting.questions.length} 个问题（页面底部）`}</span>`);
+  else if (p.status === 'running') {
     const lastRound = [...r.posts].reverse().find((x) => Number.isFinite(x.round) && x.round > 0)?.round;
     const who = (p.speaking || []).map((s) => esc(s.name)).join('、');
     items.push(`<span><span class="dot" style="display:inline-block;margin-right:6px"></span>${lastRound ? `第 ${lastRound} 轮` : '准备中'}${who ? ` · ${who} 在写` : ''}</span>`);
@@ -1061,6 +1076,7 @@ function renderProgress() {
   const running = p.status === 'running', queued = p.status === 'queued';
   const who = (p.speaking || []).map((s) => `${esc(s.name)} 在写${s.round && !['汇总', '修订版', '追问判断'].includes(s.stage) ? `第 ${s.round} 轮` : ''}${esc(s.stage)}（${ago(s.at)}）`).join('；');
   const line = queued ? `排队中${p.queuedAhead ? `，前面还有 ${p.queuedAhead} 场` : ''}…`
+    : running && p.waiting ? '<b>讨论暂停，等你回答</b>：回答后才会继续'
     : running ? (who || '准备中…')
     : p.status === 'failed' ? `<span class="err">失败：${esc(p.error || '')}</span>${recoveryHtml(S.run.recovery)}` : '';
   const canTalk = running;
@@ -1069,10 +1085,14 @@ function renderProgress() {
   const refine = S.run.mode === 'refine';
   box.querySelector('.bar').innerHTML = line ? `${running || queued ? '<span class="dot"></span>' : ''}<span>${line}</span>` : '';
   const comp = box.querySelector('.composer');
-  const mode = canTalk ? 'talk' : canAsk ? 'ask' : 'none';
+  const mode = canTalk ? (p.waiting ? `answer${p.waiting.no ?? ''}` : 'talk') : canAsk ? 'ask' : 'none';
   if (comp.dataset.mode !== mode) {
     comp.dataset.mode = mode;
-    comp.innerHTML = mode === 'talk'
+    comp.innerHTML = mode.startsWith('answer') && p.waiting.kind === 'pick'
+      ? `<div class="askbox"><b>挑出要继续讨论的脑洞</b>（只有选中的继续讨论，没选的直接放弃、不补新的；完整内容见上面各主笔的发言${lark ? '。也可以在群里回复编号' : ''}）${p.waiting.ideas.map((x) => `<label class="pick"><input type="checkbox" value="${esc(x.code)}"><b>${esc(x.code)}</b>${x.hook ? `　${esc(x.hook)}` : ''}</label>`).join('')}</div><button class="btn" id="pickAll" title="所有脑洞都继续讨论">全部保留</button><button class="btn primary" id="pickSend">继续讨论选中的</button>`
+      : mode.startsWith('answer')
+      ? `<div class="askbox"><b>${S.run.mode === 'decision' ? '主席' : '主编'}的问题</b>（讨论停在第 ${p.waiting.round} 轮之后，回答后才继续${lark ? '；也可以直接在群里回复' : ''}）<ol>${p.waiting.questions.map((q) => `<li>${esc(q)}</li>`).join('')}</ol></div><textarea id="say" placeholder="逐条回答，或者只说你在意的那条"></textarea><button class="btn" id="skip" title="不补充，让模型自己判断">按你们的判断继续</button><button class="btn primary" id="send">回答</button>`
+      : mode === 'talk'
       ? `<textarea id="say" placeholder="插话：下一轮开始时交给所有模型${lark ? '，群里也会出一张卡片' : ''}${refine ? '（例如：别动主角的名字；结局我想要开放式）' : ''}"></textarea><button class="btn primary" id="send">插话</button>`
       : mode === 'ask' && (S.run.mode === 'quick' || S.run.mode === 'redraft')
         ? `<textarea id="say" placeholder="${S.run.mode === 'redraft' ? '追问：例如「第三段再收一点」「对话改得口语些」，改稿的一方回答并更新修改稿' : '追问：补充信息或接着问，回答的一方直接回答并更新快问文档'}"></textarea><button class="btn primary" id="send">追问</button>`
@@ -1080,11 +1100,25 @@ function renderProgress() {
         ? `<textarea id="say" placeholder="追问：${refine ? '主编' : '主席'}判断直接回答、按裁决定稿（例如「按方案 A」）、核实还是重新讨论${refine ? '；重新讨论后会重写修订版' : ''}${lark ? '。这是群里的讨论，追问过程会发到群里' : ''}"></textarea><select id="ctx" title="重新讨论或定稿时，参与者接着原来的会话，还是各开一条新会话（带上主文档、方案、阻断存档、核实结果）"><option value="resume" ${S.run.followUpContext !== 'fresh' ? 'selected' : ''}>接着原会话</option><option value="fresh" ${S.run.followUpContext === 'fresh' ? 'selected' : ''}>新会话</option></select><button class="btn primary" id="send">追问</button>`
         : S.run.expired ? `<span class="hint">已超过保留期，会话已清理，不能再追问${refine ? '；修订版仍然可以写回' : ''}。</span>` : '';
     const send = $('send');
+    const answer = async (text) => { await api(`/api/runs/${S.run.number}/interject`, { method: 'POST', body: JSON.stringify({ text }) }); toast('已收到回答，讨论会在几秒内继续'); };
+    const pickSend = $('pickSend');
+    if (pickSend) pickSend.onclick = async () => {
+      const codes = [...comp.querySelectorAll('.pick input:checked')].map((x) => x.value);
+      if (!codes.length) { toast('至少选一个；都想留就点「全部保留」'); return; }
+      pickSend.disabled = true;
+      try { await answer(`选：${codes.join(' ')}`); } catch (e) { toast(e.message); }
+      pickSend.disabled = false;
+    };
+    const pickAll = $('pickAll');
+    if (pickAll) pickAll.onclick = async () => { pickAll.disabled = true; try { await answer('全部保留'); } catch (e) { toast(e.message); } pickAll.disabled = false; };
+    const skip = $('skip');
+    if (skip) skip.onclick = async () => { skip.disabled = true; try { await answer('（不补充，按你们的判断继续）'); } catch (e) { toast(e.message); } skip.disabled = false; };
     if (send) send.onclick = async () => {
       const text = $('say').value.trim(); if (!text) return;
       send.disabled = true;
       try {
-        if (mode === 'talk') { await api(`/api/runs/${S.run.number}/interject`, { method: 'POST', body: JSON.stringify({ text }) }); toast('已收到，下一轮开始时交给模型'); }
+        if (mode.startsWith('answer')) await answer(text);
+        else if (mode === 'talk') { await api(`/api/runs/${S.run.number}/interject`, { method: 'POST', body: JSON.stringify({ text }) }); toast('已收到，下一轮开始时交给模型'); }
         else { const r = await api(`/api/runs/${S.run.number}/followup`, { method: 'POST', body: JSON.stringify({ question: text, context: $('ctx')?.value }) }); toast(r.lark ? '追问已排队，过程会发到群里' : '追问已排队'); }
         $('say').value = '';
       } catch (e) { toast(e.message); }
@@ -1330,12 +1364,12 @@ function renderRun() {
       <div class="applybar">
         <span>和原稿相比改了 <b>${rows.length}</b> 处。${appliedThis ? `已于 ${new Date(r.applied.at).toLocaleString('zh-CN')} 写回墨稿。` : r.applied ? '之前写回过另一版。' : ''}</span>
         ${isLatest && !appliedThis && rows.length ? `<button class="btn primary" id="apply" ${r.mock || status === 'running' || status === 'queued' ? 'disabled' : ''}>写回墨稿</button>` : ''}
-        <span class="hint">${r.mock ? 'mock 演练的修订版不写回。' : isLatest ? '写回会替换墨稿里的这一项；总纲写回前墨稿会自动存一份历史版本。' : '只能写回最新一版。'}</span>
+        <span class="hint">${r.mock ? 'mock 演练的修订版不写回。' : isLatest ? '写回会替换墨稿里的这一项；总纲和细纲写回前墨稿会自动存一份历史版本。' : '只能写回最新一版。'}</span>
       </div>
       <div class="card">${rows.length ? rows.map((x) => `<div class="field"><div class="fl">${esc(x.label)}${x.before === null ? '<span class="chip">新增</span>' : x.after === null ? '<span class="chip">删除</span>' : ''}</div><div class="diff">${diffHtml(x.before ?? '', x.after ?? '')}</div></div>`).join('') : '<span class="hint">修订版和原稿一样。</span>'}</div>`;
     const btn = $('apply');
     if (btn) btn.onclick = async () => {
-      const ok = confirm(`确认把修订版写回墨稿？\n\n会替换${TYPE_LABEL[r.subject.type]}「${r.subject.title}」的 ${rows.length} 处内容。${r.subject.type === 'outline' ? '\n写回前墨稿会存一份历史版本，可以在大纲页恢复。' : '\n墨稿里没有历史版本；原稿在这里的「原稿」页能看到。'}`);
+      const ok = confirm(`确认把修订版写回墨稿？\n\n会替换${TYPE_LABEL[r.subject.type]}「${r.subject.title}」的 ${rows.length} 处内容。${SNAPSHOT_TYPES.has(r.subject.type) ? '\n写回前墨稿会存一份历史版本，可以在大纲页恢复。' : '\n墨稿里没有历史版本；原稿在这里的「原稿」页能看到。'}`);
       if (!ok) return;
       btn.disabled = true;
       try { await api(`/api/runs/${r.number}/apply`, { method: 'POST', body: JSON.stringify({ revisionAt: rev.at }) }); toast('已写回墨稿'); S.run = await api(`/api/runs/${r.number}`); renderRun(); loadRuns(); loadItems(); }

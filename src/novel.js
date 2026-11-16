@@ -1,5 +1,5 @@
 /**
- * 墨稿（novel-idea）的接口：列出脑洞 / 梗概 / 总纲，取一项给模型看，作者确认后写回。
+ * 墨稿（novel-idea）的接口：列出脑洞 / 梗概 / 总纲 / 章节细纲（每卷每 10 章一段），取一项给模型看，作者确认后写回。
  * 墨稿只接受本机请求，接口在 novel-idea 的 src/app/api/console/storm/。
  */
 export function createNovelClient({ baseUrl = 'http://127.0.0.1:3000', timeoutMs = 60000, fetchImpl = fetch } = {}) {

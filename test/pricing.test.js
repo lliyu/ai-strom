@@ -48,3 +48,19 @@ test('接口没返回费用时，讨论里用估算值并标记', async () => {
   assert.ok(done.every((e) => e.costEstimated && e.costOriginal.amount === 2 && e.costOriginal.currency === 'CNY'));
   assert.ok(Math.abs(events.at(-1).stats.costUsd - (done.length * 2) / 7.1) < 1e-4);
 });
+
+test('长上下文分档：完整输入超过门槛时整次按长上下文单价算，缓存比例沿用；不超过按基础价', () => {
+  const price = {
+    currency: 'CNY', usdRate: 8, inputPerM: 0.24, outputPerM: 1.2, cacheReadRatio: 0.1, cacheWriteRatio: 1.25,
+    longContext: { aboveTokens: 272000, inputPerM: 0.48, outputPerM: 1.8 },
+  };
+  // 27.2 万整：还在标准档。10 万未命中 + 17.2 万命中，输出 1 万
+  const std = estimateCost(price, { inputTokens: 272000, cacheReadTokens: 172000, outputTokens: 10000 });
+  assert.equal(std.longContext, false);
+  assert.equal(std.amount, (100000 * 0.24 + 172000 * 0.024 + 10000 * 1.2) / 1e6);
+  // 多 1 个 token 就整次按长上下文：命中 0.048、写入 0.6
+  const long = estimateCost(price, { inputTokens: 272001, cacheReadTokens: 172000, cacheWriteTokens: 1000, outputTokens: 10000 });
+  assert.equal(long.longContext, true);
+  assert.equal(long.amount, Math.round((99001 * 0.48 + 172000 * 0.048 + 1000 * 0.6 + 10000 * 1.8)) / 1e6);
+  assert.equal(long.costUsd, Math.round(long.amount / 8 * 1e6) / 1e6);
+});

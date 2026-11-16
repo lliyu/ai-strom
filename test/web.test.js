@@ -92,6 +92,25 @@ test('网页：列出群里的讨论，发言含追问，结论来自讨论状�
   assert.equal(detail.body.canFollowUp, true);
 });
 
+test('网页：主席征询人时进度带上等你回答和问题，列表标出来；收到回答后消失', async (t) => {
+  const { port, store } = await serve(t);
+  const exec = fakeLarkRun(store, { running: true });
+  store.addEvent(exec, { type: 'human_ask', round: 1, no: 1, questions: ['终结留给谁？'], at: new Date().toISOString() });
+  let detail = await request(port, 'GET', '/api/runs/3');
+  assert.deepEqual(detail.body.progress.waiting.questions, ['终结留给谁？']);
+  assert.equal(detail.body.progress.waiting.round, 1);
+  assert.equal((await request(port, 'GET', '/api/runs')).body.runs[0].waiting, true);
+  store.addEvent(exec, { type: 'human_answered', round: 1, no: 1, at: new Date().toISOString() });
+  detail = await request(port, 'GET', '/api/runs/3');
+  assert.equal(detail.body.progress.waiting, undefined);
+  assert.equal((await request(port, 'GET', '/api/runs')).body.runs[0].waiting, undefined);
+  // 脑洞风暴的挑选：带上类型和可选的脑洞
+  store.addEvent(exec, { type: 'human_ask', round: 1, no: 2, kind: 'pick', questions: ['选哪些脑洞继续讨论'], ideas: [{ code: 'A1', hook: '钩子' }], at: new Date().toISOString() });
+  detail = await request(port, 'GET', '/api/runs/3');
+  assert.equal(detail.body.progress.waiting.kind, 'pick');
+  assert.deepEqual(detail.body.progress.waiting.ideas, [{ code: 'A1', hook: '钩子' }]);
+});
+
 test('网页：进行中的群讨论可以插话（写进这次运行的插话），没在进行的不行', async (t) => {
   const { port, store } = await serve(t);
   const exec = fakeLarkRun(store, { running: true });

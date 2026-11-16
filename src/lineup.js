@@ -11,6 +11,13 @@ import { normalizeConfig, ConfigError, resolveProviderSpec } from './config.js';
 
 export const MAX_SEATS = 8;
 
+/**
+ * 打磨章节细纲用的阵容键：讨论模式仍是 refine，只是默认角色不同（看节奏、衔接、能不能照着写正文，
+ * 而不是看结构和长篇潜力）。config.json 可以用 personas['refine-chapters'].<发言者 id> 指定，
+ * 不配就按座位顺序套用下面的细纲角色模板。
+ */
+export const CHAPTERS_LINEUP = 'refine-chapters';
+
 /** 常用角色模板。config.json 的 roleTemplates 可以追加，同名的覆盖这里的。modes 为空表示所有模式都适用。 */
 export const DEFAULT_ROLE_TEMPLATES = [
   { name: '架构视角', modes: ['decision'], persona: '你关注系统边界、数据一致性、扩展性和长期维护成本。' },
@@ -27,6 +34,10 @@ export const DEFAULT_ROLE_TEMPLATES = [
   { name: '读者视角', modes: ['refine'], persona: '你站在挑剔的网文读者一边：前三章能不能留住人，爽点和情绪是否具体，哪里会让人觉得套路、憋屈而弃书。可以认可，但必须先认真找过弃书的理由。' },
   { name: '市场与差异', modes: ['refine', 'brainstorm'], persona: '你熟悉番茄、起点等平台的热门作品和读者口味，关注同质化风险、卖点能不能一句话说清、和同类热门书的差异站不站得住。' },
   { name: '逻辑与可持续', modes: ['refine'], persona: '你专门找设定和逻辑漏洞：金手指的边界是否自洽，世界规则有没有被剧情打破，按这个设计写到一两百万字会不会崩、会不会没东西可写。' },
+  { name: '节奏与爽点', modes: [CHAPTERS_LINEUP], persona: '你盯章节节奏：每章有没有明确的推进和爽点或情绪释放，压抑有没有超过一两章，小高潮的间隔够不够密，章末钩子能不能让人立刻点下一章。' },
+  { name: '追更读者', modes: [CHAPTERS_LINEUP], persona: '你是每天追更的网文读者：这几章哪里会让人跳读或弃书，主角够不够主动，信息有没有重复交代，哪一章看完不想点下一章。可以认可，但必须先认真找过弃书的理由。' },
+  { name: '场景与可写性', modes: [CHAPTERS_LINEUP], persona: '你站在要照着细纲写正文的作者一边：每个场景有没有具体的地点、人物、冲突和动作，「必须交付」是不是具体事件而不是空话，一章约 2500 字装不装得下，有没有哪章空到写不出来。' },
+  { name: '连贯与账目', modes: [CHAPTERS_LINEUP], persona: '你专门核对衔接：这几章和总纲、本卷概要、前后章节对不对得上，时间线、日期、钱和数量的账算不算得通，人物什么时候出场、读者什么时候知道什么，伏笔有没有交代和回收。' },
 ];
 
 const MODEL_ONLY = ['provider', 'model', 'effort', 'contextWindow', 'maxBudgetUsd'];
@@ -76,12 +87,32 @@ function chairModelId(cfg, pool) {
 
 /** 某个模式下的默认阵容（页面上「恢复默认」用）：就是 config.json 里配好的参与者和主席。 */
 export function defaultLineup(cfg, mode) {
+  if (mode === CHAPTERS_LINEUP) return chaptersLineup(cfg);
   const c = normalizeConfig(cfg, { mode });
   const pool = modelPool(cfg);
   return {
     participants: c.participants.map((p) => ({ model: p.id, part: p.part === 'reviewer' ? 'reviewer' : 'lead', role: p.role ?? '', persona: p.persona ?? '' })),
     chair: chairModelId(c, pool) ?? pool[0]?.id ?? null,
     factChecker: null, // 不选：调研员直接核实
+  };
+}
+
+/**
+ * 打磨细纲的默认阵容：模型、主笔 / 评审和主编都沿用作品打磨的，只换角色。
+ * personas['refine-chapters'] 里配了的发言者用配置的角色，没配的按座位顺序套用内置的细纲角色模板。
+ */
+function chaptersLineup(cfg) {
+  const base = defaultLineup(cfg, 'refine');
+  const table = cfg.personas?.[CHAPTERS_LINEUP] ?? {};
+  const tpls = roleTemplates(cfg).filter((t) => t.modes.includes(CHAPTERS_LINEUP));
+  return {
+    ...base,
+    participants: base.participants.map((p, i) => {
+      const own = table[p.model];
+      const t = tpls[i % tpls.length];
+      if (own) return { ...p, role: own.role ?? p.role, persona: own.persona ?? '' };
+      return t ? { ...p, role: t.name, persona: t.persona } : p;
+    }),
   };
 }
 

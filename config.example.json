@@ -100,7 +100,7 @@
       "pricing": {
         "deepseek-v4.1-flash-1017": {
           "currency": "CNY",
-          "usdRate": 7.1,
+          "usdRate": 6.7,
           "inputPerM": 2,
           "outputPerM": 8,
           "cacheReadRatio": 0.1,

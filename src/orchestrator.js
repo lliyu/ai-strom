@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   STAGE_LABELS, participantSystem, chairSystem,
   proposePrompt, critiquePrompt, reviewPrompt,
-  divergePrompt, feedbackPrompt, revisePrompt, abandonedIdeas, keptIdeas, ideaCode,
+  divergePrompt, feedbackPrompt, revisePrompt, abandonedIdeas, keptIdeas, ideaCode, askCheckPrompt, parseAsk, ideaHooks, parsePick,
   researchSystem, researchPrompt, sharedSystem, parseVerdict, parseStanceChange,
   triagePrompt, parseTriage, stripTriageLine, followUpPrompt, parseVerdictPick, parseVerifyQuestions, finalPrompt, freshBlock, HANDLING_LABELS,
   rewriteSystem, rewritePrompt, parseRevision, SUBJECT_LABELS, FIELD_LABELS,
@@ -74,6 +74,8 @@ export async function mapLimit(items, limit, fn) {
 }
 
 const byTag = (a, b) => a.tag.localeCompare(b.tag, 'zh-CN', { numeric: true });
+/** 每轮结束后由主席判断要不要征询人的模式。 */
+const ASK_MODES = new Set(['decision', 'brainstorm', 'refine']);
 const brief = (s) => ({ id: s.id, name: s.name, role: s.role, part: partOf(s), provider: s.provider, model: s.model, color: s.color, contextWindow: s.contextWindow });
 const who = (list) => list.map((p) => `${p.name} · ${p.role}`).join(' / ');
 
@@ -105,7 +107,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
   const convo = cfg.conversation !== false;
   const heard = []; // 本次运行收到的插话
   const stats = { calls: 0, failures: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
-  const ideasPerAgent = cfg.ideasPerAgent ?? 2;
+  const ideasPerAgent = cfg.ideasPerAgent ?? 3;
   const limits = limitsFor(cfg.mode, cfg.limits); // 脑洞风暴不限字数（null）
   const run = { participants, leads, reviewers, reviewerIds, tagOf, convo, heard, stats, emit, ideasPerAgent, limits, shared: '', truncations: 0 };
   /**
@@ -168,7 +170,16 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 脑洞风暴里被放弃的脑洞：每轮盲审评审过半标【弃】就拿掉，不补新的（从讨论记录算，续跑和追问都不用另存）。
    * retired：脑洞全被放弃的主笔，后面的轮次不再请它发言，别人也不再评它。
    */
-  run.abandoned = () => (cfg.mode === 'brainstorm' ? abandonedIdeas(rounds, { hasReviewers: reviewers.length > 0 }) : []);
+  run.abandoned = () => {
+    if (cfg.mode !== 'brainstorm') return [];
+    const human = run.humanDropped();
+    return [...human, ...abandonedIdeas(rounds, { hasReviewers: reviewers.length > 0, already: human })];
+  };
+  /** 第 1 轮之后作者没选的脑洞（从征询记录里的挑选算出来）。 */
+  run.humanDropped = () => {
+    const pick = (run.asks ?? []).find((a) => a.kind === 'pick' && a.picked);
+    return pick ? pick.ideas.filter((x) => !pick.picked.includes(x.code)).map((x) => ({ code: x.code, round: pick.round, by: 'human', reasons: ['作者没选'] })) : [];
+  };
   run.keptOf = (p, abandoned = run.abandoned()) => keptIdeas(tagOf(p), ideasPerAgent, abandoned);
   run.retired = (abandoned = run.abandoned()) => new Set(cfg.mode === 'brainstorm' ? leads.filter((p) => !run.keptOf(p, abandoned).length).map((p) => p.id) : []);
   /** 这一轮放弃了哪些脑洞：主编发一张卡片，脑洞全被放弃的主笔从下一轮起退出。 */
@@ -209,6 +220,149 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
     } catch (err) {
       log(`⚠️ 读取插话失败，本轮跳过：${err.message}`);
     }
+  };
+
+  /**
+   * 征询人：方案讨论、脑洞风暴、作品打磨每轮结束后，主席判断要不要暂停讨论问人。
+   * 问了就发一张卡片，一直等到人回答（网页上回答或在群里回复，走插话通道）；回答当作插话交给所有模型。
+   * asks 随讨论状态和断点保存：进程中断后续跑时，还没回答的问题接着等。
+   */
+  const askCfg = cfg.humanAsk ?? {};
+  run.asks = [];
+  run.askBase = 0; // 这次运行之前已经问过几次（追问时沿用讨论状态里的）
+  // 默认不限次数，问不问全由主席判断；配了 maxAsks 才限制每次运行最多问几次
+  const askLimit = Number.isFinite(askCfg.maxAsks) ? askCfg.maxAsks : null;
+  run.askCount = () => run.asks.filter((a) => a.kind !== 'pick').length; // 作者挑脑洞不算主席的征询次数
+  run.canAsk = () => ASK_MODES.has(cfg.mode) && askCfg.enabled !== false && Boolean(interjections)
+    && (askLimit === null || run.askCount() - run.askBase < askLimit);
+  run.maybeAsk = async (round, { save } = {}) => {
+    if (!run.canAsk()) return false;
+    await run.pullInterjections(); // 先把已经到的插话收进来：主席看得到，也不会被当成回答
+    const entries = rounds.filter((r) => r.round === round && ['critique', 'feedback'].includes(r.stage)).flatMap((r) => r.entries);
+    const remaining = askLimit === null ? null : askLimit - (run.askCount() - run.askBase);
+    const prompt = `${chairSystem(cfg.mode)}\n\n${askCheckPrompt({ mode: cfg.mode, round, finals: [...latest.values()].sort(byTag), entries, heard, asks: run.asks, abandoned: run.abandoned(), remaining })}`;
+    const text = await run.speak(cfg.chair, { stage: 'askcheck', round, system: run.shared, prompt, quiet: true });
+    const { need, questions } = parseAsk(text);
+    if (!need) return false;
+    const ask = { no: run.asks.length + 1, round, questions, answer: null, at: new Date().toISOString() };
+    run.asks.push(ask);
+    log(`主席暂停讨论，向人征询 ${questions.length} 个问题，等回答`);
+    emit({ type: 'human_ask', round, no: ask.no, questions });
+    await publisher.post({
+      speaker: cfg.chair,
+      title: '❓ 讨论暂停，等你回答',
+      subtitle: `第 ${round} 轮之后 · ${cfg.chair.name}征询`,
+      body: [
+        ...questions.map((q, i) => `${i + 1}. ${q}`),
+        '',
+        cfg.mode === 'refine' ? '在讨论页底部回答。讨论会一直停在这里，你回答后才继续。' : '在讨论页底部回答，或直接在群里回复。讨论会一直停在这里，你回答后才继续。',
+        '不想定的话，回复「按你们的判断继续」即可。',
+      ].join('\n'),
+      meta: { stage: 'ask', round },
+    });
+    await save?.();
+    await run.awaitAnswer(ask);
+    return true;
+  };
+  /**
+   * 一直等到收到新的插话，当作这次征询的回答。accept(text) 返回 null 表示看不懂（例如挑脑洞没写编号），
+   * 发一张提示卡片接着等；收到的每条都标上回答的是哪次征询。
+   */
+  run.awaitAnswer = async (ask, { accept = null, retry = null } = {}) => {
+    const pollMs = askCfg.pollMs ?? 15000;
+    const started = Date.now();
+    const got = [];
+    let before = heard.length;
+    let accepted = null;
+    for (;;) {
+      await run.pullInterjections();
+      if (heard.length > before) {
+        const fresh = heard.slice(before);
+        before = heard.length;
+        got.push(...fresh);
+        for (const m of fresh) m.answerTo = { no: ask.no, questions: ask.questions };
+        accepted = accept ? accept(fresh.map((m) => m.text).join('\n')) : true;
+        if (accepted) break;
+        await retry?.();
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+    ask.answer = got.map((m) => m.text).join('\n');
+    ask.answeredAt = new Date().toISOString();
+    emit({ type: 'human_answered', round: ask.round, no: ask.no, waitedMs: Date.now() - started });
+    log(`收到回答（等了 ${Math.round((Date.now() - started) / 1000)} 秒），讨论继续`);
+    return accepted;
+  };
+
+  /**
+   * 脑洞风暴第 1 轮之后：暂停，请作者从所有脑洞里挑出要继续讨论的，没选的直接放弃（不补新的），
+   * 脑洞全没被选的主笔退出后面的轮次。一直等到作者回了能认出的编号（或「全部」）。
+   */
+  run.pickIdeas = async (round, { save } = {}) => {
+    if (cfg.mode !== 'brainstorm' || askCfg.enabled === false || !interjections) return false;
+    await run.pullInterjections();
+    const ideas = [...latest.values()].sort(byTag).flatMap((e) => ideaHooks(e.text, ideasPerAgent).map((hook, i) => ({ code: ideaCode(e.tag, i + 1), hook })));
+    // 一个钩子都没认出来（格式不对，或者 mock 演练）：没法给作者看清选什么，照常往下讨论
+    if (!ideas.some((x) => x.hook)) {
+      log('第 1 轮的脑洞里没认出「一句话钩子」，跳过作者挑选');
+      return false;
+    }
+    const ask = { no: run.asks.length + 1, round, kind: 'pick', questions: ['选哪些脑洞继续讨论'], ideas, answer: null, picked: null, at: new Date().toISOString() };
+    run.asks.push(ask);
+    log(`第 ${round} 轮的 ${ideas.length} 个脑洞已经写好，等作者挑选`);
+    emit({ type: 'human_ask', round, no: ask.no, kind: 'pick', questions: ask.questions, ideas });
+    await publisher.post({
+      speaker: cfg.chair,
+      title: '👉 请挑出要继续讨论的脑洞',
+      subtitle: `第 ${round} 轮之后 · 讨论暂停`,
+      body: [
+        ...ideas.map((x) => `- **${x.code}**${x.hook ? `：${x.hook}` : ''}`),
+        '',
+        '完整内容见上面各主笔的发言。只有选中的会继续讨论，没选的直接放弃、不补新的。',
+        `在讨论页底部勾选，或在群里回复编号（例如「${ideas.slice(0, 2).map((x) => x.code).join(' ')}」）；都想留就回复「全部」。讨论会一直停在这里。`,
+      ].join('\n'),
+      meta: { stage: 'ask', round },
+    });
+    await save?.();
+    await run.awaitPick(ask);
+    return true;
+  };
+  run.awaitPick = async (ask) => {
+    const codes = ask.ideas.map((x) => x.code);
+    ask.picked = await run.awaitAnswer(ask, {
+      accept: (text) => parsePick(text, codes),
+      retry: () => publisher.post({
+        speaker: cfg.chair,
+        title: '没认出要继续的脑洞',
+        subtitle: `第 ${ask.round} 轮之后 · 仍在等你挑选`,
+        body: `回复里没有认出编号。请回复要继续讨论的编号，例如「${codes.slice(0, 2).join(' ')}」；都想留就回复「全部」。`,
+        meta: { stage: 'ask', round: ask.round },
+      }),
+    });
+    const dropped = codes.filter((c) => !ask.picked.includes(c));
+    const retired = run.retired();
+    log(`作者选了 ${ask.picked.join('、')}${dropped.length ? `，放弃 ${dropped.join('、')}` : ''}`);
+    emit({ type: 'ideas_picked', round: ask.round, picked: ask.picked, dropped, retired: [...retired] });
+    await publisher.post({
+      speaker: cfg.chair,
+      title: `继续讨论 ${ask.picked.length} 个脑洞`,
+      subtitle: `第 ${ask.round} 轮之后 · 作者挑选`,
+      body: [
+        `**继续**：${ask.picked.join('、')}`,
+        dropped.length ? `**放弃**：${dropped.join('、')}（不补新的，后面不再讨论）` : '',
+        retired.size ? `${leads.filter((p) => retired.has(p.id)).map((p) => tagOf(p)).join('、')} 的脑洞都没被选，后面的轮次不再参加。` : '',
+      ].filter(Boolean).join('\n'),
+      meta: { stage: 'abandon', round: ask.round },
+    });
+  };
+
+  /** 续跑时：上次停在征询或挑选上、还没回答，接着等。 */
+  run.awaitPending = async () => {
+    const last = run.asks.at(-1);
+    if (!last || last.answer != null || !interjections) return;
+    log(`上次停在第 ${last.round} 轮的${last.kind === 'pick' ? '挑选' : '征询'}上，接着等回答`);
+    if (last.kind === 'pick') await run.awaitPick(last);
+    else await run.awaitAnswer(last);
   };
 
   const retryDelayMs = cfg.retryDelayMs ?? 5000;
@@ -746,6 +900,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
    * 会话模式下每位评审成功收到一次后就不再重复；非会话模式每轮都要带上。
    */
   run.iterate = async ({ from, to, adaptive, scope, loop = null, onRound = null }) => {
+    await run.awaitPending();
     run.verdictAsked = adaptive;
     let lastRound = from - 1;
     const scoped = new Set(); // 已经在会话里收到讨论范围的评审
@@ -868,7 +1023,8 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
           feedback: givers.filter((q) => q.id !== p.id && fbBy.has(q.id)).map((q) => fbBy.get(q.id)),
           ideasPerAgent,
           kept: run.keptOf(p, after),
-          dropped: fresh.filter((a) => a.code[0] === ideaCode(tagOf(p), 1)[0]),
+          // 这一轮评审放弃的，加上作者第 1 轮没选的（只在挑选后的第一次修订里说）
+          dropped: [...fresh, ...(round === 2 ? run.humanDropped() : [])].filter((a) => a.code[0] === ideaCode(tagOf(p), 1)[0]),
           interjections: run.ijFor(p),
           convo,
         }));
@@ -881,7 +1037,7 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         const peersFor = (p) => lastCritiques.filter((e) => e.id !== p.id).map((e) => ({ tag: e.tag, lines: capLines(lineStartBlockers(e.text)) })).filter((x) => x.lines.length);
         const resolved = run.blockerHistory().resolved;
         const critiques = activeReviewers.length
-          ? await run.runStage(activeReviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items, ownIssues: run.ownIssuesFor(p) }), {
+          ? await run.runStage(activeReviewers, round, 'critique', (p) => critiquePrompt({ round, proposals, peers: peersFor(p), resolved, interjections: run.ijFor(p), askVerdict: adaptive, convo, mode: cfg.mode, limits, scope: scopeFor(p), items: cfg.items, ownIssues: run.ownIssuesFor(p), subjectType: run.subjectType }), {
             checkFor: (p) => ({ ...(run.checkOf('critique') ?? {}), peers: peerItems(peersFor(p)) }),
           })
           : [];
@@ -956,8 +1112,10 @@ function createRun({ cfg, providers, publisher, interjections, log, onEvent, tag
         converge(round);
         break;
       }
-      // 这一轮完整跑完：存断点（进程中断后从下一轮续跑）
-      await onRound?.(round, { stuck, lone: Object.fromEntries(lone), answered, failStreak: Object.fromEntries(failStreak), dropped: [...dropped] });
+      // 这一轮完整跑完：主席判断要不要问人（最后一轮不问，问了也没人回应），再存断点（进程中断后从下一轮续跑）
+      const loopState = () => ({ stuck, lone: Object.fromEntries(lone), answered, failStreak: Object.fromEntries(failStreak), dropped: [...dropped] });
+      if (round < to) await run.maybeAsk(round, { save: () => onRound?.(round, loopState()) });
+      await onRound?.(round, loopState());
     }
     if (dropped.size) ending = { ...ending, dropped: droppedNames() };
     return { lastRound, ending };
@@ -1388,7 +1546,7 @@ function codeSpecOf(code) {
   return { auto: Boolean(code.auto), repos: code.auto ? [] : code.repos.map((r) => ({ name: r.alias, ...(r.ref ? { ref: r.ref } : {}) })) };
 }
 
-function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [], interjections = [], data, dataContext, material, memory }) {
+function exportState({ number, topic, cfg, tags, shared, context, code, facts = [], sessions, latest, rounds, lastRound, summary, docs = [], followUps = [], createdAt, subject, revision, ending, docFailed = false, budget, blockers = [], interjections = [], data, dataContext, material, memory, asks = [] }) {
   return {
     version: STATE_VERSION,
     number: number ?? null,
@@ -1398,7 +1556,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     // 条目化发言是按场开的（试跑）：追问沿用发起时的设置
     ...(cfg.items ? { items: true } : {}),
     mode: cfg.mode,
-    ...(cfg.mode === 'brainstorm' ? { ideasPerAgent: cfg.ideasPerAgent ?? 2 } : {}),
+    ...(cfg.mode === 'brainstorm' ? { ideasPerAgent: cfg.ideasPerAgent ?? 3 } : {}),
     createdAt: createdAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     tags: Object.fromEntries(tags),
@@ -1415,6 +1573,7 @@ function exportState({ number, topic, cfg, tags, shared, context, code, facts = 
     ending: ending ? { reason: ending.reason, round: ending.round, ...(ending.tag ? { tag: ending.tag } : {}), ...(ending.part ? { part: ending.part } : {}), ...(ending.dropped?.length ? { dropped: ending.dropped } : {}) } : null,
     blockers,
     interjections,
+    ...(asks.length ? { asks } : {}),
     ...(budget ? { budget } : {}),
     ...(docFailed ? { docFailed: true } : {}),
     summary,
@@ -1459,6 +1618,8 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   const latest = new Map(resume ? resume.latest.map((e) => [e.id, e]) : []); // 主笔 id -> 最新一版方案
   const rounds = resume ? [...resume.rounds] : []; // [{ round, stage, entries: [{ id, label, tag, text }] }]
   const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: resume?.facts ?? [], budget: resume?.budget ?? {}, data: cfg.mode === 'decision' ? data : null });
+  run.subjectType = subject?.type; // 细纲的评审门槛和脑洞 / 梗概 / 总纲不同
+  if (resume?.asks) run.asks = resume.asks.map((a) => ({ ...a }));
   const { leads, reviewers, participants, stats, emit, heard, tagOf, convo, ideasPerAgent } = run;
   const dataOn = Boolean(run.data?.mcp && cfg.research);
   const knowledgeOn = Boolean(run.data?.knowledge?.dirs?.length);
@@ -1472,7 +1633,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     if (!onCheckpoint) return;
     try {
       await onCheckpoint({
-        ...exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound: extra.round ?? extra.lastRound ?? 0, subject, budget: run.budget, interjections: heard, data: run.data?.selection, dataContext, material, memory: memoryOut(memory) }),
+        ...exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound: extra.round ?? extra.lastRound ?? 0, subject, budget: run.budget, interjections: heard, asks: run.asks, data: run.data?.selection, dataContext, material, memory: memoryOut(memory) }),
         phase,
         ...extra,
         web: Boolean(run.web),
@@ -1582,6 +1743,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
   }
 
   // ---------- 第 1 轮：主笔出方案 ----------
+  let firstLoop = null;
   if (phase === 'opened') {
   await run.pullInterjections();
   const first = await run.runStage(leads, 1, cfg.mode === 'brainstorm' ? 'diverge' : refine ? 'diagnose' : 'propose', (p) => (cfg.mode === 'brainstorm'
@@ -1592,7 +1754,13 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     throw new Error(`第 1 轮只有 ${first.length} 位主笔成功发言，讨论无法继续`);
   }
   for (const e of first) latest.set(e.id, e);
-  await checkpoint('round', { round: 1, loop: { stuck: 0, lone: {}, answered: heard.length } });
+  // answered：主笔已经回应过的插话条数。征询的回答是之后才到的，第 2 轮主笔要先回应，这一轮不提前结束
+  firstLoop = { stuck: 0, lone: {}, answered: heard.length };
+  await checkpoint('round', { round: 1, loop: firstLoop });
+  // 第 1 轮之后也让主席判断要不要问人：方向偏了越早纠正越省
+  // 脑洞风暴改为请作者挑脑洞，只有选中的继续讨论
+  const firstAsk = cfg.mode === 'brainstorm' ? run.pickIdeas : run.maybeAsk;
+  if (cfg.rounds >= 2 && await firstAsk(1, { save: () => checkpoint('round', { round: 1, loop: firstLoop }) })) await checkpoint('round', { round: 1, loop: firstLoop });
   }
 
   // ---------- 后续轮次 ----------
@@ -1602,7 +1770,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     const from = phase === 'round' ? resume.round + 1 : 2;
     const onRound = (round, loop) => checkpoint('round', { round, loop });
     iterated = cfg.rounds >= 2
-      ? await run.iterate({ from, to: cfg.rounds, adaptive, loop: phase === 'round' ? resume.loop : null, onRound })
+      ? await run.iterate({ from, to: cfg.rounds, adaptive, loop: phase === 'round' ? resume.loop : firstLoop, onRound })
       : { lastRound: 1, ending: { reason: 'fixed', round: 1 } };
     await checkpoint('iterated', { lastRound: iterated.lastRound, ending: iterated.ending });
   }
@@ -1647,7 +1815,7 @@ export async function runDiscussion({ cfg, topic, providers, publisher, interjec
     ...(refine ? { subject: { type: subject.type, id: subject.id, title: subject.title }, revision } : {}),
     doc,
     docs,
-    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !docs.length, budget: run.budget, blockers, interjections: heard, data: run.data?.selection, dataContext, material, memory: memoryOut(memory) }),
+    state: exportState({ number, topic, cfg, tags, shared: run.shared, context, code: run.code, facts: run.facts, sessions, latest, rounds, lastRound, summary, docs, subject, revision, ending, docFailed: !docs.length, budget: run.budget, blockers, interjections: heard, asks: run.asks, data: run.data?.selection, dataContext, material, memory: memoryOut(memory) }),
   };
   }
 }
@@ -1810,6 +1978,9 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
   const latest = new Map(state.latest.map((e) => [e.id, e]));
   const rounds = [...state.rounds];
   const run = createRun({ cfg, providers, publisher, interjections, log, onEvent, tags, sessions, latest, rounds, facts: state.facts ?? [], budget: state.budget, data: state.mode === 'decision' || state.mode === 'quick' ? data : null });
+  run.subjectType = state.subject?.type;
+  run.asks = (state.asks ?? []).map((a) => ({ ...a }));
+  run.askBase = run.askCount();
   run.rulings = (state.followUps ?? []).filter((f) => f.handling === 'verdict').map((f) => f.ruledAfter);
   const { leads, participants, stats, emit, heard, ideasPerAgent, tagOf } = run;
   // 快问的追问固定走直接回答：不经过主席分流，由回答的一方只靠现在的快问文档回答，再更新文档
@@ -2083,6 +2254,7 @@ export async function runFollowUp({ cfg, state, question, providers, publisher, 
     budget: run.budget,
     blockers: run.blockerArchive(),
     interjections: [...pastInterjections, ...heard],
+    ...(run.asks.length ? { asks: run.asks } : {}),
     ...(retired.length || state.retiredSessions?.length ? { retiredSessions: [...(state.retiredSessions ?? []), ...retired] } : {}),
     docs,
     ...(docFailed && !docs.length ? { docFailed: true } : { docFailed: undefined }),
